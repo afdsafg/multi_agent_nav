@@ -799,7 +799,7 @@ def parse_retain_response(
     pattern = (
         rf"Retain\s+{re.escape(keyword)}\s*[:：]\s*\{{?\s*"
         r"([\d,\s]+)"
-        r"\s*\}}?"
+        r"\s*\}?"
     )
     match = re.search(pattern, response, re.IGNORECASE)
     if not match:
