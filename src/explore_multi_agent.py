@@ -794,13 +794,19 @@ def parse_retain_response(
     # Robust to VLM output variants:
     #   "Retain Images: {0, 2}" | "Retain Images: 0, 2" | "Retain Images: {0,2}"
     #   trailing dot/semicolon; missing braces; extra whitespace.
-    pattern = rf"Retain\s+{re.escape(keyword)}\s*[:：]?\s*\{{?([^}}\]\n]*)\}}?"
+    # Require ':' or '{' after keyword to skip descriptive "retain images that..."
+    # in reasoning text. Group only digits/commas/spaces.
+    pattern = (
+        rf"Retain\s+{re.escape(keyword)}\s*[:：]\s*\{{?\s*"
+        r"([\d,\s]+)"
+        r"\s*\}}?"
+    )
     match = re.search(pattern, response, re.IGNORECASE)
     if not match:
         return []
     indices = []
     for tok in match.group(1).split(","):
-        tok = tok.strip().rstrip(".;: ")
+        tok = tok.strip()
         if tok.isdigit():
             indices.append(int(tok))
     return sorted(set(indices))
