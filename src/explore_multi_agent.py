@@ -529,6 +529,7 @@ def format_high_level_planner_prompt(
     is_new_subtask: bool,
     image_goal: Optional[str] = None,
     memory: Optional[Any] = None,
+    feedback_block: str = "",
 ) -> Tuple[str, list]:
     """High-Level Planner prompt.
 
@@ -721,6 +722,10 @@ def format_high_level_planner_prompt(
     )
     content.append((text,))
 
+    # Phase F: recent failure feedback
+    if feedback_block:
+        content.append((feedback_block,))
+
     return sys_prompt, content
 
 
@@ -732,6 +737,7 @@ def format_executor_prompt(
     task_type: str,
     history_decision: Optional[Dict[str, Any]] = None,
     frontier_states: Optional[List[Any]] = None,
+    feedback_block: str = "",
 ) -> Tuple[str, list]:
     """Low-Level Executor prompt.
 
@@ -810,6 +816,10 @@ def format_executor_prompt(
     clr_text = _format_clr_block(history_decision)
     if clr_text:
         content.append((clr_text,))
+
+    # Phase F: recent failure feedback
+    if feedback_block:
+        content.append((feedback_block,))
 
     text = (
         "Output Format:\n"
@@ -1273,6 +1283,7 @@ def explore_multi_agent(
         is_new_subtask,
         image_goal=image_goal,
         memory=step.get("episode_memory"),
+        feedback_block=feedback_block,
     )
     if verbose:
         logging.info("[High-Level Planner] calling VLM")
@@ -1290,6 +1301,7 @@ def explore_multi_agent(
         question, frontier_imgs, pool, high_level_plan, task_type,
         history_decision=history_decision,
         frontier_states=frontier_states,
+        feedback_block=feedback_block,
     )
     if verbose:
         logging.info("[Executor] calling VLM")

@@ -621,16 +621,34 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                     resize_image(scene.all_observations[obs_file_name], cfg.prompt_h, cfg.prompt_w)
                                 )
                             task_check_obs_frames[global_step - back_step + 1] = task_check_obs.copy()
-                        vlm_response = query_vlm_for_response_end(
+                        vlm_response, tc_reason = query_vlm_for_response_end(
                             subtask_metadata=subtask_metadata,
                             rgb_egocentric_views=task_check_obs_frames,
                             cfg=cfg,
                             verbose=True,
-                        ) 
+                        )
                         if (vlm_response == 'yes'):
+                            # Phase F: record success feedback
+                            wm = subtask_metadata.get("working_memory", None)
+                            if wm is not None:
+                                wm.add_feedback(
+                                    step=cnt_step,
+                                    type_="TASK_CHECK_PASS",
+                                    reason=tc_reason or "target confirmed",
+                                    suggested_fix="",
+                                )
                             break
                         else:
                             decision['object_judge'] = "no"
+                            # Phase F: record failure feedback with reason
+                            wm = subtask_metadata.get("working_memory", None)
+                            if wm is not None:
+                                wm.add_feedback(
+                                    step=cnt_step,
+                                    type_="TASK_CHECK_FAIL",
+                                    reason=tc_reason or "task_check rejected",
+                                    suggested_fix="rotate toward target / use VVD viewpoint",
+                                )
 
                     his_decision[cnt_step] = decision
 

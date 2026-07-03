@@ -787,5 +787,6 @@ def query_vlm_for_response_end(
     ) = task_check(step_dict, verbose=verbose)
 
     logging.info(f"Response: [{outputs}]\nReason: [{reason}]")
-    
-    return outputs
+
+    # Phase F: return reason too so the main loop can build FeedbackEvent.
+    return outputs, reason
