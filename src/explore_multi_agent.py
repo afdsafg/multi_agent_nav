@@ -295,12 +295,74 @@ def format_frontier_manager_prompt(
     return sys_prompt, content
 
 
+def _format_clr_block(history_decision: Optional[Dict[str, Any]]) -> str:
+    """Build a 'History Decisions (avoid repeating)' text block from CLR data.
+
+    Mirrors the format of explore_utils.py Prompt_with_AVU_and_CLR L322-345.
+    Only injects decisions whose object_judge == 'no' (i.e. confirmed wrong).
+
+    Args:
+        history_decision: step['CLR'] dict. Expected shape:
+            {cnt_step, max_step, step_idx: {'target_type', 'max_point_choice',
+             'object_judge'?}}
+
+    Returns:
+        Formatted text block, or "" if no wrong decisions to inject.
+    """
+    if not history_decision:
+        return ""
+    cnt_step = history_decision.get("cnt_step", "?")
+    max_step = history_decision.get("max_step", "?")
+    lines = [
+        f"History Decisions (avoid repeating): "
+        f"(now step is {cnt_step}/{max_step}). "
+        "Choosing those incorrect objects or images again is prohibited:"
+    ]
+    have_decision = False
+    for s_key, decision in history_decision.items():
+        if not isinstance(s_key, int):
+            continue
+        if not isinstance(decision, dict):
+            continue
+        if decision.get("object_judge") != "no":
+            continue
+        if "target_type" not in decision:
+            continue
+        have_decision = True
+        target_type = decision["target_type"]
+        choice = decision.get("max_point_choice", "?")
+        if target_type == "image":
+            lines.append(
+                f"    step {s_key}: Choosing Image {choice} as answer, "
+                "but not correct."
+            )
+        elif target_type == "object":
+            lines.append(
+                f"    step {s_key}: Choosing Object {choice} as answer, "
+                "but not correct."
+            )
+        elif target_type == "frontier":
+            lines.append(
+                f"    step {s_key}: Choosing Frontier {choice} to explore, "
+                "but not correct."
+            )
+        else:
+            lines.append(
+                f"    step {s_key}: Choosing {target_type} {choice} as answer, "
+                "but not correct."
+            )
+    if not have_decision:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
 def format_answerer_prompt(
     question: str,
     pool: List[Dict[str, Any]],
     task_type: str,
     image_goal: Optional[str],
     high_level_plan: Optional[str],
+    history_decision: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, list]:
     """Answerer prompt (rewritten for GOAT-Bench).
 
@@ -379,6 +441,11 @@ def format_answerer_prompt(
             content.append((f"Image {i}: ", snap["img_b64"]))
             objs_str = _format_connected_objects(snap["connected_objects"])
             content.append((f" connected objects: {objs_str}\n",))
+
+    # F7: CLR - inject history of wrong decisions so Answerer avoids them
+    clr_text = _format_clr_block(history_decision)
+    if clr_text:
+        content.append((clr_text,))
 
     # Output format
     text = (
@@ -549,6 +616,7 @@ def format_executor_prompt(
     pool: List[Dict[str, Any]],
     high_level_plan: Optional[str],
     task_type: str,
+    history_decision: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, list]:
     """Low-Level Executor prompt.
 
@@ -620,6 +688,11 @@ def format_executor_prompt(
             content.append((
                 f"Available Frontier indices: 0-{len(frontier_imgs) - 1}\n",
             ))
+
+    # F7: CLR - inject history of wrong decisions so Executor avoids them
+    clr_text = _format_clr_block(history_decision)
+    if clr_text:
+        content.append((clr_text,))
 
     text = (
         "Output Format:\n"
@@ -791,6 +864,7 @@ def explore_multi_agent(
     is_new_subtask = step.get("is_new_subtask", False)
     step_index = step.get("step_index", 0)
     high_level_plan = step.get("high_level_plan", None)
+    history_decision = step.get("CLR", {})
 
     # b. image pool maintenance
     pool = step.get("image_pool", None)
@@ -876,7 +950,8 @@ def explore_multi_agent(
 
     # e. Answerer
     sys_p, content = format_answerer_prompt(
-        question, pool, task_type, image_goal, high_level_plan
+        question, pool, task_type, image_goal, high_level_plan,
+        history_decision=history_decision,
     )
     if verbose:
         logging.info("[Answerer] calling VLM")
@@ -921,7 +996,8 @@ def explore_multi_agent(
 
     # g. Executor
     sys_p, content = format_executor_prompt(
-        question, frontier_imgs, pool, high_level_plan, task_type
+        question, frontier_imgs, pool, high_level_plan, task_type,
+        history_decision=history_decision,
     )
     if verbose:
         logging.info("[Executor] calling VLM")

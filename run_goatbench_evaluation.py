@@ -255,8 +255,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     tsdf_planner=tsdf_planner,
                 )
 
-                # multi-agent: mark new subtask + carry high-level plan + reset snapshot/frontier state
-                subtask_metadata['is_new_subtask'] = True
+                # multi-agent: carry high-level plan + reset snapshot/frontier state.
+                # is_new_subtask is set per-step in the main loop (L451-454).
+                # 记忆跨subtask继承, start_new_subtask 仅记录边界, 不清空记忆。
                 subtask_metadata['high_level_plan'] = episode_memory.get_latest_high_level_plan() if hasattr(episode_memory, 'get_latest_high_level_plan') else None
                 scene.image_pool = None
                 scene.filtered_snapshots = set()
@@ -454,6 +455,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             subtask_metadata['is_new_subtask'] = False
 
                         if cfg.get('use_multi_agent', False):
+                            # F4: set current_step so multi-agent pipeline + obs keys align
+                            subtask_metadata['current_step'] = global_step
                             vlm_response = query_vlm_multi_agent(
                                 subtask_metadata=subtask_metadata,
                                 scene=scene,
@@ -469,13 +472,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                 if hlp is not None:
                                     episode_memory.add_entry(
                                         content=hlp,
-                                        entry_type='high_level_plan',
+                                        entry_type='high_level_planner_output',
                                         step=cnt_step,
                                     )
-                            # query_vlm_multi_agent returns 5-tuple (..., class_name);
-                            # normalize to 4-tuple for downstream unpacking
-                            if vlm_response is not None and len(vlm_response) == 5:
-                                vlm_response = vlm_response[:4]
                         else:
                             vlm_response = query_vlm_for_response(
                                 subtask_metadata=subtask_metadata,

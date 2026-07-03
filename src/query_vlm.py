@@ -427,6 +427,9 @@ def query_vlm_multi_agent(
 
     # query multi-agent vlm
     try:
+        # F5: pass scene.image_pool into step_dict so explore_multi_agent
+        # can carry it across steps instead of rebuilding from None each step
+        step_dict["image_pool"] = scene.image_pool
         (
             target_type,
             target_index,
@@ -434,6 +437,11 @@ def query_vlm_multi_agent(
             n_filtered_snapshots,
             class_name_if_image,
         ) = explore_multi_agent(step_dict, cfg, verbose=verbose)
+        # F3: explore_multi_agent updates step_dict['high_level_plan'] locally;
+        # write it back to subtask_metadata so the main loop reads the latest plan.
+        subtask_metadata['high_level_plan'] = step_dict.get('high_level_plan')
+        # F5: write image_pool back to scene for next step
+        scene.image_pool = step_dict.get('image_pool')
     except Exception as e:
         logging.error(f"explore_multi_agent failed: {e}, choose random frontier")
         return random_frontier_choice(tsdf_planner, 0)
