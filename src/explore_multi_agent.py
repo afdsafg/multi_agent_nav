@@ -1062,8 +1062,16 @@ def explore_multi_agent(
 
     n_filtered = 0
 
-    # c. Image Manager (only when pool length > 3)
-    if len(pool) > 3:
+    # Phase D: pinned evidence (from active candidates) is forced-kept.
+    pinned_paths = set()
+    if working_memory is not None:
+        pinned_paths = set(working_memory.pinned_ids)
+    max_pool = getattr(cfg, "max_pool_size", 6)
+
+    # c. Image Manager — only filters NON-pinned images; pinned are forced-kept.
+    # Manager only runs when non-pinned count > 3 (pinned don't need filtering).
+    nonpinned_idx = [i for i, s in enumerate(pool) if s.get("img_path") not in pinned_paths]
+    if len(nonpinned_idx) > 3:
         sys_p, content = format_image_manager_prompt(
             question, pool, high_level_plan, task_type, image_goal
         )
@@ -1072,25 +1080,38 @@ def explore_multi_agent(
         raw = call_openai_api(sys_p, content)
         retain_idx = parse_retain_response(raw, "Images")
         if retain_idx:
-            new_pool = [pool[i] for i in retain_idx if 0 <= i < len(pool)]
+            # retained set = pinned ∪ (retain_idx ∩ nonpinned)
+            retained_nonpinned = set(i for i in retain_idx if i in nonpinned_idx and 0 <= i < len(pool))
+            pinned_idx = [i for i in range(len(pool)) if pool[i].get("img_path") in pinned_paths]
+            keep_idx = sorted(set(pinned_idx) | retained_nonpinned)
+            # cap: if still over max_pool, drop oldest non-pinned first
+            if len(keep_idx) > max_pool:
+                pinned_set = set(pinned_idx)
+                nonpinned_keep = [i for i in keep_idx if i not in pinned_set]
+                drop_n = len(keep_idx) - max_pool
+                nonpinned_keep = nonpinned_keep[drop_n:]  # drop oldest non-pinned
+                keep_idx = sorted(set(pinned_set) | set(nonpinned_keep))
+            new_pool = [pool[i] for i in keep_idx]
             n_filtered = len(pool) - len(new_pool)
-            if n_filtered > 0:
+            if n_filtered > 0 or len(new_pool) != len(pool):
                 logging.info(
                     f"[Image Manager] filtered {n_filtered} images, "
-                    f"{len(new_pool)} retained"
+                    f"{len(new_pool)} retained (pinned={len(pinned_idx)})"
                 )
                 pool = new_pool
                 step["image_pool"] = pool
         else:
-            # Fallback: VLM 回应解析失败 (可能 pool 过大导致输出截断),
-            # 保留最近 3 张 (最新 egocentric) 防止 pool 无限膨胀。
-            MAX_POOL_FALLBACK = 3
-            if len(pool) > MAX_POOL_FALLBACK:
+            # Fallback: keep pinned + latest (max_pool - pinned) non-pinned
+            pinned_idx = [i for i in range(len(pool)) if pool[i].get("img_path") in pinned_paths]
+            nonpinned_idx_cur = [i for i in range(len(pool)) if pool[i].get("img_path") not in pinned_paths]
+            keep_nonpinned = nonpinned_idx_cur[-(max_pool - len(pinned_idx)):] if max_pool > len(pinned_idx) else []
+            keep_idx = sorted(set(pinned_idx) | set(keep_nonpinned))
+            if len(keep_idx) < len(pool):
                 logging.info(
                     f"[Image Manager] no valid retain response, "
-                    f"fallback keep latest {MAX_POOL_FALLBACK} of {len(pool)}"
+                    f"fallback keep {len(keep_idx)} (pinned={len(pinned_idx)})"
                 )
-                pool = pool[-MAX_POOL_FALLBACK:]
+                pool = [pool[i] for i in keep_idx]
                 step["image_pool"] = pool
             else:
                 logging.info(
@@ -1098,7 +1119,8 @@ def explore_multi_agent(
                 )
     else:
         logging.info(
-            f"[Image Manager] skipped (pool size {len(pool)} <= 3)"
+            f"[Image Manager] skipped (non-pinned pool size "
+            f"{len(nonpinned_idx)} <= 3, pinned={len(pinned_paths)})"
         )
 
     # d. Frontier Manager (only when frontier count > 1)
