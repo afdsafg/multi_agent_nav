@@ -83,7 +83,7 @@ clear_up_memory_every_subtask: false
 use_full_obj_list: false
 
 # whether to save visualization (which is slow)
-save_visualization: false ########### "false" to speed up, without visualization
+save_visualization: true ########### "false" to speed up, without visualization
 
 # the image size for prompting gpt-4o
 prompt_h: 512

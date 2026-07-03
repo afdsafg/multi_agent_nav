@@ -14,6 +14,9 @@ os.environ["HABITAT_SIM_LOG"] = (
 os.environ["HABITAT_SIM_HEADLESS"] = "1"
 os.environ["DISPLAY"] = ""
 os.environ["MESA_GL_VERSION_OVERRIDE"] = "3.3"
+# Offline mode: load CLIP weights from local cache only (no network)
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 import argparse
 from omegaconf import OmegaConf
 import random
@@ -139,13 +142,11 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
     sam_predictor = SAM(cfg.sam_model_name)  # UltraLytics SAM
     logging.info(f"Load SAM model {cfg.sam_model_name} successful!")
 
-    # clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
-    #     "ViT-B-32", "laion2b_s34b_b79k"  # "ViT-H-14", "laion2b_s32b_b79k"
-    # )
+    # CLIP: ViT-B-32 loaded from local HF cache (offline mode)
     clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
-        "ViT-H-14-quickgelu", "dfn5b"  # "ViT-H-14", "laion2b_s32b_b79k"
+        "ViT-B-32", "laion2b_s34b_b79k"
     )
-    clip_tokenizer = open_clip.get_tokenizer("ViT-H-14-quickgelu")
+    clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
     logging.info(f"Load CLIP model successful!")
 
     # Initialize the logger
