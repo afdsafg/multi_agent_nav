@@ -91,11 +91,12 @@ def call_openai_api(sys_prompt, contents) -> Optional[str]:
     n_images = sum(1 for c in contents if len(c) == 2)
     logging.info(f"[VLM] === calling model={mode}, content_parts={len(contents)}, images={n_images} ===")
     logging.info(f"[VLM] SYS_PROMPT:\n{sys_prompt}")
-    # 拼接 user content 文本部分 (图片只标记 [IMAGE i])
+    # 拼接 user content 文本部分 (图片打印 base64 前缀, 像 MSGNav 原版)
     user_text_parts = []
     for idx, c in enumerate(contents):
         if len(c) == 2:
-            user_text_parts.append(f"[IMAGE @ part {idx}]")
+            b64_prefix = c[1][:50] if isinstance(c[1], str) else str(c[1])[:50]
+            user_text_parts.append(f"{c[0]}[b64: {b64_prefix}...]")
         else:
             user_text_parts.append(c[0])
     logging.info(f"[VLM] USER_CONTENT:\n{''.join(user_text_parts)}")
