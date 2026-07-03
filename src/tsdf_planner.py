@@ -19,7 +19,7 @@ from src.habitat import pos_normal_to_habitat, pos_habitat_to_normal
 from src.tsdf_base import TSDFPlannerBase
 from src.conceptgraph.slam.slam_classes import MapObjectDict
 from src.utils import resize_image
-from src.memory_structures import FrontierState, F_ACTIVE, F_EXPLORED, FR_NO_NEW_INFO, FR_FOUND_CANDIDATE
+from src.memory_structures import FrontierState, F_ACTIVE, F_EXPLORED, F_STALE, FR_NO_NEW_INFO, FR_FOUND_CANDIDATE
 
 
 @dataclass
