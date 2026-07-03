@@ -34,7 +34,8 @@ from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
 from src.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
 from src.dataset_utils import prepare_goatbench_navigation_goals
-from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end
+from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end, query_vlm_multi_agent
+from src.long_term_memory import TextLongTermMemory
 from src.logger_goatbench import Logger
 import time
 
@@ -232,6 +233,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
             logging.info(f"\n\nScene {scene_id} initialization successful!")
 
+            # cross-subtask long-term memory for multi-agent workflow
+            episode_memory = TextLongTermMemory()
+
             # run questions in the scene
             global_step = -1
             for subtask_idx, (goal_type, subtask_goal) in enumerate(
@@ -250,6 +254,14 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     scene=scene,
                     tsdf_planner=tsdf_planner,
                 )
+
+                # multi-agent: mark new subtask + carry high-level plan + reset snapshot/frontier state
+                subtask_metadata['is_new_subtask'] = True
+                subtask_metadata['high_level_plan'] = episode_memory.get_latest_high_level_plan() if hasattr(episode_memory, 'get_latest_high_level_plan') else None
+                scene.snapshot_pool = None
+                scene.filtered_snapshots = set()
+                if hasattr(episode_memory, 'start_new_subtask'):
+                    episode_memory.start_new_subtask(subtask_id)
 
                 # mapping from the obj id in habitat to the id assigned by concept graph
                 # this mapping/alignment is done by heuristic matching between object masks
@@ -434,16 +446,46 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         and tsdf_planner.target_point is None
                     ):
                         # query the VLM for the next navigation point, and the reason for the choice
-                        
-                        vlm_response = query_vlm_for_response(
-                            subtask_metadata=subtask_metadata,
-                            scene=scene,
-                            tsdf_planner=tsdf_planner,
-                            rgb_egocentric_views=rgb_egocentric_views,
-                            cfg=cfg,
-                            pts = pts,
-                            verbose=True,
-                        )
+
+                        # step0: mark is_new_subtask to trigger KSS injection in multi-agent
+                        if cnt_step == 0:
+                            subtask_metadata['is_new_subtask'] = True
+                        else:
+                            subtask_metadata['is_new_subtask'] = False
+
+                        if cfg.get('use_multi_agent', False):
+                            vlm_response = query_vlm_multi_agent(
+                                subtask_metadata=subtask_metadata,
+                                scene=scene,
+                                tsdf_planner=tsdf_planner,
+                                rgb_egocentric_views=rgb_egocentric_views,
+                                cfg=cfg,
+                                pts=pts,
+                                verbose=True,
+                            )
+                            # update high-level plan in subtask_metadata + episode_memory
+                            if vlm_response is not None and hasattr(episode_memory, 'add_entry'):
+                                hlp = subtask_metadata.get('high_level_plan', None)
+                                if hlp is not None:
+                                    episode_memory.add_entry(
+                                        content=hlp,
+                                        entry_type='high_level_plan',
+                                        step=cnt_step,
+                                    )
+                            # query_vlm_multi_agent returns 5-tuple (..., class_name);
+                            # normalize to 4-tuple for downstream unpacking
+                            if vlm_response is not None and len(vlm_response) == 5:
+                                vlm_response = vlm_response[:4]
+                        else:
+                            vlm_response = query_vlm_for_response(
+                                subtask_metadata=subtask_metadata,
+                                scene=scene,
+                                tsdf_planner=tsdf_planner,
+                                rgb_egocentric_views=rgb_egocentric_views,
+                                cfg=cfg,
+                                pts = pts,
+                                verbose=True,
+                            )
                         if vlm_response is None:
                             n_filtered_frames = 0
                             logging.info(

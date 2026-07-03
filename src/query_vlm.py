@@ -4,6 +4,7 @@ import random
 import numpy as np
 
 from src.explore_utils import task_check, explore_two_step
+from src.explore_multi_agent import explore_multi_agent
 from src.utils import Visibility_based_Viewpoint_Decision
 from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
@@ -319,7 +320,203 @@ def query_vlm_for_response(
         pred_target_frontier = tsdf_planner.frontiers[target_index]
 
         return target_type, pred_target_frontier, n_filtered_snapshots, target_index
-    
+
+
+def query_vlm_multi_agent(
+    subtask_metadata: dict,
+    scene: Scene,
+    tsdf_planner: TSDFPlanner,
+    rgb_egocentric_views: list,
+    cfg,
+    pts=None,
+    verbose: bool = False,
+):
+    """Multi-agent variant of query_vlm_for_response.
+
+    Uses explore_multi_agent (5-agent chain) instead of explore_two_step.
+    Reuses the AVU+VVD logic from query_vlm_for_response's 'image' branch,
+    but img_path now comes directly from explore_multi_agent (Answerer)
+    rather than image_map_reverse mapping.
+    """
+    # prepare step_dict (mirrors query_vlm_for_response)
+    step_dict = {}
+
+    object_id_to_name = {
+        obj_id: obj["class_name"] for obj_id, obj in scene.objects.items()
+    }
+    object_id_to_room = {
+        obj_id: [obj["room_label"], obj["room_conf"]] for obj_id, obj in scene.objects.items()
+    }
+    step_dict["obj_map"] = object_id_to_name
+    step_dict["objects"] = scene.objects
+    step_dict["all_imgs"] = scene.all_observations
+    step_dict["edges"] = scene.edges
+    step_dict["prompt_h"] = cfg.prompt_h
+    step_dict["prompt_w"] = cfg.prompt_w
+    step_dict["use_full_obj_list"] = cfg.use_full_obj_list
+
+    step_dict["frontier_imgs"] = [
+        frontier.feature for frontier in tsdf_planner.frontiers
+    ]
+
+    if cfg.egocentric_views:
+        step_dict["egocentric_views"] = rgb_egocentric_views
+        step_dict["use_egocentric_views"] = True
+
+    step_dict["question"] = subtask_metadata["question"]
+    step_dict["task_type"] = subtask_metadata["task_type"]
+    step_dict["class"] = subtask_metadata["class"]
+    step_dict["image"] = subtask_metadata["image"]
+    step_dict["CLR"] = subtask_metadata["CLR"]
+    step_dict["object_id_to_room"] = object_id_to_room
+    step_dict["image_to_edges"] = scene.img_to_edge
+    step_dict["scene"] = scene
+    step_dict["tsdf_planner"] = tsdf_planner
+    step_dict["egocentric_views"] = rgb_egocentric_views
+    step_dict["frontier_imgs"] = [
+        frontier.feature for frontier in tsdf_planner.frontiers
+    ]
+
+    # multi-agent specific metadata
+    step_dict["is_new_subtask"] = subtask_metadata.get("is_new_subtask", False)
+    step_dict["high_level_plan"] = subtask_metadata.get("high_level_plan", None)
+    step_dict["step_index"] = subtask_metadata.get("current_step", 0)
+    step_dict["current_step"] = subtask_metadata.get("current_step", 0)
+    step_dict["current_position"] = pts
+
+    # query multi-agent vlm
+    try:
+        (
+            target_type,
+            target_index,
+            reason,
+            n_filtered_snapshots,
+            class_name_if_image,
+        ) = explore_multi_agent(step_dict, cfg, verbose=verbose)
+    except Exception as e:
+        logging.error(f"explore_multi_agent failed: {e}, choose random frontier")
+        return random_frontier_choice(tsdf_planner, 0)
+
+    if target_type is None:
+        logging.error("explore_multi_agent returned None, choose random frontier")
+        return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+
+    logging.info(
+        f"[multi_agent] target_type={target_type}, target_index={target_index}, "
+        f"reason=[{reason}]"
+    )
+
+    # parse by target_type
+    if target_type == "image":
+        # AVU + VVD branch (reused from query_vlm_for_response).
+        # img_path is target_index (given by Answerer directly).
+        img_path = target_index
+        object_class = class_name_if_image
+        if object_class is None:
+            logging.info(
+                f"image target but no class_name, choose random frontier"
+            )
+            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+        if img_path not in scene.all_observations:
+            logging.info(
+                f"img_path {img_path} not in all_observations, choose random frontier"
+            )
+            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+        target_image = scene.all_observations[img_path]
+        try:
+            scene.detection_model.set_classes([object_class])
+            results = scene.detection_model.predict(
+                target_image, conf=cfg.AVU_conf_threshold, verbose=False
+            )
+            scene.detection_model.set_classes(scene.obj_classes.get_classes_arr())
+            if len(results) == 0 or len(results[0].boxes) == 0:
+                logging.info(
+                    f"No objects detected in {img_path}, choose random frontier"
+                )
+                return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+            confidences = results[0].boxes.conf.cpu().numpy()
+            max_idx = confidences.argmax()
+            max_confidence = confidences[max_idx: max_idx + 1]
+            detection_class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+            max_detection_class_ids = detection_class_ids[max_idx: max_idx + 1]
+            xyxy_tensor = results[0].boxes.xyxy[max_idx: max_idx + 1, ...]
+            sam_out = scene.sam_predictor.predict(
+                target_image, bboxes=xyxy_tensor, verbose=False
+            )
+            masks_tensor = sam_out[0].masks.data
+            masks_np = masks_tensor.cpu().numpy()
+            obj_pcds_and_bboxes = detections_to_obj_pcd_and_bbox(
+                depth_array=scene.all_depths[img_path],
+                masks=masks_np,
+                cam_K=scene.intrinsics[:3, :3],
+                image_rgb=target_image,
+                trans_pose=scene.all_cam_poses[img_path],
+                min_points_threshold=scene.cfg_cg.min_points_threshold,
+                spatial_sim_type=scene.cfg_cg.spatial_sim_type,
+                obj_pcd_max_points=scene.cfg_cg.obj_pcd_max_points,
+                device=scene.device,
+            )
+            for obj in obj_pcds_and_bboxes:
+                if obj:
+                    obj["pcd"] = init_process_pcd(
+                        pcd=obj["pcd"],
+                        downsample_voxel_size=scene.cfg_cg["downsample_voxel_size"],
+                        dbscan_remove_noise=scene.cfg_cg["dbscan_remove_noise"],
+                        dbscan_eps=scene.cfg_cg["dbscan_eps"],
+                        dbscan_min_points=scene.cfg_cg["dbscan_min_points"],
+                    )
+                    obj["bbox"] = get_bounding_box(
+                        spatial_sim_type=scene.cfg_cg["spatial_sim_type"],
+                        pcd=obj["pcd"],
+                    )
+            a = []
+            for idx in scene.objects.keys():
+                a.append(scene.objects[idx]["pcd"].points)
+            obj_pos = Visibility_based_Viewpoint_Decision(
+                np.array(obj["pcd"].points),
+                np.concatenate(a, axis=0),
+                pts,
+                tsdf_planner,
+                cfg.dicision_radius,
+            )
+            if obj_pos is None:
+                obj_pos = select_navigation_corner(
+                    aabb=obj["bbox"], robot_position=pts
+                )
+                logging.info(
+                    f"multi_agent target Image {img_path}: {obj_pos} "
+                    f"(Closed Box Center, conf={max_confidence})"
+                )
+            else:
+                logging.info(
+                    f"multi_agent target Image {img_path}: {obj_pos} "
+                    f"(Visible Center, conf={max_confidence})"
+                )
+            return target_type, obj_pos, n_filtered_snapshots, target_index
+        except Exception as e:
+            logging.info(
+                f"AVU/VVD failed for {img_path}: {e}, choose random frontier"
+            )
+            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+
+    elif target_type == "frontier":
+        target_index = int(target_index)
+        if target_index < 0 or target_index >= len(tsdf_planner.frontiers):
+            logging.info(
+                f"Predicted frontier index out of range: {target_index}, "
+                f"choose random frontier"
+            )
+            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+        pred_target_frontier = tsdf_planner.frontiers[target_index]
+        logging.info(
+            f"multi_agent next choice: Frontier at {pred_target_frontier.position}"
+        )
+        return target_type, pred_target_frontier, n_filtered_snapshots, target_index
+
+    else:  # target_type == 'stop'
+        logging.info("multi_agent Stop Exploration, returning None")
+        return None
+
 
 def query_vlm_for_response_end(
     subtask_metadata: dict,
