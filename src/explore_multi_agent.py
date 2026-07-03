@@ -1273,7 +1273,21 @@ def explore_multi_agent(
     else:
         logging.info("[Answerer] NOT_FOUND, continue exploration")
 
-    # f. High-Level Planner
+    # f. High-Level Planner (Phase G: stale detection)
+    stale_threshold = getattr(cfg, "planner_stale_threshold", 2)
+    stale_warning = ""
+    if working_memory is not None and working_memory.plan_is_stale(stale_threshold):
+        stale_warning = (
+            "WARNING: Your previous plan has not changed for "
+            f"{working_memory.plan_stale_count} steps. You MUST either "
+            "(1) mark at least one branch completed/failed with a reason, "
+            "or (2) create a new branch grounded in newly observed evidence. "
+            "Do NOT repeat the same todo list unchanged.\n"
+        )
+        logging.info(
+            f"[High-Level Planner] stale detected (count="
+            f"{working_memory.plan_stale_count}), forcing replan"
+        )
     sys_p, content = format_high_level_planner_prompt(
         question,
         task_type,
@@ -1283,7 +1297,7 @@ def explore_multi_agent(
         is_new_subtask,
         image_goal=image_goal,
         memory=step.get("episode_memory"),
-        feedback_block=feedback_block,
+        feedback_block=(stale_warning + feedback_block),
     )
     if verbose:
         logging.info("[High-Level Planner] calling VLM")
@@ -1292,8 +1306,12 @@ def explore_multi_agent(
     if new_plan:
         high_level_plan = new_plan
         step["high_level_plan"] = high_level_plan
+        if working_memory is not None:
+            working_memory.update_plan(new_plan)
         logging.info("[High-Level Planner] plan updated")
     else:
+        if working_memory is not None:
+            working_memory.update_plan(high_level_plan)
         logging.info("[High-Level Planner] no valid plan block, keeping old")
 
     # g. Executor
