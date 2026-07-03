@@ -141,7 +141,7 @@ def query_vlm_for_response(
 
     # prepare frontier
     step_dict["frontier_imgs"] = [
-        frontier.feature for frontier in tsdf_planner.frontiers
+        encode_tensor2base64(frontier.feature) for frontier in tsdf_planner.frontiers
     ]
 
     # prepare egocentric views
@@ -361,7 +361,7 @@ def query_vlm_multi_agent(
     step_dict["use_full_obj_list"] = cfg.use_full_obj_list
 
     step_dict["frontier_imgs"] = [
-        frontier.feature for frontier in tsdf_planner.frontiers
+        encode_tensor2base64(frontier.feature) for frontier in tsdf_planner.frontiers
     ]
 
     if cfg.egocentric_views:
@@ -386,7 +386,7 @@ def query_vlm_multi_agent(
     step_dict["tsdf_planner"] = tsdf_planner
     step_dict["egocentric_views"] = rgb_egocentric_views
     step_dict["frontier_imgs"] = [
-        frontier.feature for frontier in tsdf_planner.frontiers
+        encode_tensor2base64(frontier.feature) for frontier in tsdf_planner.frontiers
     ]
 
     # multi-agent specific metadata
