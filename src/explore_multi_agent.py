@@ -1051,6 +1051,38 @@ def parse_retain_frontier_ids(
 # Main entry
 # ---------------------------------------------------------------------------
 
+def _frontier_heuristic_score(fs, frontier_img, pool, high_level_plan, question) -> float:
+    """§5 deterministic scorer for Frontier Manager parse-fail fallback.
+    Pure-Python, no new deps."""
+    if fs is None:
+        novelty = 1.0
+        info_gain = 0.0
+        repeat_penalty = 0
+        failed_branch_penalty = 0
+    else:
+        novelty = 1.0 if fs.first_seen_step == fs.last_seen_step else 0.3
+        info_gain = min(getattr(fs, "area", 0.0) / 100.0, 1.0)
+        repeat_penalty = getattr(fs, "selected_count", 0)
+        failed_branch_penalty = 1 if getattr(fs, "last_result", None) in ("NO_NEW_INFO", "BLOCKED") else 0
+    # plan_alignment: simple room-word overlap between plan and question
+    plan_alignment = 0.0
+    if high_level_plan and question:
+        qlow = str(question).lower()
+        for word in str(high_level_plan).lower().split():
+            w = word.strip(".,;:()[]")
+            if len(w) > 3 and w in qlow:
+                plan_alignment = 1.2
+                break
+    score = (
+        1.5 * novelty
+        + 1.0 * info_gain
+        + plan_alignment
+        - 2.0 * repeat_penalty
+        - 3.0 * failed_branch_penalty
+    )
+    return score
+
+
 def explore_multi_agent(
     step: Dict[str, Any],
     cfg,
@@ -1110,6 +1142,16 @@ def explore_multi_agent(
             frontier_states.append(fs)
     # Phase B: working memory (SubtaskWorkingMemory) if provided by main loop
     working_memory = step.get("working_memory", None)
+
+    # §2: prune stale candidates each step (closer-view limit)
+    if working_memory is not None:
+        max_attempts = getattr(cfg, "candidate_max_closer_view_attempts", 3)
+        for c in list(working_memory.active_candidates()):
+            if working_memory.check_closer_view_limit(c.candidate_id, max_attempts):
+                logging.info(
+                    f"[explore_multi_agent] released candidate {c.candidate_id} "
+                    f"(closer-view limit {max_attempts} reached)"
+                )
 
     # b. image pool maintenance
     pool = step.get("image_pool", None)
@@ -1229,8 +1271,21 @@ def explore_multi_agent(
                     if fs is not None and fs.frontier_id in retained_set
                 ]
         else:
+            scored = sorted(
+                range(len(frontier_states)),
+                key=lambda i: _frontier_heuristic_score(
+                    frontier_states[i] if i < len(frontier_states) else None,
+                    frontier_imgs[i] if i < len(frontier_imgs) else None,
+                    pool, high_level_plan, question,
+                ),
+                reverse=True,
+            )
+            top_k = min(3, len(frontier_imgs))
+            keep_pos = scored[:top_k]
+            frontier_imgs = [frontier_imgs[p] for p in keep_pos]
+            frontier_states = [frontier_states[p] for p in keep_pos]
             logging.info(
-                "[Frontier Manager] no valid retain response, keeping all"
+                f"[Frontier Manager] parse fail, heuristic top_k={top_k} kept"
             )
     else:
         logging.info(
@@ -1288,6 +1343,18 @@ def explore_multi_agent(
             f"[High-Level Planner] stale detected (count="
             f"{working_memory.plan_stale_count}), forcing replan"
         )
+    # §8: inject Progress Signals block into Planner prompt each step
+    if working_memory is not None:
+        clr = step.get("CLR", {}) or {}
+        last_fid = clr.get("last_frontier_id")
+        last_fres = clr.get("last_frontier_result")
+        progress_block = working_memory.progress_signals_block(
+            current_pose=step.get("current_position"),
+            last_frontier_id=last_fid,
+            last_frontier_result=last_fres,
+            stale_plan_count=working_memory.plan_stale_count,
+        )
+        feedback_block = progress_block + feedback_block
     sys_p, content = format_high_level_planner_prompt(
         question,
         task_type,
@@ -1315,6 +1382,34 @@ def explore_multi_agent(
         logging.info("[High-Level Planner] no valid plan block, keeping old")
 
     # g. Executor
+    # §4: hard constraint — only offer valid frontiers (active, under reselect
+    # cap, not in recent window)
+    if tsdf_planner is not None and working_memory is not None:
+        valid_ids = set(tsdf_planner.get_valid_frontier_ids(
+            max_reselect=getattr(cfg, "max_frontier_reselect", 2),
+            recent_window=getattr(cfg, "frontier_recent_window", 3),
+            recent_ids=working_memory.recent_frontier_ids,
+        ))
+    elif tsdf_planner is not None:
+        valid_ids = set(tsdf_planner.get_valid_frontier_ids(
+            max_reselect=getattr(cfg, "max_frontier_reselect", 2),
+            recent_window=getattr(cfg, "frontier_recent_window", 3),
+        ))
+    else:
+        valid_ids = None
+    if valid_ids is not None:
+        keep_idx = [
+            i for i, fs in enumerate(frontier_states)
+            if fs is not None and fs.frontier_id in valid_ids
+        ]
+        if not keep_idx:
+            logging.info("[Executor] no valid frontiers, stop")
+            _record_step_summary(step, "Executor stop (no valid frontiers)")
+            return ("stop", None, "", n_filtered, None)
+        frontier_imgs = [frontier_imgs[i] for i in keep_idx]
+        frontier_states = [frontier_states[i] for i in keep_idx]
+    else:
+        valid_ids = None
     sys_p, content = format_executor_prompt(
         question, frontier_imgs, pool, high_level_plan, task_type,
         history_decision=history_decision,
@@ -1331,6 +1426,13 @@ def explore_multi_agent(
         fs.frontier_id: i for i, fs in enumerate(frontier_states) if fs is not None
     }
     if frontier_id >= 0 and frontier_id in id_to_pos:
+        # §4 defensive: double-check frontier_id is in the valid set
+        if valid_ids is not None and frontier_id not in valid_ids:
+            logging.info(
+                f"[Executor] Frontier F_{frontier_id:03d} not in valid set, stop"
+            )
+            _record_step_summary(step, "Executor stop (frontier not valid)")
+            return ("stop", None, reason, n_filtered, None)
         pos = id_to_pos[frontier_id]
         logging.info(f"[Executor] Frontier F_{frontier_id:03d} (pos {pos})")
         _record_step_summary(step, f"Executor chose Frontier F_{frontier_id:03d}")
