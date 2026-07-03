@@ -300,15 +300,12 @@ def _format_clr_block(history_decision: Optional[Dict[str, Any]]) -> str:
     """Build a 'History Decisions (avoid repeating)' text block from CLR data.
 
     Mirrors the format of explore_utils.py Prompt_with_AVU_and_CLR L322-345.
-    Only injects decisions whose object_judge == 'no' (i.e. confirmed wrong).
-
-    Args:
-        history_decision: step['CLR'] dict. Expected shape:
-            {cnt_step, max_step, step_idx: {'target_type', 'max_point_choice',
-             'object_judge'?}}
-
-    Returns:
-        Formatted text block, or "" if no wrong decisions to inject.
+    F2: inject ALL decisions with object_judge=='no', including frontier
+    choices (previously only image/object were injected, leaving the Executor
+    without frontier anti-repeat protection).
+    F1: for image-type decisions, max_point_choice is an img_path (str), not
+    a numeric index — display the path short name so the VLM can associate it
+    with the pool entry rather than showing an opaque raw path.
     """
     if not history_decision:
         return ""
@@ -325,16 +322,30 @@ def _format_clr_block(history_decision: Optional[Dict[str, Any]]) -> str:
             continue
         if not isinstance(decision, dict):
             continue
-        if decision.get("object_judge") != "no":
-            continue
         if "target_type" not in decision:
             continue
-        have_decision = True
         target_type = decision["target_type"]
         choice = decision.get("max_point_choice", "?")
-        if target_type == "image":
+        # F2: frontier decisions never get object_judge (no task_check for
+        # frontier), so inject them unconditionally as "already explored" to
+        # give the Executor anti-repeat context. image/object still require
+        # object_judge=='no' (confirmed wrong by task_check).
+        if target_type == "frontier":
+            have_decision = True
             lines.append(
-                f"    step {s_key}: Choosing Image {choice} as answer, "
+                f"    step {s_key}: Choosing Frontier {choice} to explore, "
+                "already explored."
+            )
+            continue
+        if decision.get("object_judge") != "no":
+            continue
+        have_decision = True
+        if target_type == "image":
+            # choice is img_path; show short name for VLM readability
+            choice_str = str(choice)
+            short = choice_str.split("/")[-1] if "/" in choice_str else choice_str
+            lines.append(
+                f"    step {s_key}: Choosing Image (path={short}) as answer, "
                 "but not correct."
             )
         elif target_type == "object":
@@ -1029,6 +1040,7 @@ def explore_multi_agent(
         if 0 <= idx < len(pool):
             img_path = pool[idx]["img_path"]
             reason = _extract_reason(raw)
+            _record_step_summary(step, f"Answerer chose Image {idx} ({img_path}), class={class_name}")
             logging.info(
                 f"[Answerer] Image {idx} ({img_path}), class={class_name}"
             )
@@ -1075,10 +1087,12 @@ def explore_multi_agent(
     reason = _extract_reason(raw)
     if frontier_idx >= 0 and frontier_idx < len(frontier_imgs):
         logging.info(f"[Executor] Frontier {frontier_idx}")
+        _record_step_summary(step, f"Executor chose Frontier {frontier_idx}")
         return ("frontier", frontier_idx, reason, n_filtered, None)
     else:
         # 'Stop Exploration' or parse failure
         logging.info("[Executor] Stop Exploration")
+        _record_step_summary(step, "Executor Stop Exploration")
         return ("stop", None, reason, n_filtered, None)
 
 
@@ -1094,3 +1108,25 @@ def _extract_reason(response: Optional[str]) -> str:
     if len(lines) <= 1:
         return ""
     return " ".join(lines[1:])
+
+
+def _record_step_summary(step: Dict[str, Any], summary: str) -> None:
+    """Record a step summary into episode_memory (best-effort, never raises).
+
+    F4: step_summary_output entries were retrieved by the High-Level Planner
+    (M4 injection) but never written, making the injection dead code. This
+    helper closes the loop by writing one summary per step.
+    """
+    memory = step.get("episode_memory")
+    if memory is None or not hasattr(memory, "add_entry"):
+        return
+    try:
+        step_index = step.get("step_index", 0)
+        memory.add_entry(
+            content=summary,
+            importance=0.5,
+            entry_type="step_summary_output",
+            step=step_index,
+        )
+    except Exception:
+        pass

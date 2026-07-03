@@ -159,11 +159,10 @@ class TextLongTermMemory:
         )
 
     def retrieve_by_type(self, entry_type: str, top_k: int = 5) -> List[TextMemoryEntry]:
-        """按类型检索记忆"""
-        # 使用索引快速检索
+        """按类型检索记忆，返回最近的 top_k 条（按 timestamp 降序）。"""
         entry_ids = self.type_index.get(entry_type, [])
         matching_entries = [entry for entry in self.entries if entry.id in entry_ids]
-        matching_entries.sort(key=lambda x: x.importance, reverse=True)
+        matching_entries.sort(key=lambda x: x.timestamp, reverse=True)
         return matching_entries[:top_k]
 
     def retrieve_by_step(self, step: int, top_k: int = 5) -> List[TextMemoryEntry]:

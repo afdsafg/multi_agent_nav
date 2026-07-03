@@ -520,11 +520,20 @@ def query_vlm_multi_agent(
                         spatial_sim_type=scene.cfg_cg["spatial_sim_type"],
                         pcd=obj["pcd"],
                     )
+            # F5: pick first valid detection (loop above leaves `obj` pointing
+            # at the last element, which may be None -> TypeError on obj["pcd"])
+            valid_objs = [o for o in obj_pcds_and_bboxes if o is not None]
+            if not valid_objs:
+                logging.info(
+                    f"All detections invalid for {img_path}, choose random frontier"
+                )
+                return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+            target_obj = valid_objs[0]
             a = []
             for idx in scene.objects.keys():
                 a.append(scene.objects[idx]["pcd"].points)
             obj_pos = Visibility_based_Viewpoint_Decision(
-                np.array(obj["pcd"].points),
+                np.array(target_obj["pcd"].points),
                 np.concatenate(a, axis=0),
                 pts,
                 tsdf_planner,
@@ -532,7 +541,7 @@ def query_vlm_multi_agent(
             )
             if obj_pos is None:
                 obj_pos = select_navigation_corner(
-                    aabb=obj["bbox"], robot_position=pts
+                    aabb=target_obj["bbox"], robot_position=pts
                 )
                 logging.info(
                     f"multi_agent target Image {img_path}: {obj_pos} "

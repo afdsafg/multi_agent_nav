@@ -265,7 +265,6 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 # retrieve step summaries via subtask_metadata -> step_dict
                 subtask_metadata['episode_memory'] = episode_memory
                 scene.image_pool = None
-                scene.filtered_snapshots = set()
                 if hasattr(episode_memory, 'start_new_subtask'):
                     episode_memory.start_new_subtask(subtask_id)
 
@@ -502,9 +501,15 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                 f"Subtask id {subtask_id} invalid: query_vlm_for_response failed!"
                             )
                             # M5: record high-level plan before break
-                            if subtask_metadata.get('high_level_plan') is not None and hasattr(episode_memory, 'add_entry'):
+                            hlp_break = subtask_metadata.get('high_level_plan')
+                            # F6: defensive - hlp may be TextMemoryEntry (if set
+                            # from get_latest_high_level_plan and never updated
+                            # this step), extract .content for consistency.
+                            if hasattr(hlp_break, 'content'):
+                                hlp_break = hlp_break.content
+                            if hlp_break is not None and hasattr(episode_memory, 'add_entry'):
                                 episode_memory.add_entry(
-                                    content=subtask_metadata['high_level_plan'],
+                                    content=hlp_break,
                                     entry_type='high_level_planner_output',
                                     step=cnt_step,
                                 )
