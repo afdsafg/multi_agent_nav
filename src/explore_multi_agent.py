@@ -1019,6 +1019,9 @@ def parse_retain_frontier_ids(
         valid = set(valid_ids)
         ids = [i for i in ids if i in valid]
     return sorted(set(ids))
+
+
+def _parse_high_level_plan_response(response: Optional[str]) -> Optional[str]:
     """Extract the <update_todo_list>...</update_todo_list> block (or
     <todos>...</todos>) from the planner response. Returns the raw XML
     block string, or None."""
