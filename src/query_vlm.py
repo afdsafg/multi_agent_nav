@@ -361,19 +361,11 @@ def query_vlm_multi_agent(
     step_dict["use_full_obj_list"] = cfg.use_full_obj_list
 
     step_dict["frontier_imgs"] = [
-        encode_tensor2base64(frontier.feature) for frontier in tsdf_planner.frontiers
+        frontier.feature for frontier in tsdf_planner.frontiers
     ]
-
     if cfg.egocentric_views:
         step_dict["egocentric_views"] = rgb_egocentric_views
         step_dict["use_egocentric_views"] = True
-        # Bug1 fix: explore_multi_agent reads 'egocentric_imgs' (b64 list),
-        # not raw tensors. Encode here so the multi-agent pipeline can consume.
-        step_dict["egocentric_imgs"] = [
-            encode_tensor2base64(v) for v in rgb_egocentric_views
-        ]
-    else:
-        step_dict["egocentric_imgs"] = []
 
     step_dict["question"] = subtask_metadata["question"]
     step_dict["task_type"] = subtask_metadata["task_type"]
@@ -385,9 +377,6 @@ def query_vlm_multi_agent(
     step_dict["scene"] = scene
     step_dict["tsdf_planner"] = tsdf_planner
     step_dict["egocentric_views"] = rgb_egocentric_views
-    step_dict["frontier_imgs"] = [
-        encode_tensor2base64(frontier.feature) for frontier in tsdf_planner.frontiers
-    ]
 
     # multi-agent specific metadata
     step_dict["is_new_subtask"] = subtask_metadata.get("is_new_subtask", False)
@@ -426,6 +415,10 @@ def query_vlm_multi_agent(
     }
     step_dict["processed_images"] = processed_images
     step_dict["image_map_reverse"] = image_map_reverse
+    # KSS returns b64-encoded egocentric_imgs and frontier_imgs; overwrite
+    # the raw tensors in step_dict so explore_multi_agent consumes b64 directly.
+    step_dict["egocentric_imgs"] = _egocentric_imgs_kss
+    step_dict["frontier_imgs"] = _frontier_imgs_kss
 
     # query multi-agent vlm
     try:
