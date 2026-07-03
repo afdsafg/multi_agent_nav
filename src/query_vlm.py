@@ -1,5 +1,5 @@
 import logging
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional, Union, List, Dict, Any
 import random
 import numpy as np
 
@@ -18,6 +18,87 @@ from src.conceptgraph.slam.utils import (
     init_process_pcd,
     detections_to_obj_pcd_and_bbox,
 )
+from src.memory_structures import (
+    TargetCandidate, SubtaskWorkingMemory,
+    S_GROUNDED_3D, S_VISUAL_ONLY, S_NEED_CLOSER_VIEW, S_REJECTED,
+    get_aliases,
+)
+
+# Phase C: generic class proposals for class-agnostic grounding (Level 3).
+_GENERIC_CLASSES = ["object", "item", "thing", "furniture", "appliance"]
+# CLIP rerank threshold for accepting a class-agnostic proposal.
+_CLIP_RERANK_THRESH = 0.20
+
+
+def _cam_pose_to_yaw(cam_pose: np.ndarray) -> float:
+    """Extract camera yaw (radians) from a 4x4 world->cam / cam->world pose.
+
+    Habitat convention: camera forward is -z. We use the rotation submatrix
+    to recover the heading. Returns 0.0 if pose is malformed.
+    """
+    try:
+        R = cam_pose[:3, :3]
+        # forward vector in world = R @ [0,0,-1] = -R[:,2]
+        fwd = -R[:3, 2]
+        return float(np.arctan2(fwd[0], fwd[2]))
+    except Exception:
+        return 0.0
+
+
+def _yolo_detect(scene: Scene, classes: List[str], image_rgb, conf: float):
+    """Run YOLOWorld with a temporary class list, then restore scene classes."""
+    scene.detection_model.set_classes(classes)
+    try:
+        results = scene.detection_model.predict(image_rgb, conf=conf, verbose=False)
+    finally:
+        scene.detection_model.set_classes(scene.obj_classes.get_classes_arr())
+    if len(results) == 0 or len(results[0].boxes) == 0:
+        return None
+    return results[0]
+
+
+def _clip_rerank_bbox(
+    scene: Scene, image_rgb, xyxy_np: np.ndarray, target_phrase: str,
+    aliases: List[str],
+) -> Tuple[int, float]:
+    """Score each bbox crop against target_phrase + aliases via CLIP.
+
+    Returns (best_idx, best_score).
+    """
+    from PIL import Image
+    try:
+        from src.conceptgraph.utils.model_utils import clip_recognition
+    except Exception:
+        clip_recognition = None
+    if clip_recognition is None or scene.clip_model is None:
+        return 0, 0.0
+    prompts = [target_phrase] + [a for a in aliases if a.lower() != target_phrase.lower()]
+    best_idx, best_score = 0, -1.0
+    for i in range(len(xyxy_np)):
+        x1, y1, x2, y2 = xyxy_np[i].astype(int)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(image_rgb.shape[1], x2), min(image_rgb.shape[0], y2)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+        crop = image_rgb[y1:y2, x1:x2]
+        best_for_this = 0.0
+        for p in prompts:
+            try:
+                probs = clip_recognition(
+                    scene.clip_model, scene.clip_tokenizer,
+                    scene.clip_preprocess, crop, p,
+                )
+                # probs is softmax over [prompt]; take the prompt's prob
+                score = float(probs[0]) if hasattr(probs, '__len__') else float(probs)
+                best_for_this = max(best_for_this, score)
+            except Exception:
+                continue
+        if best_for_this > best_score:
+            best_score = best_for_this
+            best_idx = i
+    return best_idx, best_score
+
+
 def random_frontier_choice(tsdf_planner: TSDFPlanner, n_filtered_snapshots):
     """
     Choose a random frontier from the TSDF planner.
@@ -474,8 +555,7 @@ def query_vlm_multi_agent(
 
     # parse by target_type
     if target_type == "image":
-        # AVU + VVD branch (reused from query_vlm_for_response).
-        # img_path is target_index (given by Answerer directly).
+        # Phase C: four-level grounding. img_path is target_index (Answerer).
         img_path = target_index
         object_class = class_name_if_image
         if object_class is None:
@@ -489,23 +569,109 @@ def query_vlm_multi_agent(
             )
             return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
         target_image = scene.all_observations[img_path]
-        try:
-            scene.detection_model.set_classes([object_class])
-            results = scene.detection_model.predict(
-                target_image, conf=cfg.AVU_conf_threshold, verbose=False
+        cam_pose = scene.all_cam_poses[img_path]
+        view_yaw = _cam_pose_to_yaw(cam_pose)
+        aliases = get_aliases(object_class)
+        # working_memory may be None (Phase H wires it in). Create candidate if present.
+        working_memory = subtask_metadata.get("working_memory", None)
+        step_index = subtask_metadata.get("current_step", 0)
+        candidate = None
+        if working_memory is not None:
+            candidate = working_memory.get_or_create_candidate(
+                image_path=img_path,
+                target_phrase=object_class,
+                source_step=step_index,
+                camera_pose=cam_pose,
+                view_yaw=view_yaw,
             )
-            scene.detection_model.set_classes(scene.obj_classes.get_classes_arr())
-            if len(results) == 0 or len(results[0].boxes) == 0:
+            logging.info(
+                f"[AVU] candidate {candidate.candidate_id} phrase='{object_class}' "
+                f"aliases={aliases} status={candidate.status}"
+            )
+
+        try:
+            # ---- Level 1: YOLO(target_phrase) ----
+            result = _yolo_detect(scene, [object_class], target_image, cfg.AVU_conf_threshold)
+            if result is not None:
+                logging.info(f"[AVU] L1 YOLO('{object_class}') detected")
+                if candidate is not None:
+                    candidate.record_attempt(1, True, "YOLO target phrase")
+            else:
+                logging.info(f"[AVU] L1 YOLO('{object_class}') no detection, trying aliases")
+                if candidate is not None:
+                    candidate.record_attempt(1, False, "no YOLO box for target phrase")
+                # ---- Level 2: YOLO(aliases) ----
+                for alias in aliases:
+                    if alias.lower() == object_class.lower():
+                        continue
+                    result = _yolo_detect(scene, [alias], target_image, cfg.AVU_conf_threshold)
+                    if result is not None:
+                        logging.info(f"[AVU] L2 YOLO alias '{alias}' detected")
+                        if candidate is not None:
+                            candidate.record_attempt(2, True, f"alias '{alias}'")
+                        break
+                if result is None:
+                    if candidate is not None:
+                        candidate.record_attempt(2, False, "no alias detected")
+                    # ---- Level 3: generic classes + CLIP rerank ----
+                    result = _yolo_detect(scene, _GENERIC_CLASSES, target_image, cfg.AVU_conf_threshold)
+                    if result is not None:
+                        xyxy_np_all = result.boxes.xyxy.cpu().numpy()
+                        best_idx, best_score = _clip_rerank_bbox(
+                            scene, target_image, xyxy_np_all, object_class, aliases
+                        )
+                        if best_score >= _CLIP_RERANK_THRESH:
+                            logging.info(
+                                f"[AVU] L3 class-agnostic + CLIP rerank accepted "
+                                f"(score={best_score:.3f})"
+                            )
+                            if candidate is not None:
+                                candidate.record_attempt(3, True, f"CLIP score {best_score:.3f}")
+                            # keep only the best bbox
+                            keep = result.boxes.xyxy[best_idx:best_idx+1, ...]
+                            result.boxes.xyxy = keep
+                            result.boxes.conf = result.boxes.conf[best_idx:best_idx+1]
+                            result.boxes.cls = result.boxes.cls[best_idx:best_idx+1]
+                        else:
+                            logging.info(
+                                f"[AVU] L3 CLIP rerank rejected (score={best_score:.3f} "
+                                f"< {_CLIP_RERANK_THRESH})"
+                            )
+                            if candidate is not None:
+                                candidate.record_attempt(3, False, f"CLIP score {best_score:.3f}")
+                            result = None
+                    else:
+                        if candidate is not None:
+                            candidate.record_attempt(3, False, "no generic class detection")
+
+            # ---- Level 4: evidence-pose navigation (no detection) ----
+            if result is None:
                 logging.info(
-                    f"No objects detected in {img_path}, choose random frontier"
+                    f"[AVU] L4 all detection failed, navigate to evidence-pose "
+                    f"(img {img_path}, yaw={view_yaw:.2f})"
                 )
-                return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
-            confidences = results[0].boxes.conf.cpu().numpy()
-            max_idx = confidences.argmax()
+                if candidate is not None:
+                    candidate.record_attempt(4, False, "evidence-pose navigation")
+                # Return the camera pose that captured the evidence so the
+                # agent navigates there and re-observes from a closer view.
+                # cam_pose is a 4x4 world->cam; target_point is cam position
+                # in habitat coords = cam_pose[:3, 3] (if cam->world) or the
+                # inverse. scene stores cam_poses consistent with tsdf usage.
+                # We return it as the navigation target; set_next_navigation_point
+                # treats 'image' choice as a habitat position.
+                try:
+                    cam_pos_habitat = cam_pose[:3, 3]
+                except Exception:
+                    cam_pos_habitat = None
+                if cam_pos_habitat is None:
+                    return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+                return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
+
+            # ---- Grounded (L1/L2/L3): run SAM + point cloud + VVD ----
+            confidences = result.boxes.conf.cpu().numpy()
+            max_idx = int(confidences.argmax())
             max_confidence = confidences[max_idx: max_idx + 1]
-            detection_class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
-            max_detection_class_ids = detection_class_ids[max_idx: max_idx + 1]
-            xyxy_tensor = results[0].boxes.xyxy[max_idx: max_idx + 1, ...]
+            xyxy_tensor = result.boxes.xyxy[max_idx: max_idx + 1, ...]
             sam_out = scene.sam_predictor.predict(
                 target_image, bboxes=xyxy_tensor, verbose=False
             )
@@ -516,7 +682,7 @@ def query_vlm_multi_agent(
                 masks=masks_np,
                 cam_K=scene.intrinsics[:3, :3],
                 image_rgb=target_image,
-                trans_pose=scene.all_cam_poses[img_path],
+                trans_pose=cam_pose,
                 min_points_threshold=scene.cfg_cg.min_points_threshold,
                 spatial_sim_type=scene.cfg_cg.spatial_sim_type,
                 obj_pcd_max_points=scene.cfg_cg.obj_pcd_max_points,
@@ -535,15 +701,17 @@ def query_vlm_multi_agent(
                         spatial_sim_type=scene.cfg_cg["spatial_sim_type"],
                         pcd=obj["pcd"],
                     )
-            # F5: pick first valid detection (loop above leaves `obj` pointing
-            # at the last element, which may be None -> TypeError on obj["pcd"])
             valid_objs = [o for o in obj_pcds_and_bboxes if o is not None]
             if not valid_objs:
                 logging.info(
                     f"All detections invalid for {img_path}, choose random frontier"
                 )
+                if candidate is not None:
+                    candidate.record_attempt(3, False, "SAM/pcd invalid")
                 return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
             target_obj = valid_objs[0]
+            if candidate is not None:
+                working_memory.grounded_candidate(candidate.candidate_id)
             a = []
             for idx in scene.objects.keys():
                 a.append(scene.objects[idx]["pcd"].points)
@@ -572,6 +740,8 @@ def query_vlm_multi_agent(
             logging.info(
                 f"AVU/VVD failed for {img_path}: {e}, choose random frontier"
             )
+            if candidate is not None:
+                candidate.record_attempt(4, False, f"exception: {e}")
             return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
 
     elif target_type == "frontier":
