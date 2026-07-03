@@ -791,13 +791,16 @@ def parse_retain_response(
     """
     if response is None:
         return []
-    pattern = rf"Retain\s+{re.escape(keyword)}\s*:\s*\{{([^}}]*)\}}"
+    # Robust to VLM output variants:
+    #   "Retain Images: {0, 2}" | "Retain Images: 0, 2" | "Retain Images: {0,2}"
+    #   trailing dot/semicolon; missing braces; extra whitespace.
+    pattern = rf"Retain\s+{re.escape(keyword)}\s*[:：]?\s*\{{?([^}}\]\n]*)\}}?"
     match = re.search(pattern, response, re.IGNORECASE)
     if not match:
         return []
     indices = []
     for tok in match.group(1).split(","):
-        tok = tok.strip()
+        tok = tok.strip().rstrip(".;: ")
         if tok.isdigit():
             indices.append(int(tok))
     return sorted(set(indices))
