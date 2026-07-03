@@ -467,6 +467,8 @@ def query_vlm_multi_agent(
     step_dict["current_position"] = pts
     # M4: pass episode_memory so High-Level Planner can retrieve step summaries
     step_dict["episode_memory"] = subtask_metadata.get("episode_memory", None)
+    # Phase H: pass working_memory so agents can read candidates/feedback
+    step_dict["working_memory"] = subtask_metadata.get("working_memory", None)
 
     # Bug2 fix: explore_multi_agent reads 'processed_images' and
     # 'image_map_reverse' (built by KSS) but they were never computed here,

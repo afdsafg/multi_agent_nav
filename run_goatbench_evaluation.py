@@ -40,6 +40,7 @@ from src.dataset_utils import prepare_goatbench_navigation_goals
 from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end, query_vlm_multi_agent
 from src.long_term_memory import TextLongTermMemory
 from src.logger_goatbench import Logger
+from src.memory_structures import SubtaskWorkingMemory
 import time
 
 
@@ -236,6 +237,11 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
             # cross-subtask long-term memory for multi-agent workflow
             episode_memory = TextLongTermMemory()
+            # Phase H: SubtaskWorkingMemory lives at episode level so the
+            # frontier_registry geometry persists across subtasks (marked
+            # STALE on reset). Working state (pool/pinned/candidates/feedback)
+            # is reset each subtask.
+            working_memory = SubtaskWorkingMemory()
 
             # run questions in the scene
             global_step = -1
@@ -258,13 +264,18 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
                 # multi-agent: carry high-level plan + reset snapshot/frontier state.
                 # is_new_subtask is set per-step in the main loop (L451-454).
-                # 记忆跨subtask继承, start_new_subtask 仅记录边界, 不清空记忆。
-                # C3: get_latest_high_level_plan returns TextMemoryEntry; extract .content
-                latest_plan_entry = episode_memory.get_latest_high_level_plan() if hasattr(episode_memory, 'get_latest_high_level_plan') else None
-                subtask_metadata['high_level_plan'] = latest_plan_entry.content if latest_plan_entry is not None else None
                 # M4: pass episode_memory reference so High-Level Planner can
                 # retrieve step summaries via subtask_metadata -> step_dict
                 subtask_metadata['episode_memory'] = episode_memory
+                # Phase H: explicit working memory reset + plan clear.
+                # Long-term memory (all_observations/objects/edges/M3DSG) is
+                # NOT cleared; only per-subtask working state is reset.
+                working_memory.reset_for_new_subtask(
+                    subtask_id=subtask_id,
+                    question=subtask_metadata.get("question", ""),
+                )
+                subtask_metadata['working_memory'] = working_memory
+                subtask_metadata['high_level_plan'] = None  # do NOT inherit plan
                 scene.image_pool = None
                 if hasattr(episode_memory, 'start_new_subtask'):
                     episode_memory.start_new_subtask(subtask_id)
