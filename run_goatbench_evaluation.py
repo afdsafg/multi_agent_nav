@@ -258,7 +258,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 # multi-agent: carry high-level plan + reset snapshot/frontier state.
                 # is_new_subtask is set per-step in the main loop (L451-454).
                 # 记忆跨subtask继承, start_new_subtask 仅记录边界, 不清空记忆。
-                subtask_metadata['high_level_plan'] = episode_memory.get_latest_high_level_plan() if hasattr(episode_memory, 'get_latest_high_level_plan') else None
+                # C3: get_latest_high_level_plan returns TextMemoryEntry; extract .content
+                latest_plan_entry = episode_memory.get_latest_high_level_plan() if hasattr(episode_memory, 'get_latest_high_level_plan') else None
+                subtask_metadata['high_level_plan'] = latest_plan_entry.content if latest_plan_entry is not None else None
+                # M4: pass episode_memory reference so High-Level Planner can
+                # retrieve step summaries via subtask_metadata -> step_dict
+                subtask_metadata['episode_memory'] = episode_memory
                 scene.image_pool = None
                 scene.filtered_snapshots = set()
                 if hasattr(episode_memory, 'start_new_subtask'):
@@ -292,6 +297,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         init_clearance=cfg.init_clearance * 2,
                         save_visualization=cfg.save_visualization,
                     )
+                    # M7: clear stale plan — old plan was based on a now-invalid
+                    # scene graph; keeping it would mislead the planner.
+                    subtask_metadata['high_level_plan'] = None
 
                 while cnt_step < num_step - 1:
                     decision = {}
@@ -469,6 +477,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             # update high-level plan in subtask_metadata + episode_memory
                             if vlm_response is not None and hasattr(episode_memory, 'add_entry'):
                                 hlp = subtask_metadata.get('high_level_plan', None)
+                                # C4: defensive - hlp may be TextMemoryEntry, extract .content
+                                if hasattr(hlp, 'content'):
+                                    hlp = hlp.content
                                 if hlp is not None:
                                     episode_memory.add_entry(
                                         content=hlp,
@@ -490,6 +501,13 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             logging.info(
                                 f"Subtask id {subtask_id} invalid: query_vlm_for_response failed!"
                             )
+                            # M5: record high-level plan before break
+                            if subtask_metadata.get('high_level_plan') is not None and hasattr(episode_memory, 'add_entry'):
+                                episode_memory.add_entry(
+                                    content=subtask_metadata['high_level_plan'],
+                                    entry_type='high_level_planner_output',
+                                    step=cnt_step,
+                                )
                             break
 
                         target_type, max_point_choice, n_filtered_frames, target_index = vlm_response
@@ -509,6 +527,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             logging.info(
                                 f"Subtask id {subtask_id} invalid: set_next_navigation_point failed!"
                             )
+                            # M6: record decision before break
+                            his_decision[cnt_step] = decision
                             break
                     timer.stop("Querying the VLM")
 
@@ -532,6 +552,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         logging.info(
                             f"Subtask id {subtask_id} invalid: agent_step failed!"
                         )
+                        # M6: record decision before break
+                        his_decision[cnt_step] = decision
                         break
 
                     # update agent's position and rotation

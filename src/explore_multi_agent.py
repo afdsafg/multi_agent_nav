@@ -19,6 +19,7 @@ import re
 from typing import List, Dict, Any, Optional, Tuple
 
 from src.explore_utils import call_openai_api, encode_tensor2base64, resize_image, format_question
+from src.plan_extraction_utils import extract_todo_list_from_text
 
 
 # ---------------------------------------------------------------------------
@@ -468,12 +469,18 @@ def format_high_level_planner_prompt(
     frontier_imgs: List[str],
     high_level_plan_prev: Optional[str],
     is_new_subtask: bool,
+    image_goal: Optional[str] = None,
+    memory: Optional[Any] = None,
 ) -> Tuple[str, list]:
     """High-Level Planner prompt.
 
     Ported from Pred-EQA format_high_level_plan_prompt. Outputs XML
-    <update_todo_list>. If is_new_subtask=True, appends a NEW SUBTASK block
-    instructing the planner to reorganize memory and plan.
+    <update_todo_list>. If is_new_subtask=True, prepends a NEW SUBTASK block
+    instructing the planner to discard stale directives and plan fresh.
+
+    Args:
+        image_goal: base64 reference image for image-type subtasks.
+        memory: TextLongTermMemory instance for retrieving step summaries.
     """
     sys_prompt = (
         "Task: You are a HIGH-LEVEL EXPLORATION PLANNER AGENT responsible for "
@@ -483,25 +490,35 @@ def format_high_level_planner_prompt(
         "observe an attribute) and output them as an ordered to-do list. "
         "This plan will guide the low-level agents in subsequent steps.\n\n"
         "Instructions:\n"
-        "1. Analyze the user's question and identify its type (object "
-        "recognition, attribute recognition, spatial relationship, object "
-        "state, functional reasoning, world knowledge, or object "
-        "localization).\n"
+        "1. Analyze the user's question and identify its target.\n"
+    )
+    # M2: GOAT-Bench three-class task_type adaptation
+    if task_type == "object":
+        sys_prompt += (
+            "   - Target: find object of category "
+            f"\"{question}\" in the environment.\n"
+        )
+    elif task_type == "description":
+        sys_prompt += (
+            "   - Target: find object matching natural language "
+            f"description: \"{question}\".\n"
+        )
+    elif task_type == "image":
+        sys_prompt += (
+            "   - Target: find object matching the reference image provided.\n"
+        )
+    else:
+        sys_prompt += (
+            f"   - Target: find the object described by: \"{question}\".\n"
+        )
+    sys_prompt += (
         "2. Decompose the question into subgoals. For example:\n"
-        "   - Object recognition: Determine which object to find and where "
-        "it is likely located.\n"
-        "   - Attribute recognition: Identify the object and which attribute "
-        "to check.\n"
-        "   - Spatial understanding: Decide which locations or objects need "
-        "exploration to understand their spatial arrangement.\n"
-        "   - Object state recognition: Determine which object's state to "
-        "verify and how to observe it.\n"
-        "   - Functional reasoning: Identify relevant objects that "
-        "demonstrate the function in question.\n"
-        "   - World knowledge: Use typical associations (e.g., kitchen "
-        "contains a fridge) to infer where to search.\n"
-        "   - Object localization: Plan a search sequence for locating the "
-        "object in different rooms.\n"
+        "   - Determine which object to find and where it is likely "
+        "located.\n"
+        "   - Decide which locations or objects need exploration to "
+        "understand their spatial arrangement.\n"
+        "   - Use typical associations (e.g., kitchen contains a fridge) "
+        "to infer where to search.\n"
         "3. For each subgoal, create a clear task (e.g., \"Go to the "
         "kitchen\", \"Find the refrigerator\", \"Check the microwave's door "
         "status\").\n"
@@ -510,6 +527,11 @@ def format_high_level_planner_prompt(
         "generate multiple parallel prediction-based exploration branches as "
         "testable hypotheses based on current observations and world "
         "knowledge.\n"
+        "Example: instead of [ ] Find the kitchen, create:\n"
+        "[ ] Explore the frontier leading to the hallway since it may lead "
+        "to the kitchen\n"
+        "[ ] Explore the frontier leading to the living area since it may "
+        "also lead to the kitchen\n"
         "5. Combine these immediate predictive branches and the remaining "
         "downstream high-level tasks into a single, cohesive, ordered to-do "
         "list. Place the parallel predictive branches at the very top as the "
@@ -552,16 +574,61 @@ def format_high_level_planner_prompt(
     )
     content = []
 
+    # C1+C2(3): NEW SUBTASK block FIRST (highest priority context)
+    if is_new_subtask:
+        new_subtask_text = (
+            "--- NEW SUBTASK ---\n"
+            "Previous subtask completed/failed. New subtask:\n"
+            f"Task type: {task_type} (object|description|image)\n"
+            f"Question: {question}\n\n"
+            "IMPORTANT: The previous plan is from a DIFFERENT subtask with a "
+            "DIFFERENT target. You MUST:\n"
+            "1. Discard all stale spatial directives from the previous plan "
+            "(e.g. \"Go to kitchen\" is irrelevant if new target is not in "
+            "kitchen).\n"
+            "2. Preserve useful spatial knowledge (rooms visited, object "
+            "locations, layout connections) as context.\n"
+            "3. Generate a FRESH TODO list for the new target. Mark old "
+            "unrelated branches [x] with reason \"irrelevant to new "
+            "subtask\".\n"
+        )
+        content.append((new_subtask_text,))
+
     content.append((f"Target Question: {question}\n",))
     content.append((f"Task type: {task_type}\n",))
 
-    # Previous plan
+    # M3: inject reference image for image-type subtasks
+    if image_goal is not None and task_type == "image":
+        content.append(("Reference Image:\n", image_goal))
+        content.append(("\n",))
+
+    # C1+C2(1): label previous plan as completed reference when new subtask
     if high_level_plan_prev:
-        content.append((
-            f"Previous High-Level Plan:\n{high_level_plan_prev}\n",
-        ))
+        if is_new_subtask:
+            content.append((
+                "Previous Subtask Plan (COMPLETED, for reference only):\n"
+                f"{high_level_plan_prev}\n",
+            ))
+        else:
+            content.append((
+                f"Previous High-Level Plan:\n{high_level_plan_prev}\n",
+            ))
     else:
         content.append(("No previous high-level plan.\n",))
+
+    # M4: inject recent step summaries from long-term memory
+    if memory is not None:
+        try:
+            summaries = memory.retrieve_by_type(
+                'step_summary_output', top_k=3
+            )
+            if summaries:
+                summary_lines = ["Previous Steps Summary:\n"]
+                for s in summaries:
+                    summary_lines.append(f"- {s.content}\n")
+                content.append(("".join(summary_lines),))
+        except Exception:
+            pass  # memory may not support retrieve_by_type
 
     # Images (clues) - images only, no ids per content constraint
     content.append(("Currently observed visual clues:\n",))
@@ -595,17 +662,6 @@ def format_high_level_planner_prompt(
         "</update_todo_list>\n"
     )
     content.append((text,))
-
-    # New subtask injection
-    if is_new_subtask:
-        new_subtask_text = (
-            "--- NEW SUBTASK ---\n"
-            "Previous subtask completed/failed. "
-            f"New subtask: task_type={task_type}, question={question}. "
-            "Please review and reorganize your memory and plan for this new "
-            "target."
-        )
-        content.append((new_subtask_text,))
 
     return sys_prompt, content
 
@@ -809,6 +865,17 @@ def _parse_high_level_plan_response(response: Optional[str]) -> Optional[str]:
     match = re.search(pattern, response, re.IGNORECASE)
     if match:
         return f"<todos>{match.group(1)}</todos>"
+    # m1: final fallback - extract todo items from plain text and wrap
+    todo_list = extract_todo_list_from_text(response)
+    if todo_list:
+        lines = []
+        for item in todo_list:
+            status_char = {'pending': '[ ]', 'in_progress': '[-]',
+                           'completed': '[x]'}.get(item.get('status', ''), '[ ]')
+            lines.append(f"{status_char} {item.get('task', '')}")
+        wrapped = "<update_todo_list>\n<todos>\n" + \
+                  "\n".join(lines) + "\n</todos>\n</update_todo_list>"
+        return wrapped
     return None
 
 
@@ -982,6 +1049,8 @@ def explore_multi_agent(
         frontier_imgs,
         high_level_plan,
         is_new_subtask,
+        image_goal=image_goal,
+        memory=step.get("episode_memory"),
     )
     if verbose:
         logging.info("[High-Level Planner] calling VLM")

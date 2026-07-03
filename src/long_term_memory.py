@@ -67,6 +67,25 @@ class TextLongTermMemory:
         # 重新排序时间戳索引
         self.timestamp_index = [e.id for e in sorted(self.entries, key=lambda x: x.timestamp)]
 
+        # m2: capacity eviction — evict oldest entry when over max_size
+        if len(self.entries) > self.max_size:
+            evicted = self.entries.pop(0)
+            # update indices
+            if evicted.entry_type in self.type_index:
+                try:
+                    self.type_index[evicted.entry_type].remove(evicted.id)
+                except ValueError:
+                    pass
+            if evicted.step in self.step_index:
+                try:
+                    self.step_index[evicted.step].remove(evicted.id)
+                except ValueError:
+                    pass
+            try:
+                self.timestamp_index.remove(evicted.id)
+            except ValueError:
+                pass
+
         return entry_id
 
 
