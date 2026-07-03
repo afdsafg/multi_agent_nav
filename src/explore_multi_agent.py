@@ -386,11 +386,16 @@ def format_answerer_prompt(
     image_goal: Optional[str],
     high_level_plan: Optional[str],
     history_decision: Optional[Dict[str, Any]] = None,
+    candidates_block: str = "",
+    feedback_block: str = "",
 ) -> Tuple[str, list]:
-    """Answerer prompt (rewritten for GOAT-Bench).
+    """Answerer prompt (Phase E tri-state for GOAT-Bench).
 
-    Output format: 'Image i, <class>' (i = pool index, <class> = target
-    category name) or 'Continue Exploration'.
+    Output format: structured tri-state decision.
+    - NOT_FOUND: target not visible, continue exploration.
+    - CANDIDATE_VISIBLE: target likely visible but not confirmed (small /
+      occluded / edge of frame). Creates a TargetCandidate for grounding.
+    - TARGET_CONFIRMED: target clearly visible and identifiable. Triggers AVU.
 
     For GOAT-Bench three task types:
     - object: find the object of the specified category.
@@ -411,20 +416,18 @@ def format_answerer_prompt(
     if task_type == "object":
         sys_prompt += (
             "   - This is an OBJECT task: find the object of the specified "
-            "category in the environment. If any image clearly contains "
-            "the target object, report it.\n"
+            "category in the environment.\n"
         )
     elif task_type == "description":
         sys_prompt += (
             "   - This is a DESCRIPTION task: find the object exactly "
-            "matching the natural-language description. If any image "
-            "contains an object matching the description, report it.\n"
+            "matching the natural-language description.\n"
         )
     elif task_type == "image":
         sys_prompt += (
             "   - This is an IMAGE task: find the same object shown in the "
             "reference image. Compare the reference image with each image "
-            "in the pool and report the matching one.\n"
+            "in the pool.\n"
         )
     else:
         sys_prompt += (
@@ -432,11 +435,24 @@ def format_answerer_prompt(
             "and check the images.\n"
         )
     sys_prompt += (
-        "4. If ANY image contains information sufficient to identify the "
-        "target object, output the image index and the target category "
-        "name.\n"
-        "5. If NO image provides sufficient information, output Continue "
-        "Exploration.\n"
+        "4. Output ONE of three decisions:\n"
+        "   - NOT_FOUND: no image shows the target or any likely candidate.\n"
+        "   - CANDIDATE_VISIBLE: an image shows a LIKELY candidate but it is "
+        "small, partially occluded, at the edge of frame, or you are not "
+        "fully certain. This will trigger closer-view grounding.\n"
+        "   - TARGET_CONFIRMED: an image clearly and centrally shows the "
+        "target object — directly visible, identifiable, not just inferred "
+        "from common sense.\n"
+        "5. TARGET_CONFIRMED is ONLY allowed when ALL of these hold:\n"
+        "   - the target's main body is directly visible (not merely "
+        "'probably in the room' or 'just outside frame');\n"
+        "   - identification is from visual evidence, not common-sense "
+        "guessing;\n"
+        "   - for small objects, you can point to a specific region of the "
+        "image;\n"
+        "   - for attribute questions, the attribute itself is visible.\n"
+        "   Otherwise use CANDIDATE_VISIBLE (if something plausible is "
+        "visible) or NOT_FOUND.\n"
     )
 
     content = []
@@ -454,6 +470,12 @@ def format_answerer_prompt(
         content.append((f"Current High-Level Plan:\n{high_level_plan}\n",))
     else:
         content.append(("No high-level plan yet.\n",))
+
+    # Phase E: active candidates + feedback
+    if candidates_block:
+        content.append((candidates_block,))
+    if feedback_block:
+        content.append((feedback_block,))
 
     # Images
     content.append(("Available Images:\n",))
@@ -474,11 +496,25 @@ def format_answerer_prompt(
     text = (
         "Output Format:\n"
         "1. First, think step by step and explain your reasoning clearly.\n"
-        "2. If answerable, provide your final answer in the EXACT format: "
-        '"Image i, <class>" where i is the image index and <class> is '
-        "the target object category name. Example: Image 3, espresso "
-        "machine\n"
-        'If not answerable, use format: "Continue Exploration"'
+        "2. Then output a structured decision block in EXACTLY this format:\n"
+        "Decision: NOT_FOUND | CANDIDATE_VISIBLE | TARGET_CONFIRMED\n"
+        "Image: <i>          (image index; omit if NOT_FOUND)\n"
+        "Target phrase: <class>   (target category; omit if NOT_FOUND)\n"
+        "Visibility:\n"
+        "  directly_visible: yes | no\n"
+        "  central_enough: yes | no\n"
+        "  partially_occluded: yes | no\n"
+        "  approximate_location: <short text, e.g. 'right side near lamp'>\n"
+        "  confidence: <0.0-1.0>\n"
+        "Need action: move closer | rotate | ground with AVU | none\n"
+        "\n"
+        "Examples:\n"
+        "Decision: TARGET_CONFIRMED\n"
+        "Image: 3\n"
+        "Target phrase: espresso machine\n"
+        "...\n"
+        "Decision: NOT_FOUND\n"
+        "(no Image / Target phrase lines)\n"
     )
     content.append((text,))
     return sys_prompt, content
@@ -829,36 +865,62 @@ def parse_retain_response(
 
 def parse_answerer_response(
     response: Optional[str],
-) -> Optional[Tuple[int, str]]:
-    """Parse Answerer response.
+) -> Optional[Tuple[str, Optional[int], Optional[str]]]:
+    """Parse Answerer tri-state response (Phase E).
 
     Returns:
-        (pool_index, class_name) for 'Image i, <class>', or None for
-        'Continue Exploration'. Returns None on parse failure too.
+        (decision, idx_or_None, class_name_or_None) where decision is one of
+        'NOT_FOUND' | 'CANDIDATE_VISIBLE' | 'TARGET_CONFIRMED'.
+        Returns ('NOT_FOUND', None, None) on parse failure / Continue.
     """
     if response is None:
-        return None
+        return ("NOT_FOUND", None, None)
     text = response.strip()
-    # Take the last non-empty line that looks like an answer (after reasoning)
     lower = text.lower()
-    if "continue exploration" in lower:
-        return None
-    # Match 'Image i, <class>' or 'Snapshot i, <class>' (case-insensitive)
-    pattern = r"(?:Image|Snapshot)\s+(\d+)\s*,\s*(.+?)(?:\n|$)"
-    matches = re.findall(pattern, text, re.IGNORECASE)
-    if not matches:
-        return None
-    idx_str, class_name = matches[-1]
-    try:
-        idx = int(idx_str)
-    except ValueError:
-        return None
-    class_name = class_name.strip().rstrip(".")
-    # Strip trailing reasoning in parentheses
-    class_name = re.sub(r"\s*\(.*$", "", class_name).strip()
-    if not class_name:
-        return None
-    return idx, class_name
+
+    # Detect decision keyword (case-insensitive). Prefer the last occurrence.
+    decision = None
+    for m in re.finditer(r"Decision\s*[:：]\s*([A-Z_]+)", text, re.IGNORECASE):
+        decision = m.group(1).strip().upper()
+    if decision is None:
+        # Legacy / freeform: 'continue exploration' → NOT_FOUND
+        if "continue exploration" in lower:
+            return ("NOT_FOUND", None, None)
+        # Legacy 'Image i, <class>' → treat as TARGET_CONFIRMED for back-compat
+        pattern = r"(?:Image|Snapshot)\s+(\d+)\s*,\s*(.+?)(?:\n|$)"
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            idx_str, class_name = matches[-1]
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                return ("NOT_FOUND", None, None)
+            class_name = re.sub(r"\s*\(.*$", "", class_name.strip().rstrip(".")).strip()
+            if class_name:
+                return ("TARGET_CONFIRMED", idx, class_name)
+        return ("NOT_FOUND", None, None)
+
+    if decision == "NOT_FOUND":
+        return ("NOT_FOUND", None, None)
+
+    # CANDIDATE_VISIBLE or TARGET_CONFIRMED: extract Image + Target phrase
+    idx = None
+    class_name = None
+    img_m = re.search(r"Image\s*[:：]\s*(\d+)", text, re.IGNORECASE)
+    if img_m:
+        try:
+            idx = int(img_m.group(1))
+        except ValueError:
+            idx = None
+    phrase_m = re.search(r"Target\s+phrase\s*[:：]\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+    if phrase_m:
+        class_name = re.sub(r"\s*\(.*$", "", phrase_m.group(1).strip().rstrip(".")).strip()
+        if not class_name:
+            class_name = None
+    if idx is None or class_name is None:
+        # malformed → treat as NOT_FOUND to avoid bad AVU
+        return ("NOT_FOUND", None, None)
+    return (decision, idx, class_name)
 
 
 def parse_executor_response(response: Optional[str]) -> int:
@@ -1166,32 +1228,40 @@ def explore_multi_agent(
             f"{len(frontier_imgs)} <= 1)"
         )
 
-    # e. Answerer
+    # e. Answerer (Phase E: tri-state)
+    candidates_block = ""
+    feedback_block = ""
+    if working_memory is not None:
+        candidates_block = working_memory.candidates_prompt_block()
+        feedback_block = working_memory.feedback_prompt_block()
     sys_p, content = format_answerer_prompt(
         question, pool, task_type, image_goal, high_level_plan,
         history_decision=history_decision,
+        candidates_block=candidates_block,
+        feedback_block=feedback_block,
     )
     if verbose:
         logging.info("[Answerer] calling VLM")
     raw = call_openai_api(sys_p, content)
-    answer = parse_answerer_response(raw)
-    if answer is not None:
-        idx, class_name = answer
-        if 0 <= idx < len(pool):
-            img_path = pool[idx]["img_path"]
-            reason = _extract_reason(raw)
-            _record_step_summary(step, f"Answerer chose Image {idx} ({img_path}), class={class_name}")
-            logging.info(
-                f"[Answerer] Image {idx} ({img_path}), class={class_name}"
-            )
-            return ("image", img_path, reason, n_filtered, class_name)
-        else:
-            logging.info(
-                f"[Answerer] index {idx} out of pool range {len(pool)}, "
-                "falling through to exploration"
-            )
+    decision, idx, class_name = parse_answerer_response(raw)
+    reason = _extract_reason(raw)
+    if decision in ("CANDIDATE_VISIBLE", "TARGET_CONFIRMED") and idx is not None and 0 <= idx < len(pool):
+        img_path = pool[idx]["img_path"]
+        _record_step_summary(
+            step,
+            f"Answerer {decision} Image {idx} ({img_path}), class={class_name}"
+        )
+        logging.info(
+            f"[Answerer] {decision} Image {idx} ({img_path}), class={class_name}"
+        )
+        return ("image", img_path, reason, n_filtered, class_name)
+    elif decision in ("CANDIDATE_VISIBLE", "TARGET_CONFIRMED"):
+        logging.info(
+            f"[Answerer] {decision} but index {idx} out of pool range "
+            f"{len(pool)}, falling through to exploration"
+        )
     else:
-        logging.info("[Answerer] Continue Exploration")
+        logging.info("[Answerer] NOT_FOUND, continue exploration")
 
     # f. High-Level Planner
     sys_p, content = format_high_level_planner_prompt(
