@@ -10,7 +10,10 @@ from typing import Optional
 import logging
 import numpy as np 
 import heapq
-import ollama
+try:
+    import ollama
+except ImportError:
+    ollama = None
 import re
 from src.utils import resize_image
 from src.const import *
