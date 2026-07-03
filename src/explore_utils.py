@@ -114,6 +114,13 @@ def call_openai_api(sys_prompt, contents) -> Optional[str]:
             continue
         except Exception as e:
             print("Error: ", e)
+            # print response body for 4xx errors (e.g. 400 Bad Request)
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    print("Response body:", resp.text)
+                except Exception:
+                    pass
             err_text = str(e).lower()
             if "content management policy" in err_text or "response was filtered" in err_text:
                 return "Continue Exploration"
