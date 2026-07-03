@@ -361,6 +361,11 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             scene.all_depths[obs_file_name] = depth
                             scene.all_cam_poses[obs_file_name] = cam_pose
                             scene.all_obs_point[obs_file_name] = tsdf_planner.habitat2voxel(pts)
+                            # Save each rendered view to disk for Answerer debugging
+                            if cfg.save_visualization:
+                                views_dir = os.path.join(str(cfg.output_dir), subtask_id, "views")
+                                os.makedirs(views_dir, exist_ok=True)
+                                plt.imsave(os.path.join(views_dir, obs_file_name), rgb[..., :3])
                             scene.global_step_cnt = global_step
                             rgb_egocentric_views.append(
                                 resize_image(rgb, cfg.prompt_h, cfg.prompt_w)
