@@ -82,6 +82,13 @@ success_distance: 0.25  # the distance threshold for a successful navigation
 clear_up_memory_every_subtask: false
 use_full_obj_list: false
 
+# Phase B/D/G: working memory + frontier registry parameters
+max_frontier_reselect: 2        # max times a frontier can be selected before being hard-excluded
+frontier_recent_window: 3       # frontiers selected within this many recent steps are excluded
+max_pool_size: 6                # image pool soft cap (pinned evidence is force-kept)
+candidate_max_closer_view_attempts: 3  # release a VISUAL_ONLY candidate after this many closer-view failures
+planner_stale_threshold: 2      # force replan after N unchanged planner outputs
+
 # whether to save visualization (which is slow)
 save_visualization: true ########### "false" to speed up, without visualization
 

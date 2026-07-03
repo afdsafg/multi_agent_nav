@@ -586,12 +586,28 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
                     # update agent's position and rotation
                     pts, angle, pts_voxel, fig, _, target_arrived = return_values
-                    
-                    
+
+
                     logger.log_step(pts_voxel=pts_voxel)
                     logging.info(
                         f"Current position: {pts}, {logger.subtask_explore_dist:.3f}"
                     )
+
+                    # Phase B/F: frontier reached -> mark + feedback
+                    if target_type == "frontier" and target_arrived:
+                        fid = decision.get("frontier_id", -1)
+                        if fid is not None and fid >= 0:
+                            tsdf_planner.mark_frontier_result(fid, "NO_NEW_INFO")
+                            wm = subtask_metadata.get("working_memory", None)
+                            if wm is not None:
+                                wm.mark_frontier_reached(fid, "NO_NEW_INFO")
+                                wm.add_feedback(
+                                    step=cnt_step,
+                                    type_="FRONTIER_NO_INFO",
+                                    reason=f"Frontier F_{int(fid):03d} reached, no new target info",
+                                    frontier_id=int(fid),
+                                    suggested_fix="select a different frontier",
+                                )
 
                     # sanity check about objects, scene graph, ...
                     scene.sanity_check(cfg=cfg)
