@@ -21,6 +21,7 @@ from src.conceptgraph.slam.utils import (
 from src.memory_structures import (
     TargetCandidate, SubtaskWorkingMemory,
     S_GROUNDED_3D, S_VISUAL_ONLY, S_NEED_CLOSER_VIEW, S_REJECTED,
+    FB_AVU_FAIL, FB_AVU_VISUAL_ONLY,
     get_aliases,
 )
 
@@ -654,6 +655,14 @@ def query_vlm_multi_agent(
                 )
                 if candidate is not None:
                     candidate.record_attempt(4, False, "evidence-pose navigation")
+                if working_memory is not None:
+                    working_memory.add_feedback(
+                        step=step_index,
+                        type_=FB_AVU_VISUAL_ONLY,
+                        reason=f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose",
+                        suggested_fix="re-observe from closer view; try aliases",
+                        target_candidate_id=candidate.candidate_id if candidate else None,
+                    )
                 # Return the camera pose that captured the evidence so the
                 # agent navigates there and re-observes from a closer view.
                 # cam_pose is a 4x4 world->cam; target_point is cam position
@@ -666,7 +675,18 @@ def query_vlm_multi_agent(
                 except Exception:
                     cam_pos_habitat = None
                 if cam_pos_habitat is None:
-                    return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+                    logging.info(
+                        f"[AVU] L4 evidence-pose unavailable, stop (no random frontier)"
+                    )
+                    if working_memory is not None:
+                        working_memory.add_feedback(
+                            step=step_index,
+                            type_=FB_AVU_VISUAL_ONLY,
+                            reason=f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; evidence-pose unavailable",
+                            suggested_fix="re-observe from closer view; try aliases",
+                            target_candidate_id=candidate.candidate_id if candidate else None,
+                        )
+                    return None
                 return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
 
             # ---- Grounded (L1/L2/L3): run SAM + point cloud + VVD ----
@@ -706,11 +726,25 @@ def query_vlm_multi_agent(
             valid_objs = [o for o in obj_pcds_and_bboxes if o is not None]
             if not valid_objs:
                 logging.info(
-                    f"All detections invalid for {img_path}, choose random frontier"
+                    f"All detections invalid for {img_path}, navigate to evidence-pose"
                 )
                 if candidate is not None:
                     candidate.record_attempt(3, False, "SAM/pcd invalid")
-                return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+                if working_memory is not None:
+                    working_memory.add_feedback(
+                        step=step_index,
+                        type_=FB_AVU_VISUAL_ONLY,
+                        reason=f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose",
+                        suggested_fix="re-observe from closer view; try aliases",
+                        target_candidate_id=candidate.candidate_id if candidate else None,
+                    )
+                try:
+                    cam_pos_habitat = cam_pose[:3, 3]
+                except Exception:
+                    cam_pos_habitat = None
+                if cam_pos_habitat is None:
+                    return None
+                return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
             target_obj = valid_objs[0]
             if candidate is not None:
                 working_memory.grounded_candidate(candidate.candidate_id)
@@ -740,11 +774,25 @@ def query_vlm_multi_agent(
             return target_type, obj_pos, n_filtered_snapshots, target_index
         except Exception as e:
             logging.info(
-                f"AVU/VVD failed for {img_path}: {e}, choose random frontier"
+                f"AVU/VVD failed for {img_path}: {e}, navigate to evidence-pose or stop"
             )
             if candidate is not None:
                 candidate.record_attempt(4, False, f"exception: {e}")
-            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+            if working_memory is not None:
+                working_memory.add_feedback(
+                    step=step_index,
+                    type_=FB_AVU_FAIL,
+                    reason=f"AVU exception: {e}",
+                    suggested_fix="retry grounding from evidence-pose; consider aliases",
+                    target_candidate_id=candidate.candidate_id if candidate else None,
+                )
+            try:
+                cam_pos_habitat = cam_pose[:3, 3]
+            except Exception:
+                cam_pos_habitat = None
+            if cam_pos_habitat is None:
+                return None
+            return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
 
     elif target_type == "frontier":
         target_index = int(target_index)
