@@ -87,12 +87,18 @@ def call_openai_api(sys_prompt, contents) -> Optional[str]:
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": formated_content},
     ]
-    # 打印 prompt 摘要 (像原 MSGNav 一样可见)
+    # 打印完整 prompt (文本部分, 跳过 base64 图片)
     n_images = sum(1 for c in contents if len(c) == 2)
-    logging.info(f"[VLM] calling model={mode}, sys_prompt={len(sys_prompt)} chars, "
-                 f"content_parts={len(contents)}, images={n_images}")
-    if logging.getLogger().isEnabledFor(logging.DEBUG):
-        logging.debug(f"[VLM] sys_prompt head: {sys_prompt[:200]}...")
+    logging.info(f"[VLM] === calling model={mode}, content_parts={len(contents)}, images={n_images} ===")
+    logging.info(f"[VLM] SYS_PROMPT:\n{sys_prompt}")
+    # 拼接 user content 文本部分 (图片只标记 [IMAGE i])
+    user_text_parts = []
+    for idx, c in enumerate(contents):
+        if len(c) == 2:
+            user_text_parts.append(f"[IMAGE @ part {idx}]")
+        else:
+            user_text_parts.append(c[0])
+    logging.info(f"[VLM] USER_CONTENT:\n{''.join(user_text_parts)}")
     while retry_count < max_tries:
         try:
             if mode == 'gpt':
@@ -113,8 +119,8 @@ def call_openai_api(sys_prompt, contents) -> Optional[str]:
                     presence_penalty=0,
                 )
             resp = completion.choices[0].message.content
-            # 打印 VLM 回应 (截断到 500 字符避免日志爆炸)
-            logging.info(f"[VLM] response: {resp[:500]}{'...' if len(resp) > 500 else ''}")
+            # 打印完整 VLM 回应
+            logging.info(f"[VLM] RESPONSE:\n{resp}")
             return resp
         except openai.RateLimitError as e:
             print("Rate limit error, waiting for 60s")
