@@ -370,6 +370,7 @@ class TSDFPlanner(TSDFPlannerBase):
         self.frontiers = filtered_frontiers
 
         # create new frontiers and add to frontier list
+        counter_at_start = self.frontier_counter
         for ft_data in valid_ft_angles:
             # exclude the new frontier's region that is already covered by the existing frontiers
             ft_data["region"] = ft_data["region"] & np.logical_not(kept_frontier_area)
@@ -381,6 +382,15 @@ class TSDFPlanner(TSDFPlannerBase):
                         cur_point=cur_point,
                     )
                 )
+
+        # §4: geometric re-association. New frontiers (fresh counter id) may
+        # match a STALE registry entry from a frontier that disappeared ≥1
+        # step ago. Reclaim the old stable id so identity survives reappear.
+        new_frontiers = [
+            f for f in self.frontiers if f.frontier_id >= counter_at_start
+        ]
+        if new_frontiers:
+            self._reassociate_stale_frontiers(new_frontiers)
 
         # Turn to face each frontier point and get rgb image
         for i, frontier in enumerate(self.frontiers):
@@ -944,6 +954,42 @@ class TSDFPlanner(TSDFPlannerBase):
 
     def free_frontier(self, frontier: Frontier):
         self.frontier_map[self.frontier_map == frontier.frontier_id] = 0
+
+    def _reassociate_stale_frontiers(self, new_frontiers: List[Frontier]) -> None:
+        """§4: match newly-created frontiers to STALE registry entries by
+        centroid distance (<1.0m) and yaw similarity (<30deg). First-match-
+        wins; reassign the stable old id so identity survives reappear."""
+        if not self.frontier_registry:
+            return
+        stale_items = [
+            (fid, fs) for fid, fs in self.frontier_registry.items()
+            if fs.status == F_STALE
+        ]
+        if not stale_items:
+            return
+        for nf in new_frontiers:
+            pos_world = self.voxel2habitat(nf.position)
+            n_centroid = np.array([pos_world[0], 0.0, pos_world[2]])
+            n_yaw = float(np.arctan2(nf.orientation[1], nf.orientation[0]))
+            for old_id, fs in stale_items:
+                if fs.status != F_STALE:
+                    continue  # claimed by an earlier new frontier
+                d = float(np.linalg.norm(n_centroid - fs.centroid))
+                if d >= 1.0:
+                    continue
+                dyaw = abs(n_yaw - fs.view_yaw)
+                dyaw = (dyaw + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi,pi]
+                if abs(dyaw) >= (30.0 * np.pi / 180.0):
+                    continue
+                # match: reclaim old id
+                logging.info(
+                    f"§4 reassociate: frontier {nf.frontier_id} -> {old_id} "
+                    f"(d={d:.3f}m, dyaw={np.degrees(abs(dyaw)):.1f}deg)"
+                )
+                self.frontier_map[nf.region] = old_id
+                nf.frontier_id = old_id
+                fs.status = F_ACTIVE  # so upsert below treats as existing-active
+                break
 
     # Phase B: frontier selection bookkeeping (called by main loop after
     # Executor picks a frontier). selected_count suppresses reselection;
