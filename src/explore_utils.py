@@ -87,6 +87,12 @@ def call_openai_api(sys_prompt, contents) -> Optional[str]:
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": formated_content},
     ]
+    # 打印 prompt 摘要 (像原 MSGNav 一样可见)
+    n_images = sum(1 for c in contents if len(c) == 2)
+    logging.info(f"[VLM] calling model={mode}, sys_prompt={len(sys_prompt)} chars, "
+                 f"content_parts={len(contents)}, images={n_images}")
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(f"[VLM] sys_prompt head: {sys_prompt[:200]}...")
     while retry_count < max_tries:
         try:
             if mode == 'gpt':
@@ -106,7 +112,10 @@ def call_openai_api(sys_prompt, contents) -> Optional[str]:
                     top_p=0.7,
                     presence_penalty=0,
                 )
-            return completion.choices[0].message.content
+            resp = completion.choices[0].message.content
+            # 打印 VLM 回应 (截断到 500 字符避免日志爆炸)
+            logging.info(f"[VLM] response: {resp[:500]}{'...' if len(resp) > 500 else ''}")
+            return resp
         except openai.RateLimitError as e:
             print("Rate limit error, waiting for 60s")
             time.sleep(30)

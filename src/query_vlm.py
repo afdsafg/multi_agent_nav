@@ -392,33 +392,55 @@ def query_vlm_multi_agent(
     # so the snapshot pool was always empty. Run Key_Subgraph_Selection the
     # same way explore_two_step does (see explore_utils.py L801-818) and
     # populate both keys.
+    # 设计: KSS 仅在 subtask 的 step0 (is_new_subtask=True) 运行并注入图像边,
+    # 其他步骤跳过 KSS (processed_images 为空), explore_multi_agent 只追加 egocentric。
     step_dict["use_prefiltering"] = cfg.prefiltering
     step_dict["top_k_categories"] = cfg.top_k_categories
     step_dict["use_AVU"] = getattr(cfg, "use_AVU", step_dict.get("use_AVU", True))
     use_room_filter = cfg.use_room_filter
-    (
-        _question_kss,
-        _image_goal_kss,
-        _egocentric_imgs_kss,
-        _selected_objs,
-        _selected_edges,
-        processed_images,
-        _frontier_imgs_kss,
-    ) = Key_Subgraph_Selection(
-        step_dict, verbose, cfg.use_ollama, use_room_filter
-    )
-    # Key_Subgraph_Selection returns processed_images but not
-    # image_map_reverse; build the reverse index consistent with
-    # Prompt_with_AVU_and_CLR (explore_utils.py L286-291).
-    image_map_reverse = {
-        idx: img_key for idx, img_key in enumerate(processed_images.keys())
-    }
-    step_dict["processed_images"] = processed_images
-    step_dict["image_map_reverse"] = image_map_reverse
-    # KSS returns b64-encoded egocentric_imgs and frontier_imgs; overwrite
-    # the raw tensors in step_dict so explore_multi_agent consumes b64 directly.
-    step_dict["egocentric_imgs"] = _egocentric_imgs_kss
-    step_dict["frontier_imgs"] = _frontier_imgs_kss
+    is_new_subtask = subtask_metadata.get("is_new_subtask", False)
+    if is_new_subtask:
+        (
+            _question_kss,
+            _image_goal_kss,
+            _egocentric_imgs_kss,
+            _selected_objs,
+            _selected_edges,
+            processed_images,
+            _frontier_imgs_kss,
+        ) = Key_Subgraph_Selection(
+            step_dict, verbose, cfg.use_ollama, use_room_filter
+        )
+        # Key_Subgraph_Selection returns processed_images but not
+        # image_map_reverse; build the reverse index consistent with
+        # Prompt_with_AVU_and_CLR (explore_utils.py L286-291).
+        image_map_reverse = {
+            idx: img_key for idx, img_key in enumerate(processed_images.keys())
+        }
+        step_dict["processed_images"] = processed_images
+        step_dict["image_map_reverse"] = image_map_reverse
+        # KSS returns b64-encoded egocentric_imgs and frontier_imgs; overwrite
+        # the raw tensors in step_dict so explore_multi_agent consumes b64 directly.
+        step_dict["egocentric_imgs"] = _egocentric_imgs_kss
+        step_dict["frontier_imgs"] = _frontier_imgs_kss
+        if verbose:
+            logging.info(f"[KSS] step0 injected {len(processed_images)} edge images, "
+                         f"{len(_egocentric_imgs_kss)} egocentric, "
+                         f"{len(_frontier_imgs_kss)} frontiers")
+    else:
+        # non-step0: skip KSS, only encode egocentric + frontier for multi-agent
+        step_dict["processed_images"] = {}
+        step_dict["image_map_reverse"] = {}
+        step_dict["egocentric_imgs"] = [
+            encode_tensor2base64(v) for v in rgb_egocentric_views
+        ] if cfg.egocentric_views else []
+        step_dict["frontier_imgs"] = [
+            encode_tensor2base64(f.feature) for f in tsdf_planner.frontiers
+        ]
+        if verbose:
+            logging.info(f"[KSS] skipped (non-step0), "
+                         f"{len(step_dict['egocentric_imgs'])} egocentric, "
+                         f"{len(step_dict['frontier_imgs'])} frontiers")
 
     # query multi-agent vlm
     try:
