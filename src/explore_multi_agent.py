@@ -987,9 +987,20 @@ def explore_multi_agent(
                 pool = new_pool
                 step["image_pool"] = pool
         else:
-            logging.info(
-                "[Image Manager] no valid retain response, keeping pool"
-            )
+            # Fallback: VLM 回应解析失败 (可能 pool 过大导致输出截断),
+            # 保留最近 3 张 (最新 egocentric) 防止 pool 无限膨胀。
+            MAX_POOL_FALLBACK = 3
+            if len(pool) > MAX_POOL_FALLBACK:
+                logging.info(
+                    f"[Image Manager] no valid retain response, "
+                    f"fallback keep latest {MAX_POOL_FALLBACK} of {len(pool)}"
+                )
+                pool = pool[-MAX_POOL_FALLBACK:]
+                step["image_pool"] = pool
+            else:
+                logging.info(
+                    "[Image Manager] no valid retain response, keeping pool"
+                )
     else:
         logging.info(
             f"[Image Manager] skipped (pool size {len(pool)} <= 3)"
