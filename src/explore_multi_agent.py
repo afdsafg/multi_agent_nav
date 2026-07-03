@@ -219,11 +219,12 @@ def format_frontier_manager_prompt(
     pool: List[Dict[str, Any]],
     high_level_plan: Optional[str],
     task_type: str,
+    frontier_states: Optional[List[Any]] = None,
 ) -> Tuple[str, list]:
     """Frontier Manager prompt.
 
     Ported from Pred-EQA format_plan_manager_prompt. Outputs
-    'Retain Frontiers: {i,...}'.
+    'Retain Frontiers: {F_XXX, ...}' using stable frontier IDs.
     """
     sys_prompt = (
         "Task: You are an EXPLORATION DIRECTION MANAGEMENT AGENT responsible "
@@ -252,6 +253,9 @@ def format_frontier_manager_prompt(
         "6. REMEMBER, the key is to avoid deleting potentially useful "
         "information. When in doubt, err on the side of caution and retain "
         "the frontier.\n"
+        "7. Each frontier has a STABLE ID like F_023. Use this ID (not the "
+        "display index) in your output. Frontiers marked DO NOT SELECT or "
+        "status=EXPLORED must be pruned.\n"
     )
     content = []
 
@@ -277,20 +281,22 @@ def format_frontier_manager_prompt(
         content.append(("No frontiers available\n",))
     else:
         for i, img in enumerate(frontier_imgs):
-            content.append((f"Frontier {i}: ", img))
+            fs = frontier_states[i] if frontier_states and i < len(frontier_states) else None
+            if fs is not None:
+                header = f"Frontier {fs.to_prompt_str(local_index=i)}: "
+            else:
+                header = f"Frontier {i}: "
+            content.append((header, img))
             content.append(("\n",))
-        if len(frontier_imgs) == 1:
-            content.append(("Available Frontier indices: 0\n",))
-        else:
-            content.append((
-                f"Available Frontier indices: 0-{len(frontier_imgs) - 1}\n",
-            ))
+        ids = [fs.frontier_id for fs in frontier_states] if frontier_states else list(range(len(frontier_imgs)))
+        id_strs = ", ".join(f"F_{i:03d}" for i in ids)
+        content.append((f"Available Frontier IDs: {id_strs}\n",))
 
     text = (
         "Output Format:\n"
         "1. First, think step by step and explain your reasoning clearly.\n"
         '2. Then, provide your final answer in the exact format: '
-        '"Retain Frontiers: {i, ...}" (retain at least 1 frontier).'
+        '"Retain Frontiers: {F_XXX, F_YYY}" (retain at least 1 frontier).'
     )
     content.append((text,))
     return sys_prompt, content
@@ -332,8 +338,13 @@ def _format_clr_block(history_decision: Optional[Dict[str, Any]]) -> str:
         # object_judge=='no' (confirmed wrong by task_check).
         if target_type == "frontier":
             have_decision = True
+            fid = decision.get("frontier_id")
+            if fid is not None:
+                fid_str = f"F_{int(fid):03d}"
+            else:
+                fid_str = str(choice)
             lines.append(
-                f"    step {s_key}: Choosing Frontier {choice} to explore, "
+                f"    step {s_key}: Choosing Frontier {fid_str} to explore, "
                 "already explored."
             )
             continue
@@ -684,6 +695,7 @@ def format_executor_prompt(
     high_level_plan: Optional[str],
     task_type: str,
     history_decision: Optional[Dict[str, Any]] = None,
+    frontier_states: Optional[List[Any]] = None,
 ) -> Tuple[str, list]:
     """Low-Level Executor prompt.
 
@@ -747,14 +759,16 @@ def format_executor_prompt(
         content.append(("No frontiers available\n",))
     else:
         for i, img in enumerate(frontier_imgs):
-            content.append((f"Frontier {i}: ", img))
+            fs = frontier_states[i] if frontier_states and i < len(frontier_states) else None
+            if fs is not None:
+                header = f"Frontier {fs.to_prompt_str(local_index=i)}: "
+            else:
+                header = f"Frontier {i}: "
+            content.append((header, img))
             content.append(("\n",))
-        if len(frontier_imgs) == 1:
-            content.append(("Available Frontier indices: 0\n",))
-        else:
-            content.append((
-                f"Available Frontier indices: 0-{len(frontier_imgs) - 1}\n",
-            ))
+        ids = [fs.frontier_id for fs in frontier_states] if frontier_states else list(range(len(frontier_imgs)))
+        id_strs = ", ".join(f"F_{i:03d}" for i in ids)
+        content.append((f"Available Frontier IDs: {id_strs}\n",))
 
     # F7: CLR - inject history of wrong decisions so Executor avoids them
     clr_text = _format_clr_block(history_decision)
@@ -765,8 +779,9 @@ def format_executor_prompt(
         "Output Format:\n"
         "1. First, think step by step and explain your reasoning clearly.\n"
         "2. Then, provide your final answer in the exact format: "
-        '"Next Step: Frontier i" or "Stop Exploration", where i is the index '
-        "of the frontier you choose."
+        '"Next Step: Frontier F_XXX" or "Stop Exploration", where F_XXX is '
+        "the stable ID of the frontier you choose. Do NOT select frontiers "
+        "marked DO NOT SELECT or status=EXPLORED."
     )
     content.append((text,))
     return sys_prompt, content
@@ -870,7 +885,68 @@ def parse_executor_response(response: Optional[str]) -> int:
         return -1
 
 
-def _parse_high_level_plan_response(response: Optional[str]) -> Optional[str]:
+def parse_executor_frontier_id(response: Optional[str]) -> int:
+    """Parse Executor response for a stable frontier ID.
+
+    Returns:
+        frontier_id (int) for 'Frontier F_XXX', or -1 for 'Stop Exploration'
+        / parse failure.
+    """
+    if response is None:
+        return -1
+    text = response.strip()
+    if "stop exploration" in text.lower():
+        return -1
+    # Match 'F_023' (stable ID). Fall back to bare integer for robustness.
+    pattern = r"F_?(\d+)"
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    if matches:
+        try:
+            return int(matches[-1])
+        except ValueError:
+            return -1
+    # Legacy fallback: 'Frontier i' with plain index
+    pattern = r"Frontier\s+(\d+)"
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    if matches:
+        try:
+            return int(matches[-1])
+        except ValueError:
+            return -1
+    return -1
+
+
+def parse_retain_frontier_ids(
+    response: Optional[str],
+    valid_ids: Optional[List[int]] = None,
+) -> List[int]:
+    """Parse 'Retain Frontiers: {F_XXX, F_YYY}' into a list of frontier IDs.
+
+    Args:
+        valid_ids: if provided, filter parsed IDs to this set (defensive).
+    """
+    if response is None:
+        return []
+    pattern = (
+        rf"Retain\s+{re.escape('Frontiers')}\s*[:：]\s*\{{?\s*"
+        r"(F_?\d+(?:\s*,\s*F_?\d+|\s*,\s*\d+)*)"
+        r"\s*\}?"
+    )
+    match = re.search(pattern, response, re.IGNORECASE)
+    ids: List[int] = []
+    if match:
+        for tok in re.findall(r"F_?(\d+)|\b(\d+)\b", match.group(1)):
+            val = tok[0] or tok[1]
+            if val.isdigit():
+                ids.append(int(val))
+    if not ids:
+        # legacy: plain indices 'Retain Frontiers: 0, 2'
+        legacy = parse_retain_response(response, "Frontiers")
+        ids = legacy
+    if valid_ids is not None:
+        valid = set(valid_ids)
+        ids = [i for i in ids if i in valid]
+    return sorted(set(ids))
     """Extract the <update_todo_list>...</update_todo_list> block (or
     <todos>...</todos>) from the planner response. Returns the raw XML
     block string, or None."""
@@ -952,6 +1028,16 @@ def explore_multi_agent(
     step_index = step.get("step_index", 0)
     high_level_plan = step.get("high_level_plan", None)
     history_decision = step.get("CLR", {})
+    tsdf_planner = step.get("tsdf_planner", None)
+    # Phase B: build frontier_states list aligned with frontier_imgs.
+    # frontier_imgs are encoded from tsdf_planner.frontiers in order.
+    frontier_states = []
+    if tsdf_planner is not None:
+        for f in tsdf_planner.frontiers:
+            fs = tsdf_planner.frontier_registry.get(f.frontier_id)
+            frontier_states.append(fs)
+    # Phase B: working memory (SubtaskWorkingMemory) if provided by main loop
+    working_memory = step.get("working_memory", None)
 
     # b. image pool maintenance
     pool = step.get("image_pool", None)
@@ -1018,24 +1104,36 @@ def explore_multi_agent(
     # d. Frontier Manager (only when frontier count > 1)
     if len(frontier_imgs) > 1:
         sys_p, content = format_frontier_manager_prompt(
-            question, frontier_imgs, pool, high_level_plan, task_type
+            question, frontier_imgs, pool, high_level_plan, task_type,
+            frontier_states=frontier_states,
         )
         if verbose:
             logging.info("[Frontier Manager] calling VLM")
         raw = call_openai_api(sys_p, content)
-        retain_frontier_idx = parse_retain_response(raw, "Frontiers")
-        if retain_frontier_idx:
+        valid_ids = [fs.frontier_id for fs in frontier_states if fs is not None]
+        retain_ids = parse_retain_frontier_ids(raw, valid_ids=valid_ids)
+        if retain_ids:
+            # map retained frontier_ids back to positional indices
+            id_to_pos = {
+                fs.frontier_id: i for i, fs in enumerate(frontier_states) if fs is not None
+            }
             new_frontier_imgs = [
-                frontier_imgs[i]
-                for i in retain_frontier_idx
-                if 0 <= i < len(frontier_imgs)
+                frontier_imgs[id_to_pos[fid]]
+                for fid in retain_ids
+                if fid in id_to_pos and 0 <= id_to_pos[fid] < len(frontier_imgs)
             ]
             if new_frontier_imgs:
                 logging.info(
                     f"[Frontier Manager] filtered to "
-                    f"{len(new_frontier_imgs)} frontiers"
+                    f"{len(new_frontier_imgs)} frontiers (ids={retain_ids})"
                 )
                 frontier_imgs = new_frontier_imgs
+                # keep frontier_states in sync (filter to retained ids)
+                retained_set = set(retain_ids)
+                frontier_states = [
+                    fs for fs in frontier_states
+                    if fs is not None and fs.frontier_id in retained_set
+                ]
         else:
             logging.info(
                 "[Frontier Manager] no valid retain response, keeping all"
@@ -1099,16 +1197,27 @@ def explore_multi_agent(
     sys_p, content = format_executor_prompt(
         question, frontier_imgs, pool, high_level_plan, task_type,
         history_decision=history_decision,
+        frontier_states=frontier_states,
     )
     if verbose:
         logging.info("[Executor] calling VLM")
     raw = call_openai_api(sys_p, content)
-    frontier_idx = parse_executor_response(raw)
+    frontier_id = parse_executor_frontier_id(raw)
     reason = _extract_reason(raw)
-    if frontier_idx >= 0 and frontier_idx < len(frontier_imgs):
-        logging.info(f"[Executor] Frontier {frontier_idx}")
-        _record_step_summary(step, f"Executor chose Frontier {frontier_idx}")
-        return ("frontier", frontier_idx, reason, n_filtered, None)
+    # map frontier_id -> positional index in the (possibly filtered) list
+    id_to_pos = {
+        fs.frontier_id: i for i, fs in enumerate(frontier_states) if fs is not None
+    }
+    if frontier_id >= 0 and frontier_id in id_to_pos:
+        pos = id_to_pos[frontier_id]
+        logging.info(f"[Executor] Frontier F_{frontier_id:03d} (pos {pos})")
+        _record_step_summary(step, f"Executor chose Frontier F_{frontier_id:03d}")
+        # Phase B: mark selected in registry + working memory
+        if tsdf_planner is not None:
+            tsdf_planner.mark_frontier_selected(frontier_id)
+        if working_memory is not None:
+            working_memory.mark_frontier_selected(frontier_id)
+        return ("frontier", pos, reason, n_filtered, None)
     else:
         # 'Stop Exploration' or parse failure
         logging.info("[Executor] Stop Exploration")

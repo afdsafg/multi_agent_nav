@@ -19,6 +19,7 @@ from src.habitat import pos_normal_to_habitat, pos_habitat_to_normal
 from src.tsdf_base import TSDFPlannerBase
 from src.conceptgraph.slam.slam_classes import MapObjectDict
 from src.utils import resize_image
+from src.memory_structures import FrontierState, F_ACTIVE, F_EXPLORED, FR_NO_NEW_INFO, FR_FOUND_CANDIDATE
 
 
 @dataclass
@@ -102,6 +103,9 @@ class TSDFPlanner(TSDFPlannerBase):
         # about frontier allocation
         self.frontier_map = np.zeros(self._vol_dim[:2], dtype=int)
         self.frontier_counter = 1
+        # Phase B: stable frontier registry. Maps frontier_id -> FrontierState.
+        # Populated by update_frontier_map, read by agent_step + multi-agent.
+        self.frontier_registry: Dict[int, "FrontierState"] = {}
 
         # about storing occupancy information on each step
         self.unexplored = None
@@ -345,11 +349,13 @@ class TSDFPlanner(TSDFPlannerBase):
                         # create a new frontier with the old image
                         old_img_path = frontier.image
                         old_img_feature = frontier.feature
+                        old_fid = frontier.frontier_id  # Phase B: keep stable id
                         filtered_frontiers.append(
                             self.create_frontier(
                                 valid_ft_angles[update_ft_idx],
                                 frontier_edge_areas=frontier_edge_areas,
                                 cur_point=cur_point,
+                                frontier_id=old_fid,
                             )
                         )
                         filtered_frontiers[-1].image = old_img_path
@@ -409,6 +415,38 @@ class TSDFPlanner(TSDFPlannerBase):
                 )
                 frontier.image = f"{cnt_step}_{i}.png"
                 frontier.feature = processed_rgb
+
+        # Phase B: sync frontier_registry with current frontier list.
+        # Upsert FrontierState for every current frontier; mark missing ones
+        # STALE so they are not preferred but their geometry is remembered.
+        current_ids = {f.frontier_id for f in self.frontiers}
+        for f in self.frontiers:
+            pos_world = self.voxel2habitat(f.position)
+            centroid = np.array([pos_world[0], 0.0, pos_world[2]])
+            yaw = float(np.arctan2(f.orientation[1], f.orientation[0]))
+            area = float(np.sum(f.region))
+            existing = self.frontier_registry.get(f.frontier_id)
+            if existing is None:
+                self.frontier_registry[f.frontier_id] = FrontierState(
+                    frontier_id=f.frontier_id,
+                    centroid=centroid,
+                    area=area,
+                    view_yaw=yaw,
+                    first_seen_step=cnt_step,
+                    last_seen_step=cnt_step,
+                    status=F_ACTIVE,
+                )
+            else:
+                existing.last_seen_step = cnt_step
+                existing.centroid = centroid
+                existing.area = area
+                existing.view_yaw = yaw
+                if existing.status == F_STALE:
+                    existing.status = F_ACTIVE
+        # mark disappeared frontiers STALE (not EXPLORED — they may reappear)
+        for fid, fs in self.frontier_registry.items():
+            if fid not in current_ids and fs.status == F_ACTIVE:
+                fs.status = F_STALE
 
         return True
 
@@ -741,6 +779,16 @@ class TSDFPlanner(TSDFPlannerBase):
         self._explore_vol_cpu[near_coords[:, 0], near_coords[:, 1], :] = 1
 
         if target_arrived:
+            # Phase B: mark the frontier as reached in the registry.
+            if isinstance(self.max_point, Frontier):
+                fid = self.max_point.frontier_id
+                fs = self.frontier_registry.get(fid)
+                if fs is not None:
+                    fs.reached_count += 1
+                    if fs.status != F_EXPLORED:
+                        fs.status = F_EXPLORED
+                    if fs.last_result is None:
+                        fs.last_result = FR_NO_NEW_INFO
             self.max_point = None
             self.target_point = None
 
@@ -831,7 +879,8 @@ class TSDFPlanner(TSDFPlannerBase):
         return region_map
 
     def create_frontier(
-        self, ft_data: dict, frontier_edge_areas, cur_point
+        self, ft_data: dict, frontier_edge_areas, cur_point,
+        frontier_id: Optional[int] = None,
     ) -> Frontier:
         ft_direction = np.array([np.cos(ft_data["angle"]), np.sin(ft_data["angle"])])
 
@@ -881,9 +930,10 @@ class TSDFPlanner(TSDFPlannerBase):
 
         # allocate an id for the frontier
         # assert np.all(self.frontier_map[region] == 0)
-        frontier_id = self.frontier_counter
+        if frontier_id is None:
+            frontier_id = self.frontier_counter
+            self.frontier_counter += 1
         self.frontier_map[region] = frontier_id
-        self.frontier_counter += 1
 
         return Frontier(
             position=center,
@@ -894,3 +944,49 @@ class TSDFPlanner(TSDFPlannerBase):
 
     def free_frontier(self, frontier: Frontier):
         self.frontier_map[self.frontier_map == frontier.frontier_id] = 0
+
+    # Phase B: frontier selection bookkeeping (called by main loop after
+    # Executor picks a frontier). selected_count suppresses reselection;
+    # recent list enforces a window. Returns the FrontierState or None.
+    def mark_frontier_selected(self, frontier_id: int) -> Optional[FrontierState]:
+        fs = self.frontier_registry.get(frontier_id)
+        if fs is not None:
+            fs.selected_count += 1
+        return fs
+
+    def mark_frontier_result(
+        self, frontier_id: int, result: str = FR_NO_NEW_INFO
+    ) -> None:
+        fs = self.frontier_registry.get(frontier_id)
+        if fs is None:
+            return
+        fs.reached_count += 1
+        fs.last_result = result
+        if result == FR_NO_NEW_INFO:
+            fs.status = F_EXPLORED
+        elif result == FR_FOUND_CANDIDATE:
+            fs.status = F_ACTIVE
+
+    def get_valid_frontier_ids(
+        self,
+        max_reselect: int = 2,
+        recent_window: int = 3,
+        recent_ids: Optional[List[int]] = None,
+    ) -> List[int]:
+        """Return frontier_ids currently selectable (active, under reselect cap,
+        not in recent window)."""
+        recent = set(recent_ids[-recent_window:]) if recent_ids and recent_window > 0 else set()
+        out = []
+        for f in self.frontiers:
+            fs = self.frontier_registry.get(f.frontier_id)
+            if fs is None:
+                out.append(f.frontier_id)
+                continue
+            if fs.status in (F_EXPLORED,):
+                continue
+            if fs.selected_count >= max_reselect:
+                continue
+            if f.frontier_id in recent:
+                continue
+            out.append(f.frontier_id)
+        return out

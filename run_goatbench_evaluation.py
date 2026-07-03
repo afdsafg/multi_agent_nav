@@ -524,6 +524,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         target_type, max_point_choice, n_filtered_frames, target_index = vlm_response
                         decision['target_type'] = target_type
                         decision['max_point_choice'] = target_index
+                        # Phase B: record stable frontier_id for frontier decisions
+                        if target_type == "frontier" and max_point_choice is not None:
+                            try:
+                                decision['frontier_id'] = int(getattr(max_point_choice, 'frontier_id', -1))
+                            except (TypeError, ValueError):
+                                decision['frontier_id'] = -1
                         # set the vlm choice as the navigation target
                         update_success = tsdf_planner.set_next_navigation_point(
                             target_type = target_type, 
