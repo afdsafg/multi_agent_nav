@@ -348,6 +348,30 @@ class SubtaskWorkingMemory:
         c.release()
         self.pinned_ids.discard(c.image_path)
 
+    def release_after_navigation(self, candidate_id: str) -> None:
+        """§2 release condition 1: GROUNDED_3D + navigation succeeded."""
+        self.release_candidate(candidate_id)
+
+    def reject_candidate_by_vlm(self, image_path: str, reason: str) -> None:
+        """§2 release condition 2: VLM re-confirms target NOT visible.
+        Find any active (non-rejected, non-released) candidate for the image
+        and reject it."""
+        for c in self.target_candidates.values():
+            if c.image_path == image_path and c.status not in (S_REJECTED,) and c.pinned:
+                self.reject_candidate(c.candidate_id, reason)
+                return
+
+    def check_closer_view_limit(self, candidate_id: str, max_attempts: int) -> bool:
+        """§2 release condition 3: N closer-view attempts failed → release.
+        Returns True if limit reached (and candidate released)."""
+        c = self.target_candidates.get(candidate_id)
+        if c is None:
+            return False
+        if c.closer_view_attempts >= max_attempts:
+            self.release_candidate(candidate_id)
+            return True
+        return False
+
     def active_candidates(self) -> List[TargetCandidate]:
         return [
             c for c in self.target_candidates.values()
@@ -461,6 +485,25 @@ class SubtaskWorkingMemory:
     def recent_feedback(self, n: int = 4) -> List[FeedbackEvent]:
         return self.feedback[-n:] if self.feedback else []
 
+    def suggest_fix_for(self, type_: str, reason: str = "") -> str:
+        """§7 failure-type → suggested_fix mapping. reason used to disambiguate
+        TASK_CHECK_FAIL (facing vs instance)."""
+        t = type_
+        r = (reason or "").lower()
+        if t == FB_TASK_CHECK_FAIL:
+            if "facing" in r or "view" in r or "orient" in r:
+                return "rotate toward target / use VVD viewpoint"
+            return "mark candidate rejected, find other instances"
+        if t in (FB_AVU_FAIL, FB_AVU_VISUAL_ONLY):
+            return "pin image, try aliases / class-agnostic grounding / navigate closer"
+        if t == FB_FRONTIER_NO_INFO:
+            return "select a different frontier"
+        if t == FB_PLANNER_STALE:
+            return "revise plan: mark branch completed/failed or add new branch"
+        if t == FB_WRONG_INSTANCE:
+            return "reject candidate, search for other instances"
+        return ""
+
     def feedback_prompt_block(self, n: int = 4) -> str:
         events = self.recent_feedback(n)
         if not events:
@@ -501,4 +544,51 @@ class SubtaskWorkingMemory:
         lines = ["Active Target Candidates (VLM saw but not yet grounded):"]
         for c in active:
             lines.append(c.to_prompt_str())
+        return "\n".join(lines) + "\n"
+
+    def progress_signals_block(
+        self,
+        current_pose: Any = None,
+        distance_moved: Optional[float] = None,
+        new_objects: Optional[List[str]] = None,
+        new_rooms: Optional[List[str]] = None,
+        last_frontier_id: Optional[int] = None,
+        last_frontier_result: Optional[str] = None,
+        stale_plan_count: Optional[int] = None,
+    ) -> str:
+        """§8 Progress Signals block for the Planner prompt each step. Omits
+        lines whose argument is None. Uses active_candidates / recent_feedback /
+        plan_stale_count for the derived lines. (stale_plan_count arg is
+        accepted for caller compatibility but the instance attribute wins.)"""
+        lines: List[str] = ["Progress Signals:"]
+        if current_pose is not None:
+            lines.append(f"- current pose: {current_pose}")
+        if distance_moved is not None:
+            lines.append(f"- distance moved since last step: {distance_moved}m")
+        if new_objects is not None:
+            lines.append(f"- newly observed objects: {new_objects}")
+        if new_rooms is not None:
+            lines.append(f"- newly observed room cues: {new_rooms}")
+        if last_frontier_id is not None:
+            res = last_frontier_result if last_frontier_result is not None else "none"
+            lines.append(f"- last frontier: F_{last_frontier_id:03d}, result={res}")
+        # candidate grounding status (always present, may be empty)
+        active = self.active_candidates()
+        if active:
+            status_str = "; ".join(
+                f"{c.candidate_id}={c.status}" for c in active
+            )
+        else:
+            status_str = "none"
+        lines.append(f"- candidate grounding status: {status_str}")
+        # recent feedback (last 2)
+        events = self.recent_feedback(2)
+        if events:
+            fb_str = " | ".join(
+                f"[{e.type}] {e.reason}" for e in events
+            )
+        else:
+            fb_str = "none"
+        lines.append(f"- recent feedback: {fb_str}")
+        lines.append(f"- stale_plan_count: {self.plan_stale_count}")
         return "\n".join(lines) + "\n"
