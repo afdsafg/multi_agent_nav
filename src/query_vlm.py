@@ -544,12 +544,12 @@ def query_vlm_multi_agent(
         # F5: write image_pool back to scene for next step
         scene.image_pool = step_dict.get('image_pool')
     except Exception as e:
-        logging.error(f"explore_multi_agent failed: {e}, choose random frontier")
-        return random_frontier_choice(tsdf_planner, 0)
+        logging.error(f"explore_multi_agent failed: {e}, stop (no random frontier)")
+        return None
 
     if target_type is None:
-        logging.error("explore_multi_agent returned None, choose random frontier")
-        return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+        logging.error("explore_multi_agent returned None, stop (no random frontier)")
+        return None
 
     logging.info(
         f"[multi_agent] target_type={target_type}, target_index={target_index}, "
@@ -563,14 +563,14 @@ def query_vlm_multi_agent(
         object_class = class_name_if_image
         if object_class is None:
             logging.info(
-                f"image target but no class_name, choose random frontier"
+                f"image target but no class_name, stop (no random frontier)"
             )
-            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+            return None
         if img_path not in scene.all_observations:
             logging.info(
-                f"img_path {img_path} not in all_observations, choose random frontier"
+                f"img_path {img_path} not in all_observations, stop (no random frontier)"
             )
-            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+            return None
         target_image = scene.all_observations[img_path]
         cam_pose = scene.all_cam_poses[img_path]
         view_yaw = _cam_pose_to_yaw(cam_pose)
@@ -656,11 +656,13 @@ def query_vlm_multi_agent(
                 if candidate is not None:
                     candidate.record_attempt(4, False, "evidence-pose navigation")
                 if working_memory is not None:
+                    _reason_l4a = f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose"
+                    _fix_l4a = working_memory.suggest_fix_for(FB_AVU_VISUAL_ONLY, _reason_l4a) if working_memory is not None else "re-observe from closer view; try aliases"
                     working_memory.add_feedback(
                         step=step_index,
                         type_=FB_AVU_VISUAL_ONLY,
-                        reason=f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose",
-                        suggested_fix="re-observe from closer view; try aliases",
+                        reason=_reason_l4a,
+                        suggested_fix=_fix_l4a,
                         target_candidate_id=candidate.candidate_id if candidate else None,
                     )
                 # Return the camera pose that captured the evidence so the
@@ -679,11 +681,13 @@ def query_vlm_multi_agent(
                         f"[AVU] L4 evidence-pose unavailable, stop (no random frontier)"
                     )
                     if working_memory is not None:
+                        _reason_nopose = f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; evidence-pose unavailable"
+                        _fix_nopose = working_memory.suggest_fix_for(FB_AVU_VISUAL_ONLY, _reason_nopose) if working_memory is not None else "re-observe from closer view; try aliases"
                         working_memory.add_feedback(
                             step=step_index,
                             type_=FB_AVU_VISUAL_ONLY,
-                            reason=f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; evidence-pose unavailable",
-                            suggested_fix="re-observe from closer view; try aliases",
+                            reason=_reason_nopose,
+                            suggested_fix=_fix_nopose,
                             target_candidate_id=candidate.candidate_id if candidate else None,
                         )
                     return None
@@ -731,11 +735,13 @@ def query_vlm_multi_agent(
                 if candidate is not None:
                     candidate.record_attempt(3, False, "SAM/pcd invalid")
                 if working_memory is not None:
+                    _reason_sam = f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose"
+                    _fix_sam = working_memory.suggest_fix_for(FB_AVU_VISUAL_ONLY, _reason_sam) if working_memory is not None else "re-observe from closer view; try aliases"
                     working_memory.add_feedback(
                         step=step_index,
                         type_=FB_AVU_VISUAL_ONLY,
-                        reason=f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose",
-                        suggested_fix="re-observe from closer view; try aliases",
+                        reason=_reason_sam,
+                        suggested_fix=_fix_sam,
                         target_candidate_id=candidate.candidate_id if candidate else None,
                     )
                 try:
@@ -779,11 +785,13 @@ def query_vlm_multi_agent(
             if candidate is not None:
                 candidate.record_attempt(4, False, f"exception: {e}")
             if working_memory is not None:
+                _reason_exc = f"AVU exception: {e}"
+                _fix_exc = working_memory.suggest_fix_for(FB_AVU_FAIL, _reason_exc) if working_memory is not None else "retry grounding from evidence-pose; consider aliases"
                 working_memory.add_feedback(
                     step=step_index,
                     type_=FB_AVU_FAIL,
-                    reason=f"AVU exception: {e}",
-                    suggested_fix="retry grounding from evidence-pose; consider aliases",
+                    reason=_reason_exc,
+                    suggested_fix=_fix_exc,
                     target_candidate_id=candidate.candidate_id if candidate else None,
                 )
             try:
@@ -799,9 +807,9 @@ def query_vlm_multi_agent(
         if target_index < 0 or target_index >= len(tsdf_planner.frontiers):
             logging.info(
                 f"Predicted frontier index out of range: {target_index}, "
-                f"choose random frontier"
+                f"stop (no random frontier)"
             )
-            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+            return None
         pred_target_frontier = tsdf_planner.frontiers[target_index]
         logging.info(
             f"multi_agent next choice: Frontier at {pred_target_frontier.position}"
