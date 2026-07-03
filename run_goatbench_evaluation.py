@@ -664,12 +664,21 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                     reason=tc_reason or "target confirmed",
                                     suggested_fix="",
                                 )
+                                for c in list(wm.target_candidates.values()):
+                                    if c.status == "GROUNDED_3D":
+                                        wm.release_after_navigation(c.candidate_id)
+                                        logging.info(f"[Phase2] released pinned candidate {c.candidate_id} after nav success")
                             break
                         else:
                             decision['object_judge'] = "no"
                             # Phase F: record failure feedback with reason
                             wm = subtask_metadata.get("working_memory", None)
                             if wm is not None:
+                                for c in list(wm.target_candidates.values()):
+                                    if c.status == "GROUNDED_3D":
+                                        wm.reject_candidate_by_vlm(c.image_path, f"task_check rejected at step {cnt_step}")
+                                        logging.info(f"[Phase2] rejected candidate {c.candidate_id} (wrong instance)")
+                                        break
                                 wm.add_feedback(
                                     step=cnt_step,
                                     type_="TASK_CHECK_FAIL",
