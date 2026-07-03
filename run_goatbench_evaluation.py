@@ -258,7 +258,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 # multi-agent: mark new subtask + carry high-level plan + reset snapshot/frontier state
                 subtask_metadata['is_new_subtask'] = True
                 subtask_metadata['high_level_plan'] = episode_memory.get_latest_high_level_plan() if hasattr(episode_memory, 'get_latest_high_level_plan') else None
-                scene.snapshot_pool = None
+                scene.image_pool = None
                 scene.filtered_snapshots = set()
                 if hasattr(episode_memory, 'start_new_subtask'):
                     episode_memory.start_new_subtask(subtask_id)

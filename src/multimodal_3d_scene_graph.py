@@ -156,7 +156,7 @@ class Scene:
         self.all_cam_poses = {}
         self.global_step_cnt = 0
         # multi-agent workflow compat attrs
-        self.snapshot_pool = None
+        self.image_pool = None
         self.filtered_snapshots = set()
         # setup detection and segmentation models
         self.detection_model = detection_model

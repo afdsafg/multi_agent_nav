@@ -3,7 +3,12 @@ from typing import Tuple, Optional, Union
 import random
 import numpy as np
 
-from src.explore_utils import task_check, explore_two_step
+from src.explore_utils import (
+    task_check,
+    explore_two_step,
+    Key_Subgraph_Selection,
+    encode_tensor2base64,
+)
 from src.explore_multi_agent import explore_multi_agent
 from src.utils import Visibility_based_Viewpoint_Decision
 from src.tsdf_planner import TSDFPlanner, Frontier
@@ -362,6 +367,13 @@ def query_vlm_multi_agent(
     if cfg.egocentric_views:
         step_dict["egocentric_views"] = rgb_egocentric_views
         step_dict["use_egocentric_views"] = True
+        # Bug1 fix: explore_multi_agent reads 'egocentric_imgs' (b64 list),
+        # not raw tensors. Encode here so the multi-agent pipeline can consume.
+        step_dict["egocentric_imgs"] = [
+            encode_tensor2base64(v) for v in rgb_egocentric_views
+        ]
+    else:
+        step_dict["egocentric_imgs"] = []
 
     step_dict["question"] = subtask_metadata["question"]
     step_dict["task_type"] = subtask_metadata["task_type"]
@@ -383,6 +395,35 @@ def query_vlm_multi_agent(
     step_dict["step_index"] = subtask_metadata.get("current_step", 0)
     step_dict["current_step"] = subtask_metadata.get("current_step", 0)
     step_dict["current_position"] = pts
+
+    # Bug2 fix: explore_multi_agent reads 'processed_images' and
+    # 'image_map_reverse' (built by KSS) but they were never computed here,
+    # so the snapshot pool was always empty. Run Key_Subgraph_Selection the
+    # same way explore_two_step does (see explore_utils.py L801-818) and
+    # populate both keys.
+    step_dict["use_prefiltering"] = cfg.prefiltering
+    step_dict["top_k_categories"] = cfg.top_k_categories
+    step_dict["use_AVU"] = getattr(cfg, "use_AVU", step_dict.get("use_AVU", True))
+    use_room_filter = cfg.use_room_filter
+    (
+        _question_kss,
+        _image_goal_kss,
+        _egocentric_imgs_kss,
+        _selected_objs,
+        _selected_edges,
+        processed_images,
+        _frontier_imgs_kss,
+    ) = Key_Subgraph_Selection(
+        step_dict, verbose, cfg.use_ollama, use_room_filter
+    )
+    # Key_Subgraph_Selection returns processed_images but not
+    # image_map_reverse; build the reverse index consistent with
+    # Prompt_with_AVU_and_CLR (explore_utils.py L286-291).
+    image_map_reverse = {
+        idx: img_key for idx, img_key in enumerate(processed_images.keys())
+    }
+    step_dict["processed_images"] = processed_images
+    step_dict["image_map_reverse"] = image_map_reverse
 
     # query multi-agent vlm
     try:

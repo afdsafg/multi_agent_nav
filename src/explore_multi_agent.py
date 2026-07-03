@@ -1,11 +1,11 @@
 """Coupled multi-agent workflow for MSGNav GOAT-Bench evaluation.
 
-Ported from Pred-EQA's 5-agent chain (Snapshot Manager, Frontier Manager,
+Ported from Pred-EQA's 5-agent chain (Image Manager, Frontier Manager,
 Answerer, High-Level Planner, Low-Level Executor) and adapted to MSGNav's
-M3DSG scene graph, KSS snapshot pool, and call_openai_api VLM interface.
+M3DSG scene graph, KSS image pool, and call_openai_api VLM interface.
 
 Key adaptations vs Pred-EQA:
-- snapshot_pool entries carry M3DSG-connected objects (id, class_name) from
+- image_pool entries carry M3DSG-connected objects (id, class_name) from
   scene.img_to_edge reverse lookup.
 - Answerer outputs "Image i, <class>" (i = pool index) for all three GOAT-Bench
   task types (object / description / image), or "Continue Exploration".
@@ -22,9 +22,9 @@ from src.explore_utils import call_openai_api, encode_tensor2base64, resize_imag
 
 
 # ---------------------------------------------------------------------------
-# snapshot_pool data structure
+# image_pool data structure
 # ---------------------------------------------------------------------------
-# snapshot_pool: list of dict {
+# image_pool: list of dict {
 #     "img_path": str,                      # key into scene.all_observations
 #     "img_b64": str,                       # resized RGB base64
 #     "connected_objects": List[Tuple[int, str]],  # (obj_id, class_name)
@@ -33,13 +33,13 @@ from src.explore_utils import call_openai_api, encode_tensor2base64, resize_imag
 # }
 
 
-def build_snapshot_pool_from_kss(
+def build_image_pool_from_kss(
     step: int,
     scene,
     processed_images: Dict[str, str],
     image_map_reverse: Dict[int, str],
 ) -> List[Dict[str, Any]]:
-    """Build snapshot pool from KSS processed_images.
+    """Build image pool from KSS processed_images.
 
     For each image key in processed_images, reverse-lookup the connected
     object pairs via scene.img_to_edge and record (obj_id, class_name) for
@@ -52,7 +52,7 @@ def build_snapshot_pool_from_kss(
         image_map_reverse: {idx: img_key} from KSS (kept for compatibility).
 
     Returns:
-        snapshot_pool list.
+        image_pool list.
     """
     pool: List[Dict[str, Any]] = []
     for img_key, img_b64 in processed_images.items():
@@ -84,10 +84,10 @@ def add_egocentric_to_pool(
     scene=None,
     egocentric_img_paths: Optional[List[str]] = None,
 ) -> None:
-    """Append current-step egocentric views to the snapshot pool in-place.
+    """Append current-step egocentric views to the image pool in-place.
 
     Args:
-        pool: snapshot pool list (mutated).
+        pool: image pool list (mutated).
         egocentric_imgs: list of base64-encoded egocentric RGB images.
         step: current step index.
         scene: optional Scene, used to resolve img_path if egocentric_img_paths given.
@@ -119,33 +119,33 @@ def _format_connected_objects(connected_objects: List[Tuple[int, str]]) -> str:
     return ", ".join(f"{name}({oid})" for oid, name in connected_objects)
 
 
-def format_snapshot_manager_prompt(
+def format_image_manager_prompt(
     question: str,
     pool: List[Dict[str, Any]],
     high_level_plan: Optional[str],
     task_type: str,
     image_goal: Optional[str],
 ) -> Tuple[str, list]:
-    """Snapshot Manager prompt.
+    """Image Manager prompt.
 
-    Ported from Pred-EQA format_manage_prompt. Displays each snapshot as
-    'Snapshot i: <img> connected objects: chair(5), table(8)'. Outputs
-    'Retain Snapshots: {i,...}'.
+    Ported from Pred-EQA format_manage_prompt. Displays each image as
+    'Image i: <img> connected objects: chair(5), table(8)'. Outputs
+    'Retain Images: {i,...}'.
     """
     sys_prompt = (
         "Task: You are an indoor MEMORY MANAGEMENT AGENT responsible for "
-        "CURATING and PRESERVING visual snapshots and spatial information "
+        "CURATING and PRESERVING visual images and spatial information "
         "collected by the embodied agent during its navigation, working in "
         "tandem with your existing TEXTUAL MEMORY and high-level plan.\n\n"
         "Instructions:\n"
         "1. CAREFULLY analyze the information needed to answer the question, "
         "paying special attention to location details, objectives, object "
         "relationships, and any mentioned or implied attributes.\n"
-        "2. Review all available snapshots thoroughly and cross-reference "
-        "them with your TEXTUAL MEMORY. When deciding whether to retain a "
-        "snapshot, adopt a conservative approach - if there is ANY potential "
+        "2. Review all available images thoroughly and cross-reference "
+        "them with your TEXTUAL MEMORY. When deciding whether to retain an "
+        "image, adopt a conservative approach - if there is ANY potential "
         "visual relevance to the current question or its context, it should "
-        "be preserved. Specifically, retain snapshots that include:\n"
+        "be preserved. Specifically, retain images that include:\n"
         "   - Any room types or spaces that may be related to the question's "
         "context, even indirectly.\n"
         "   - Adjacent or connected areas that could provide spatial clues or "
@@ -162,7 +162,7 @@ def format_snapshot_manager_prompt(
         "the question or reconstructing the environment.\n"
         "3. MEMORY COMPACTION (Textual Redundancy Filter): To prevent critical "
         "visual clues from being overwhelmed by redundant trajectory images, "
-        "you may DISCARD a snapshot ONLY IF it meets BOTH of the following "
+        "you may DISCARD an image ONLY IF it meets BOTH of the following "
         "conditions:\n"
         "   - It is completely irrelevant to the primary question or objective "
         "(contains no target objects or contextual clues).\n"
@@ -191,13 +191,13 @@ def format_snapshot_manager_prompt(
     else:
         content.append(("No high-level plan yet.\n",))
 
-    # Snapshots display
-    content.append(("Available Snapshots:\n",))
+    # Images display
+    content.append(("Available Images:\n",))
     if not pool:
-        content.append(("No snapshots available\n",))
+        content.append(("No images available\n",))
     else:
         for i, snap in enumerate(pool):
-            content.append((f"Snapshot {i}: ", snap["img_b64"]))
+            content.append((f"Image {i}: ", snap["img_b64"]))
             objs_str = _format_connected_objects(snap["connected_objects"])
             content.append((f" connected objects: {objs_str}\n",))
 
@@ -206,7 +206,7 @@ def format_snapshot_manager_prompt(
         "Output Format:\n"
         "1. First, think step by step and explain your reasoning clearly.\n"
         '2. Then, provide your final answer in the exact format: '
-        '"Retain Snapshots: {i, ...}".'
+        '"Retain Images: {i, ...}".'
     )
     content.append((text,))
     return sys_prompt, content
@@ -227,11 +227,11 @@ def format_frontier_manager_prompt(
     sys_prompt = (
         "Task: You are an EXPLORATION DIRECTION MANAGEMENT AGENT responsible "
         "for STRATEGICALLY SELECTING and PRUNING potential frontiers based on "
-        "observed visual snapshots. Your goal is to eliminate directions that "
+        "observed visual images. Your goal is to eliminate directions that "
         "have BOTH OBVIOUSLY BEEN EXPLORED AND ARE IRRELEVANT to answering "
         "the question.\n\n"
         "Instructions:\n"
-        "1. CAREFULLY analyze the provided visual snapshots to identify areas "
+        "1. CAREFULLY analyze the provided visual images to identify areas "
         "that have already been explored.\n"
         "2. Determine which frontiers (exploration directions) can be safely "
         "removed because they MEET BOTH CRITERIA:\n"
@@ -261,10 +261,10 @@ def format_frontier_manager_prompt(
     else:
         content.append(("No high-level plan yet.\n",))
 
-    # Previously observed clues (snapshots)
+    # Previously observed clues (images)
     content.append(("Previously Observed Clues:\n",))
     if not pool:
-        content.append(("No snapshots available\n",))
+        content.append(("No images available\n",))
     else:
         for snap in pool:
             content.append(("\n", snap["img_b64"]))
@@ -318,39 +318,39 @@ def format_answerer_prompt(
         "Instructions:\n"
         "1. CAREFULLY analyze the information needed to answer the question, "
         "especially location, objectives, relationships, and attributes.\n"
-        "2. CAREFULLY analyze ALL available snapshots (total observed clues). "
-        "Each snapshot shows the view and lists the connected objects with "
+        "2. CAREFULLY analyze ALL available images (total observed clues). "
+        "Each image shows the view and lists the connected objects with "
         "their IDs and class names.\n"
         "3. Judge based on the task type:\n"
     )
     if task_type == "object":
         sys_prompt += (
             "   - This is an OBJECT task: find the object of the specified "
-            "category in the environment. If any snapshot clearly contains "
+            "category in the environment. If any image clearly contains "
             "the target object, report it.\n"
         )
     elif task_type == "description":
         sys_prompt += (
             "   - This is a DESCRIPTION task: find the object exactly "
-            "matching the natural-language description. If any snapshot "
+            "matching the natural-language description. If any image "
             "contains an object matching the description, report it.\n"
         )
     elif task_type == "image":
         sys_prompt += (
             "   - This is an IMAGE task: find the same object shown in the "
-            "reference image. Compare the reference image with each snapshot "
-            "and report the matching one.\n"
+            "reference image. Compare the reference image with each image "
+            "in the pool and report the matching one.\n"
         )
     else:
         sys_prompt += (
             "   - Unknown task type: use the question to infer the target "
-            "and check the snapshots.\n"
+            "and check the images.\n"
         )
     sys_prompt += (
-        "4. If ANY snapshot contains information sufficient to identify the "
-        "target object, output the snapshot index and the target category "
+        "4. If ANY image contains information sufficient to identify the "
+        "target object, output the image index and the target category "
         "name.\n"
-        "5. If NO snapshot provides sufficient information, output Continue "
+        "5. If NO image provides sufficient information, output Continue "
         "Exploration.\n"
     )
 
@@ -370,13 +370,13 @@ def format_answerer_prompt(
     else:
         content.append(("No high-level plan yet.\n",))
 
-    # Snapshots
-    content.append(("Available Snapshots:\n",))
+    # Images
+    content.append(("Available Images:\n",))
     if not pool:
-        content.append(("No snapshots available\n",))
+        content.append(("No images available\n",))
     else:
         for i, snap in enumerate(pool):
-            content.append((f"Snapshot {i}: ", snap["img_b64"]))
+            content.append((f"Image {i}: ", snap["img_b64"]))
             objs_str = _format_connected_objects(snap["connected_objects"])
             content.append((f" connected objects: {objs_str}\n",))
 
@@ -385,7 +385,7 @@ def format_answerer_prompt(
         "Output Format:\n"
         "1. First, think step by step and explain your reasoning clearly.\n"
         "2. If answerable, provide your final answer in the EXACT format: "
-        '"Image i, <class>" where i is the snapshot index and <class> is '
+        '"Image i, <class>" where i is the image index and <class> is '
         "the target object category name. Example: Image 3, espresso "
         "machine\n"
         'If not answerable, use format: "Continue Exploration"'
@@ -476,8 +476,8 @@ def format_high_level_planner_prompt(
         "strategy, only mark them as completed [x] when fully accomplished "
         "successfully.\n"
         "Content Constraints:\n"
-        "STRICTLY NEVER mention ANY snapshot or frontier identifiers (e.g., "
-        "\"Snapshot 2\", \"Frontier 0\") - these labels are step-specific and "
+        "STRICTLY NEVER mention ANY image or frontier identifiers (e.g., "
+        "\"Image 2\", \"Frontier 0\") - these labels are step-specific and "
         "will cause confusion in later steps when the current image is no "
         "longer available.\n"
         "AVOID relative directional references tied to transient views. "
@@ -496,10 +496,10 @@ def format_high_level_planner_prompt(
     else:
         content.append(("No previous high-level plan.\n",))
 
-    # Snapshots (clues) - images only, no ids per content constraint
+    # Images (clues) - images only, no ids per content constraint
     content.append(("Currently observed visual clues:\n",))
     if not pool:
-        content.append(("No snapshots available\n",))
+        content.append(("No images available\n",))
     else:
         for snap in pool:
             content.append(("\n", snap["img_b64"]))
@@ -600,7 +600,7 @@ def format_executor_prompt(
     # Previously observed clues
     content.append(("Previously Observed Clues:\n",))
     if not pool:
-        content.append(("No snapshots available\n",))
+        content.append(("No images available\n",))
     else:
         for snap in pool:
             content.append(("\n", snap["img_b64"]))
@@ -640,11 +640,11 @@ def parse_retain_response(
     response: Optional[str],
     keyword: str,
 ) -> List[int]:
-    """Parse 'Retain Snapshots: {i,...}' or 'Retain Frontiers: {i,...}'.
+    """Parse 'Retain Images: {i,...}' or 'Retain Frontiers: {i,...}'.
 
     Args:
         response: raw VLM response.
-        keyword: "Snapshots" or "Frontiers".
+        keyword: "Images" or "Frontiers".
 
     Returns:
         Sorted list of retained indices. Empty list on failure.
@@ -679,8 +679,8 @@ def parse_answerer_response(
     lower = text.lower()
     if "continue exploration" in lower:
         return None
-    # Match 'Image i, <class>' (case-insensitive 'image')
-    pattern = r"Image\s+(\d+)\s*,\s*(.+?)(?:\n|$)"
+    # Match 'Image i, <class>' or 'Snapshot i, <class>' (case-insensitive)
+    pattern = r"(?:Image|Snapshot)\s+(\d+)\s*,\s*(.+?)(?:\n|$)"
     matches = re.findall(pattern, text, re.IGNORECASE)
     if not matches:
         return None
@@ -750,7 +750,7 @@ def explore_multi_agent(
 ) -> Tuple[str, Any, Optional[str], int, Optional[str]]:
     """Multi-agent exploration workflow main entry.
 
-    Runs the 5-agent chain: Snapshot Manager -> Frontier Manager -> Answerer
+    Runs the 5-agent chain: Image Manager -> Frontier Manager -> Answerer
     -> High-Level Planner -> Executor. Returns the decision for this step.
 
     Args:
@@ -762,7 +762,7 @@ def explore_multi_agent(
             - scene (Scene instance)
             - is_new_subtask (bool)
             - high_level_plan (str | None, maintained by main loop)
-            - snapshot_pool (list | None, maintained by main loop)
+            - image_pool (list | None, maintained by main loop)
             - step_index (int)
             - prompt_h, prompt_w (int)
         cfg: config namespace.
@@ -775,7 +775,7 @@ def explore_multi_agent(
         - frontier: target_index = frontier index
         - stop: target_index = None
         - reason: VLM reasoning string (may be "")
-        - n_filtered: number of snapshots filtered by Snapshot Manager
+        - n_filtered: number of images filtered by Image Manager
         - class_name_if_image: target class name for image answers, else None
     """
     logging.info("[explore_multi_agent] start")
@@ -792,15 +792,15 @@ def explore_multi_agent(
     step_index = step.get("step_index", 0)
     high_level_plan = step.get("high_level_plan", None)
 
-    # b. snapshot pool maintenance
-    pool = step.get("snapshot_pool", None)
+    # b. image pool maintenance
+    pool = step.get("image_pool", None)
     if is_new_subtask or pool is None:
         # (Re)build pool from KSS processed_images
-        pool = build_snapshot_pool_from_kss(
+        pool = build_image_pool_from_kss(
             step_index, scene, processed_images, image_map_reverse
         )
         logging.info(
-            f"[explore_multi_agent] built pool from KSS: {len(pool)} snapshots"
+            f"[explore_multi_agent] built pool from KSS: {len(pool)} images"
         )
     else:
         # Append current-step egocentric views
@@ -811,36 +811,36 @@ def explore_multi_agent(
         )
 
     # Write pool back so the main loop can carry it across steps
-    step["snapshot_pool"] = pool
+    step["image_pool"] = pool
 
     n_filtered = 0
 
-    # c. Snapshot Manager (only when pool length > 3)
+    # c. Image Manager (only when pool length > 3)
     if len(pool) > 3:
-        sys_p, content = format_snapshot_manager_prompt(
+        sys_p, content = format_image_manager_prompt(
             question, pool, high_level_plan, task_type, image_goal
         )
         if verbose:
-            logging.info("[Snapshot Manager] calling VLM")
+            logging.info("[Image Manager] calling VLM")
         raw = call_openai_api(sys_p, content)
-        retain_idx = parse_retain_response(raw, "Snapshots")
+        retain_idx = parse_retain_response(raw, "Images")
         if retain_idx:
             new_pool = [pool[i] for i in retain_idx if 0 <= i < len(pool)]
             n_filtered = len(pool) - len(new_pool)
             if n_filtered > 0:
                 logging.info(
-                    f"[Snapshot Manager] filtered {n_filtered} snapshots, "
+                    f"[Image Manager] filtered {n_filtered} images, "
                     f"{len(new_pool)} retained"
                 )
                 pool = new_pool
-                step["snapshot_pool"] = pool
+                step["image_pool"] = pool
         else:
             logging.info(
-                "[Snapshot Manager] no valid retain response, keeping pool"
+                "[Image Manager] no valid retain response, keeping pool"
             )
     else:
         logging.info(
-            f"[Snapshot Manager] skipped (pool size {len(pool)} <= 3)"
+            f"[Image Manager] skipped (pool size {len(pool)} <= 3)"
         )
 
     # d. Frontier Manager (only when frontier count > 1)
