@@ -648,7 +648,11 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     if (
                         target_arrived
                         and (
-                            _ntk == NavTargetKind.VIEWPOINT_POSE
+                            (
+                                _nav_candidate is not None
+                                and _nav_candidate.nav_status == NavStatus.REACHED
+                                and _ntk == NavTargetKind.VIEWPOINT_POSE
+                            )
                             or (_nav_candidate is None and target_type != "frontier")
                         )
                     ):

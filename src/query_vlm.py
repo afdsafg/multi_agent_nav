@@ -612,6 +612,7 @@ def query_vlm_multi_agent(
                     phrase=object_class,
                     bbox_xyxy=result.boxes.xyxy[_bi].cpu().numpy().astype(int),
                     conf=float(_conf[_bi]),
+                    raw_score=float(_conf[_bi]),
                 )
             else:
                 logging.info(f"[AVU] L1 YOLO('{object_class}') no detection, trying aliases")
@@ -633,6 +634,7 @@ def query_vlm_multi_agent(
                             phrase=alias,
                             bbox_xyxy=result.boxes.xyxy[_bi].cpu().numpy().astype(int),
                             conf=float(_conf[_bi]),
+                            raw_score=float(_conf[_bi]),
                         )
                         break
                 if ground2d is None:
@@ -658,8 +660,8 @@ def query_vlm_multi_agent(
                                 source="class_agnostic_clip",
                                 phrase=object_class,
                                 bbox_xyxy=xyxy_np_all[best_idx].astype(int),
-                                raw_score=float(best_score),
-                                rank_score=float(best_score),
+                                raw_score=float(best_score),  # 绝对 CLIP 分数
+                                rank_score=1.0,  # top-1 rank，归一化
                                 conf=float(result.boxes.conf[best_idx].cpu().numpy()),
                             )
                         else:

@@ -16,14 +16,16 @@ def build_visual_approach_pose(
     cam_pose,
     tsdf_planner,
     desired_standoff: float = 1.2,
+    mask=None,
 ):
     """Visual Candidate Approach v0 (report §Visual Candidate Approach).
 
     Build a navigation pose by advancing along the bbox-center depth ray,
     then snapping to a navigable cell. Returns an ApproachPose or None
     (caller falls back to evidence-pose). None when:
-      - depth valid ratio < 0.25 (bbox too small / far)
       - LOS check from cam to snapped point blocked by wall
+    depth invalid (valid_ratio < 0.25) no longer returns None; falls back
+    to fixed-step advance along bearing (report requirement).
     """
     from src.memory_structures import ApproachPose
 
@@ -36,14 +38,23 @@ def build_visual_approach_pose(
     u = (x1 + x2) / 2.0
     v = (y1 + y2) / 2.0
 
-    depth_crop = depth_array[y1:y2, x1:x2]
-    valid = depth_crop[depth_crop > 0]
-    area = max(depth_crop.size, 1)
-    valid_ratio = len(valid) / area
-    if valid_ratio < 0.25:
-        return None
+    if mask is not None:
+        depth_vals = depth_array[mask]
+        valid = depth_vals[depth_vals > 0]
+        valid_ratio = len(valid) / max(int(mask.sum()), 1)
+    else:
+        depth_crop = depth_array[y1:y2, x1:x2]
+        valid = depth_crop[depth_crop > 0]
+        area = max(depth_crop.size, 1)
+        valid_ratio = len(valid) / area
 
-    z = float(np.quantile(valid, 0.30))
+    if valid_ratio < 0.25:
+        # depth无效：沿 bearing 固定步长逼近（报告要求不放弃）
+        z = None
+        advance = 0.8
+    else:
+        z = float(np.quantile(valid, 0.30))
+        advance = float(np.clip(z - desired_standoff, 0.5, 1.5))
 
     # pixel ray -> camera frame -> world frame (horizontal plane)
     K = np.asarray(intrinsics, dtype=float)
@@ -58,7 +69,6 @@ def build_visual_approach_pose(
         return None
     ray_world = ray_world / norm
 
-    advance = float(np.clip(z - desired_standoff, 0.5, 1.5))
     raw_xyz = cam_t + advance * ray_world
 
     snapped = tsdf_planner.get_near_true_point(np.array([raw_xyz]))
@@ -75,9 +85,10 @@ def build_visual_approach_pose(
             return None
 
     yaw = float(math.atan2(ray_world[2], ray_world[0]))
+    _z_str = "none" if z is None else f"{z:.2f}"
     logging.info(
         f"[VisualApproach] approach pose={xyz} yaw={yaw:.2f} "
-        f"valid_ratio={valid_ratio:.2f} z={z:.2f} advance={advance:.2f}"
+        f"valid_ratio={valid_ratio:.2f} z={_z_str} advance={advance:.2f}"
     )
     return ApproachPose(
         xyz=xyz,

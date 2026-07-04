@@ -171,6 +171,8 @@ S_GROUNDED_3D = "GROUNDED_3D"            # bbox/mask/point cloud obtained
 S_VISUAL_ONLY = "VISUAL_ONLY"            # VLM saw it, detector failed
 S_NEED_CLOSER_VIEW = "NEED_CLOSER_VIEW"  # visible but small/occluded
 S_REJECTED = "REJECTED"                  # VLM re-confirmed: not the target
+S_SUCCEEDED = "SUCCEEDED"                # navigation + task_check passed
+S_EXPIRED = "EXPIRED"                    # TTL or closer-view cap reached
 
 
 @dataclass
@@ -184,11 +186,14 @@ def should_release(c: "TargetCandidate", step: int, ttl_steps: int = 12,
                    max_closer_views: int = 3) -> bool:
     """Report §TargetCandidateMemory release gate. Only reject/expire/cap
     release; success release is handled by release_after_navigation."""
-    if c.status == S_REJECTED:
+    if c.status in (S_REJECTED, S_SUCCEEDED, S_EXPIRED):
         return True
     if c.closer_view_attempts >= max_closer_views:
+        c.status = S_EXPIRED
         return True
-    if step - c.source_step > ttl_steps and c.status == S_VISUAL_ONLY:
+    _ref_step = c.updated_step if c.updated_step else c.source_step
+    if step - _ref_step > ttl_steps and c.status == S_VISUAL_ONLY:
+        c.status = S_EXPIRED
         return True
     return False
 
@@ -213,6 +218,7 @@ class TargetCandidate:
     nav_status: NavStatus = NavStatus.NONE
     nav_goal_xyz: Optional[Any] = None       # habitat (x,y,z)
     nav_goal_yaw: Optional[float] = None
+    updated_step: int = 0                    # last status-change step (0 → use source_step)
 
     def record_attempt(self, level: int, success: bool, reason: str = "") -> None:
         self.grounding_attempts.append(
@@ -293,6 +299,7 @@ FB_TASK_CHECK_PASS = "TASK_CHECK_PASS"
 FB_AVU_FAIL = "AVU_FAIL"
 FB_AVU_VISUAL_ONLY = "AVU_VISUAL_ONLY"
 FB_FRONTIER_NO_INFO = "FRONTIER_NO_INFO"
+FB_BLOCK_FRONTIER = "BLOCK_FRONTIER"
 FB_PLANNER_STALE = "PLANNER_STALE"
 FB_WRONG_INSTANCE = "WRONG_INSTANCE"
 
@@ -307,6 +314,12 @@ class FeedbackEvent:
     suggested_fix: str = ""
     ttl_steps: int = 4
     created_step: int = 0
+    event_id: str = ""
+    subtask_id: str = ""
+    reason_code: str = ""
+    message: str = ""
+    blocked_actions: list = field(default_factory=list)
+    severity: str = "info"
 
     def to_prompt_str(self) -> str:
         s = f"- Step {self.step} [{self.type}]: {self.reason}"
@@ -581,7 +594,7 @@ class SubtaskWorkingMemory:
             "ImageManager": {FB_AVU_FAIL, FB_AVU_VISUAL_ONLY},
             "Answerer": {FB_TASK_CHECK_FAIL, FB_WRONG_INSTANCE},
             "Planner": {FB_TASK_CHECK_FAIL, FB_AVU_FAIL, FB_FRONTIER_NO_INFO, FB_PLANNER_STALE},
-            "Executor": {FB_FRONTIER_NO_INFO},
+            "Executor": {FB_FRONTIER_NO_INFO, FB_BLOCK_FRONTIER},
         }
         types = _MAP.get(agent_name, set())
         return [e for e in alive if e.type in types]
