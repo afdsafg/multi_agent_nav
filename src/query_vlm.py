@@ -2,7 +2,6 @@ import logging
 from typing import Tuple, Optional, Union, List, Dict, Any
 import random
 import numpy as np
-import torch
 
 from src.explore_utils import (
     task_check,
@@ -11,7 +10,8 @@ from src.explore_utils import (
     encode_tensor2base64,
 )
 from src.explore_multi_agent import explore_multi_agent
-from src.utils import Visibility_based_Viewpoint_Decision, build_visual_approach_pose
+from src.candidate_controller import CandidateController
+from src.utils import Visibility_based_Viewpoint_Decision
 from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
 from src.conceptgraph.slam.utils import (
@@ -19,88 +19,6 @@ from src.conceptgraph.slam.utils import (
     init_process_pcd,
     detections_to_obj_pcd_and_bbox,
 )
-from src.memory_structures import (
-    TargetCandidate, SubtaskWorkingMemory,
-    S_GROUNDED_3D, S_VISUAL_ONLY, S_NEED_CLOSER_VIEW, S_REJECTED,
-    FB_AVU_FAIL, FB_AVU_VISUAL_ONLY,
-    get_aliases,
-    NavTargetKind, NavStatus,
-    Grounding2D,
-)
-
-# Phase C: generic class proposals for class-agnostic grounding (Level 3).
-_GENERIC_CLASSES = ["object", "item", "thing", "furniture", "appliance"]
-# CLIP rerank threshold for accepting a class-agnostic proposal.
-_CLIP_RERANK_THRESH = 0.20
-
-
-def _cam_pose_to_yaw(cam_pose: np.ndarray) -> float:
-    """Extract camera yaw (radians) from a 4x4 world->cam / cam->world pose.
-
-    Habitat convention: camera forward is -z. We use the rotation submatrix
-    to recover the heading. Returns 0.0 if pose is malformed.
-    """
-    try:
-        R = cam_pose[:3, :3]
-        # forward vector in world = R @ [0,0,-1] = -R[:,2]
-        fwd = -R[:3, 2]
-        return float(np.arctan2(fwd[0], fwd[2]))
-    except Exception:
-        return 0.0
-
-
-def _yolo_detect(scene: Scene, classes: List[str], image_rgb, conf: float):
-    """Run YOLOWorld with a temporary class list, then restore scene classes."""
-    scene.detection_model.set_classes(classes)
-    try:
-        results = scene.detection_model.predict(image_rgb, conf=conf, verbose=False)
-    finally:
-        scene.detection_model.set_classes(scene.obj_classes.get_classes_arr())
-    if len(results) == 0 or len(results[0].boxes) == 0:
-        return None
-    return results[0]
-
-
-def _clip_rerank_bbox(
-    scene: Scene, image_rgb, xyxy_np: np.ndarray, target_phrase: str,
-    aliases: List[str],
-) -> Tuple[int, float]:
-    """Score each bbox crop against target_phrase + aliases via CLIP.
-
-    Returns (best_idx, best_score).
-    """
-    from PIL import Image
-    try:
-        from src.conceptgraph.utils.model_utils import clip_recognition
-    except Exception:
-        clip_recognition = None
-    if clip_recognition is None or scene.clip_model is None:
-        return 0, 0.0
-    prompts = [target_phrase] + [a for a in aliases if a.lower() != target_phrase.lower()]
-    best_idx, best_score = 0, -1.0
-    for i in range(len(xyxy_np)):
-        x1, y1, x2, y2 = xyxy_np[i].astype(int)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(image_rgb.shape[1], x2), min(image_rgb.shape[0], y2)
-        if x2 - x1 < 2 or y2 - y1 < 2:
-            continue
-        crop = image_rgb[y1:y2, x1:x2]
-        best_for_this = 0.0
-        for p in prompts:
-            try:
-                probs = clip_recognition(
-                    scene.clip_model, scene.clip_tokenizer,
-                    scene.clip_preprocess, crop, p,
-                )
-                # probs is softmax over [prompt]; take the prompt's prob
-                score = float(probs[0]) if hasattr(probs, '__len__') else float(probs)
-                best_for_this = max(best_for_this, score)
-            except Exception:
-                continue
-        if best_for_this > best_score:
-            best_score = best_for_this
-            best_idx = i
-    return best_idx, best_score
 
 
 def random_frontier_choice(tsdf_planner: TSDFPlanner, n_filtered_snapshots):
@@ -574,312 +492,30 @@ def query_vlm_multi_agent(
                 f"img_path {img_path} not in all_observations, stop (no random frontier)"
             )
             return None
-        target_image = scene.all_observations[img_path]
-        cam_pose = scene.all_cam_poses[img_path]
-        view_yaw = _cam_pose_to_yaw(cam_pose)
-        aliases = get_aliases(object_class)
-        # working_memory may be None (Phase H wires it in). Create candidate if present.
-        working_memory = subtask_metadata.get("working_memory", None)
-        step_index = subtask_metadata.get("current_step", 0)
-        candidate = None
-        if working_memory is not None:
-            candidate = working_memory.get_or_create_candidate(
-                image_path=img_path,
-                target_phrase=object_class,
-                source_step=step_index,
-                camera_pose=cam_pose,
-                view_yaw=view_yaw,
-            )
+        controller = CandidateController(cfg)
+        controller_result = controller.handle_visible_candidate(
+            scene=scene,
+            tsdf_planner=tsdf_planner,
+            working_memory=subtask_metadata.get("working_memory", None),
+            img_path=img_path,
+            target_phrase=object_class,
+            pts=pts,
+            step_index=subtask_metadata.get("current_step", 0),
+        )
+        if controller_result.intent is None:
             logging.info(
-                f"[AVU] candidate {candidate.candidate_id} phrase='{object_class}' "
-                f"aliases={aliases} status={candidate.status}"
+                f"[multi_agent] CandidateController produced no intent: "
+                f"{controller_result.reason}"
             )
-
-        try:
-            ground2d = None  # Grounding2D, set by L1/L2/L3 success
-            _l3_xyxy_all = None  # keep L3 proposals even if CLIP rejects (for visual approach)
-            _l3_best_idx = None
-            # ---- Level 1: YOLO(target_phrase) ----
-            result = _yolo_detect(scene, [object_class], target_image, cfg.AVU_conf_threshold)
-            if result is not None:
-                logging.info(f"[AVU] L1 YOLO('{object_class}') detected")
-                if candidate is not None:
-                    candidate.record_attempt(1, True, "YOLO target phrase")
-                _conf = result.boxes.conf.cpu().numpy()
-                _bi = int(_conf.argmax())
-                ground2d = Grounding2D(
-                    source="yolo_target",
-                    phrase=object_class,
-                    bbox_xyxy=result.boxes.xyxy[_bi].cpu().numpy().astype(int),
-                    conf=float(_conf[_bi]),
-                    raw_score=float(_conf[_bi]),
-                )
-            else:
-                logging.info(f"[AVU] L1 YOLO('{object_class}') no detection, trying aliases")
-                if candidate is not None:
-                    candidate.record_attempt(1, False, "no YOLO box for target phrase")
-                # ---- Level 2: YOLO(aliases) ----
-                for alias in aliases:
-                    if alias.lower() == object_class.lower():
-                        continue
-                    result = _yolo_detect(scene, [alias], target_image, cfg.AVU_conf_threshold)
-                    if result is not None:
-                        logging.info(f"[AVU] L2 YOLO alias '{alias}' detected")
-                        if candidate is not None:
-                            candidate.record_attempt(2, True, f"alias '{alias}'")
-                        _conf = result.boxes.conf.cpu().numpy()
-                        _bi = int(_conf.argmax())
-                        ground2d = Grounding2D(
-                            source="yolo_alias",
-                            phrase=alias,
-                            bbox_xyxy=result.boxes.xyxy[_bi].cpu().numpy().astype(int),
-                            conf=float(_conf[_bi]),
-                            raw_score=float(_conf[_bi]),
-                        )
-                        break
-                if ground2d is None:
-                    if candidate is not None:
-                        candidate.record_attempt(2, False, "no alias detected")
-                    # ---- Level 3: generic classes + CLIP rerank ----
-                    result = _yolo_detect(scene, _GENERIC_CLASSES, target_image, cfg.AVU_conf_threshold)
-                    if result is not None:
-                        xyxy_np_all = result.boxes.xyxy.cpu().numpy()
-                        best_idx, best_score = _clip_rerank_bbox(
-                            scene, target_image, xyxy_np_all, object_class, aliases
-                        )
-                        _l3_xyxy_all = xyxy_np_all
-                        _l3_best_idx = best_idx
-                        if best_score >= _CLIP_RERANK_THRESH:
-                            logging.info(
-                                f"[AVU] L3 class-agnostic + CLIP rerank accepted "
-                                f"(score={best_score:.3f})"
-                            )
-                            if candidate is not None:
-                                candidate.record_attempt(3, True, f"CLIP score {best_score:.3f}")
-                            ground2d = Grounding2D(
-                                source="class_agnostic_clip",
-                                phrase=object_class,
-                                bbox_xyxy=xyxy_np_all[best_idx].astype(int),
-                                raw_score=float(best_score),  # 绝对 CLIP 分数
-                                rank_score=1.0,  # top-1 rank，归一化
-                                conf=float(result.boxes.conf[best_idx].cpu().numpy()),
-                            )
-                        else:
-                            logging.info(
-                                f"[AVU] L3 CLIP rerank rejected (score={best_score:.3f} "
-                                f"< {_CLIP_RERANK_THRESH})"
-                            )
-                            if candidate is not None:
-                                candidate.record_attempt(3, False, f"CLIP score {best_score:.3f}")
-                    else:
-                        if candidate is not None:
-                            candidate.record_attempt(3, False, "no generic class detection")
-
-            # ---- Level 4: visual approach (preferred) or evidence-pose ----
-            if ground2d is None:
-                logging.info(
-                    f"[AVU] L4 all detection failed; trying visual approach "
-                    f"(img {img_path}, yaw={view_yaw:.2f})"
-                )
-                if candidate is not None:
-                    candidate.record_attempt(4, False, "visual approach / evidence-pose")
-                # Visual approach: use L3 proposals even if CLIP rejected
-                if _l3_xyxy_all is not None and _l3_best_idx is not None:
-                    try:
-                        _approach = build_visual_approach_pose(
-                            _l3_xyxy_all[_l3_best_idx],
-                            scene.all_depths[img_path],
-                            scene.intrinsics[:3, :3],
-                            cam_pose,
-                            tsdf_planner,
-                        )
-                        if _approach is not None:
-                            logging.info(
-                                f"[AVU] L4 visual approach accepted, "
-                                f"nav_target_kind=VISUAL_APPROACH_POSE"
-                            )
-                            if candidate is not None:
-                                candidate.nav_target_kind = NavTargetKind.VISUAL_APPROACH_POSE
-                                candidate.nav_goal_xyz = _approach.xyz
-                                candidate.nav_goal_yaw = _approach.yaw
-                                candidate.nav_status = NavStatus.PLANNED
-                                if working_memory is not None:
-                                    working_memory.set_last_nav_candidate(candidate.candidate_id)
-                            return target_type, _approach.xyz, n_filtered_snapshots, target_index
-                    except Exception as _ve:
-                        logging.info(f"[AVU] visual approach exception: {_ve}")
-                # Visual approach failed/unavailable -> evidence-pose fallback
-                logging.info(
-                    f"[AVU] L4 visual approach unavailable, navigate to evidence-pose"
-                )
-                if working_memory is not None:
-                    _reason_l4a = f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose"
-                    _fix_l4a = working_memory.suggest_fix_for(FB_AVU_VISUAL_ONLY, _reason_l4a) if working_memory is not None else "re-observe from closer view; try aliases"
-                    working_memory.add_feedback(
-                        step=step_index,
-                        type_=FB_AVU_VISUAL_ONLY,
-                        reason=_reason_l4a,
-                        suggested_fix=_fix_l4a,
-                        target_candidate_id=candidate.candidate_id if candidate else None,
-                    )
-                # Return the camera pose that captured the evidence so the
-                # agent navigates there and re-observes from a closer view.
-                # cam_pose is a 4x4 world->cam; target_point is cam position
-                # in habitat coords = cam_pose[:3, 3] (if cam->world) or the
-                # inverse. scene stores cam_poses consistent with tsdf usage.
-                # We return it as the navigation target; set_next_navigation_point
-                # treats 'image' choice as a habitat position.
-                try:
-                    cam_pos_habitat = cam_pose[:3, 3]
-                except Exception:
-                    cam_pos_habitat = None
-                if cam_pos_habitat is None:
-                    logging.info(
-                        f"[AVU] L4 evidence-pose unavailable, stop (no random frontier)"
-                    )
-                    if working_memory is not None:
-                        _reason_nopose = f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; evidence-pose unavailable"
-                        _fix_nopose = working_memory.suggest_fix_for(FB_AVU_VISUAL_ONLY, _reason_nopose) if working_memory is not None else "re-observe from closer view; try aliases"
-                        working_memory.add_feedback(
-                            step=step_index,
-                            type_=FB_AVU_VISUAL_ONLY,
-                            reason=_reason_nopose,
-                            suggested_fix=_fix_nopose,
-                            target_candidate_id=candidate.candidate_id if candidate else None,
-                        )
-                    return None
-                if candidate is not None:
-                    candidate.nav_target_kind = NavTargetKind.EVIDENCE_POSE
-                    candidate.nav_goal_xyz = cam_pos_habitat
-                    candidate.nav_status = NavStatus.PLANNED
-                    if working_memory is not None:
-                        working_memory.set_last_nav_candidate(candidate.candidate_id)
-                return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
-
-            # ---- Grounded (L1/L2/L3): run SAM + point cloud + VVD ----
-            max_confidence = np.array([ground2d.conf])
-            xyxy_tensor = torch.as_tensor(ground2d.bbox_xyxy, dtype=torch.float32, device=scene.device).reshape(1, 4)
-            sam_out = scene.sam_predictor.predict(
-                target_image, bboxes=xyxy_tensor, verbose=False
-            )
-            masks_tensor = sam_out[0].masks.data
-            masks_np = masks_tensor.cpu().numpy()
-            obj_pcds_and_bboxes = detections_to_obj_pcd_and_bbox(
-                depth_array=scene.all_depths[img_path],
-                masks=masks_np,
-                cam_K=scene.intrinsics[:3, :3],
-                image_rgb=target_image,
-                trans_pose=cam_pose,
-                min_points_threshold=scene.cfg_cg.min_points_threshold,
-                spatial_sim_type=scene.cfg_cg.spatial_sim_type,
-                obj_pcd_max_points=scene.cfg_cg.obj_pcd_max_points,
-                device=scene.device,
-            )
-            for obj in obj_pcds_and_bboxes:
-                if obj:
-                    obj["pcd"] = init_process_pcd(
-                        pcd=obj["pcd"],
-                        downsample_voxel_size=scene.cfg_cg["downsample_voxel_size"],
-                        dbscan_remove_noise=scene.cfg_cg["dbscan_remove_noise"],
-                        dbscan_eps=scene.cfg_cg["dbscan_eps"],
-                        dbscan_min_points=scene.cfg_cg["dbscan_min_points"],
-                    )
-                    obj["bbox"] = get_bounding_box(
-                        spatial_sim_type=scene.cfg_cg["spatial_sim_type"],
-                        pcd=obj["pcd"],
-                    )
-            valid_objs = [o for o in obj_pcds_and_bboxes if o is not None]
-            if not valid_objs:
-                logging.info(
-                    f"All detections invalid for {img_path}, navigate to evidence-pose"
-                )
-                if candidate is not None:
-                    candidate.record_attempt(3, False, "SAM/pcd invalid")
-                if working_memory is not None:
-                    _reason_sam = f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose"
-                    _fix_sam = working_memory.suggest_fix_for(FB_AVU_VISUAL_ONLY, _reason_sam) if working_memory is not None else "re-observe from closer view; try aliases"
-                    working_memory.add_feedback(
-                        step=step_index,
-                        type_=FB_AVU_VISUAL_ONLY,
-                        reason=_reason_sam,
-                        suggested_fix=_fix_sam,
-                        target_candidate_id=candidate.candidate_id if candidate else None,
-                    )
-                try:
-                    cam_pos_habitat = cam_pose[:3, 3]
-                except Exception:
-                    cam_pos_habitat = None
-                if cam_pos_habitat is None:
-                    return None
-                if candidate is not None:
-                    candidate.nav_target_kind = NavTargetKind.EVIDENCE_POSE
-                    candidate.nav_goal_xyz = cam_pos_habitat
-                    candidate.nav_status = NavStatus.PLANNED
-                    if working_memory is not None:
-                        working_memory.set_last_nav_candidate(candidate.candidate_id)
-                return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
-            target_obj = valid_objs[0]
-            if candidate is not None:
-                working_memory.grounded_candidate(candidate.candidate_id)
-            a = []
-            for idx in scene.objects.keys():
-                a.append(scene.objects[idx]["pcd"].points)
-            obj_pos = Visibility_based_Viewpoint_Decision(
-                np.array(target_obj["pcd"].points),
-                np.concatenate(a, axis=0),
-                pts,
-                tsdf_planner,
-                cfg.dicision_radius,
-            )
-            if obj_pos is None:
-                obj_pos = select_navigation_corner(
-                    aabb=target_obj["bbox"], robot_position=pts
-                )
-                logging.info(
-                    f"multi_agent target Image {img_path}: {obj_pos} "
-                    f"(Closed Box Center, conf={max_confidence})"
-                )
-            else:
-                logging.info(
-                    f"multi_agent target Image {img_path}: {obj_pos} "
-                    f"(Visible Center, conf={max_confidence})"
-                )
-            if candidate is not None:
-                candidate.nav_target_kind = NavTargetKind.VIEWPOINT_POSE
-                candidate.nav_goal_xyz = obj_pos
-                candidate.nav_status = NavStatus.PLANNED
-                if working_memory is not None:
-                    working_memory.set_last_nav_candidate(candidate.candidate_id)
-            return target_type, obj_pos, n_filtered_snapshots, target_index
-        except Exception as e:
-            logging.info(
-                f"AVU/VVD failed for {img_path}: {e}, navigate to evidence-pose or stop"
-            )
-            if candidate is not None:
-                candidate.record_attempt(4, False, f"exception: {e}")
-            if working_memory is not None:
-                _reason_exc = f"AVU exception: {e}"
-                _fix_exc = working_memory.suggest_fix_for(FB_AVU_FAIL, _reason_exc) if working_memory is not None else "retry grounding from evidence-pose; consider aliases"
-                working_memory.add_feedback(
-                    step=step_index,
-                    type_=FB_AVU_FAIL,
-                    reason=_reason_exc,
-                    suggested_fix=_fix_exc,
-                    target_candidate_id=candidate.candidate_id if candidate else None,
-                )
-            try:
-                cam_pos_habitat = cam_pose[:3, 3]
-            except Exception:
-                cam_pos_habitat = None
-            if cam_pos_habitat is None:
-                return None
-            if candidate is not None:
-                candidate.nav_target_kind = NavTargetKind.EVIDENCE_POSE
-                candidate.nav_goal_xyz = cam_pos_habitat
-                candidate.nav_status = NavStatus.PLANNED
-                if working_memory is not None:
-                    working_memory.set_last_nav_candidate(candidate.candidate_id)
-            return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
+            return None
+        subtask_metadata["navigation_intent"] = controller_result.intent
+        subtask_metadata["candidate_controller_events"] = controller_result.events
+        return (
+            controller_result.intent,
+            controller_result.navigation_goal,
+            n_filtered_snapshots,
+            target_index,
+        )
 
     elif target_type == "frontier":
         target_index = int(target_index)

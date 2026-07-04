@@ -10,9 +10,9 @@ Implements the three memory layers from 诊断.md:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union
 
 import numpy as np
 
@@ -48,6 +48,515 @@ class CandidateState(Enum):
     SUCCEEDED = auto()
     REJECTED = auto()
     EXPIRED = auto()
+
+
+class NavigationMode(Enum):
+    EXPLORE = "EXPLORE"
+    VISUAL_APPROACH = "VISUAL_APPROACH"
+    TARGET_APPROACH = "TARGET_APPROACH"
+    VERIFY = "VERIFY"
+    STOP = "STOP"
+
+
+class BranchTaskStatus(Enum):
+    NEW = "NEW"
+    ADVANCING = "ADVANCING"
+    STALLED = "STALLED"
+    REVISITING = "REVISITING"
+    CLOSED = "CLOSED"
+
+
+class HypothesisStatus(Enum):
+    ACTIVE = "ACTIVE"
+    SUPPORTED = "SUPPORTED"
+    REJECTED = "REJECTED"
+    CONFIRMED = "CONFIRMED"
+
+
+class EventType(Enum):
+    SPATIAL_BRANCH_CREATED = "SPATIAL_BRANCH_CREATED"
+    SPATIAL_BRANCH_ADVANCED = "SPATIAL_BRANCH_ADVANCED"
+    SPATIAL_BRANCH_STALLED = "SPATIAL_BRANCH_STALLED"
+    SPATIAL_BRANCH_REVISITING = "SPATIAL_BRANCH_REVISITING"
+    NEW_FRONTIER = "NEW_FRONTIER"
+    FRONTIER_REACHED = "FRONTIER_REACHED"
+    NO_VALID_FRONTIER = "NO_VALID_FRONTIER"
+    SEMANTIC_EVIDENCE = "SEMANTIC_EVIDENCE"
+    EVIDENCE_CONFLICT = "EVIDENCE_CONFLICT"
+    CANDIDATE_VISIBLE = "CANDIDATE_VISIBLE"
+    CANDIDATE_GROUNDED_3D = "CANDIDATE_GROUNDED_3D"
+    VISUAL_APPROACH_READY = "VISUAL_APPROACH_READY"
+    TARGET_VIEWPOINT_READY = "TARGET_VIEWPOINT_READY"
+    TARGET_VIEWPOINT_REACHED = "TARGET_VIEWPOINT_REACHED"
+    VERIFY_SUCCESS = "VERIFY_SUCCESS"
+    VERIFY_FAILED = "VERIFY_FAILED"
+    WRONG_INSTANCE = "WRONG_INSTANCE"
+    POOR_VIEW = "POOR_VIEW"
+    TARGET_NOT_VISIBLE = "TARGET_NOT_VISIBLE"
+    WORKING_MEMORY_OVER_BUDGET = "WORKING_MEMORY_OVER_BUDGET"
+    HYPOTHESIS_UPDATE_REQUIRED = "HYPOTHESIS_UPDATE_REQUIRED"
+    MEMORY_UPDATE_REQUIRED = "MEMORY_UPDATE_REQUIRED"
+    NAVIGATION_FAILED = "NAVIGATION_FAILED"
+
+
+class AnswererDecision(Enum):
+    NOT_FOUND = "NOT_FOUND"
+    CANDIDATE_VISIBLE = "CANDIDATE_VISIBLE"
+    TARGET_CONFIRMED = "TARGET_CONFIRMED"
+    ANSWER_READY = "ANSWER_READY"
+
+
+class ExecutorActionMode(Enum):
+    CONTINUE_SPATIAL_BRANCH = "CONTINUE_SPATIAL_BRANCH"
+    SWITCH_SPATIAL_BRANCH = "SWITCH_SPATIAL_BRANCH"
+    REVISIT_SPATIAL_BRANCH = "REVISIT_SPATIAL_BRANCH"
+    STOP = "STOP"
+
+
+class VerifyStatus(Enum):
+    SUCCESS = "SUCCESS"
+    WRONG_INSTANCE = "WRONG_INSTANCE"
+    POOR_VIEW = "POOR_VIEW"
+    TARGET_NOT_VISIBLE = "TARGET_NOT_VISIBLE"
+
+
+T = TypeVar("T", bound="JsonDataclassMixin")
+
+
+def _enum_value(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    return value
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        if hasattr(value, "to_dict"):
+            return value.to_dict()
+        return {f.name: _jsonable(getattr(value, f.name)) for f in fields(value)}
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:
+            return value
+    return value
+
+
+def _coerce_enum(enum_cls: Type[Enum], value: Any) -> Enum:
+    if isinstance(value, enum_cls):
+        return value
+    if isinstance(value, str):
+        try:
+            return enum_cls(value)
+        except ValueError:
+            return enum_cls[value]
+    return enum_cls(value)
+
+
+class JsonDataclassMixin:
+    """Small JSON bridge for typed rebuild records.
+
+    This intentionally avoids a dependency on pydantic. Runtime code can pass
+    numpy arrays, enum instances, or primitive dicts; persisted state stays JSON
+    compatible.
+    """
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {f.name: _jsonable(getattr(self, f.name)) for f in fields(self)}
+
+    @classmethod
+    def from_dict(cls: Type[T], data: Dict[str, Any]) -> T:
+        if data is None:
+            raise ValueError(f"cannot build {cls.__name__} from None")
+        return cls(**dict(data))
+
+
+@dataclass
+class FrontierAnchor(JsonDataclassMixin):
+    frontier_id: int
+    spatial_branch_id: Optional[str] = None
+
+
+@dataclass
+class SpatialBranchAnchor(JsonDataclassMixin):
+    spatial_branch_id: str
+
+
+@dataclass
+class ImageAnchor(JsonDataclassMixin):
+    image_path: str
+    candidate_id: Optional[str] = None
+
+
+@dataclass
+class ObjectAnchor(JsonDataclassMixin):
+    object_id: Union[int, str]
+    class_name: Optional[str] = None
+
+
+@dataclass
+class CandidateAnchor(JsonDataclassMixin):
+    candidate_id: str
+    image_path: Optional[str] = None
+    target_phrase: Optional[str] = None
+
+
+Anchor = Union[
+    FrontierAnchor,
+    SpatialBranchAnchor,
+    ImageAnchor,
+    ObjectAnchor,
+    CandidateAnchor,
+]
+
+
+def anchor_from_dict(data: Dict[str, Any]) -> Anchor:
+    kind = (data or {}).get("kind") or (data or {}).get("type")
+    if kind:
+        kind = str(kind).lower()
+    if kind == "frontier" or "frontier_id" in data:
+        return FrontierAnchor(
+            frontier_id=int(data["frontier_id"]),
+            spatial_branch_id=data.get("spatial_branch_id"),
+        )
+    if kind == "spatial_branch" or "spatial_branch_id" in data:
+        return SpatialBranchAnchor(spatial_branch_id=str(data["spatial_branch_id"]))
+    if kind == "object" or "object_id" in data:
+        return ObjectAnchor(
+            object_id=data["object_id"],
+            class_name=data.get("class_name"),
+        )
+    if kind == "candidate" or "candidate_id" in data:
+        return CandidateAnchor(
+            candidate_id=str(data["candidate_id"]),
+            image_path=data.get("image_path"),
+            target_phrase=data.get("target_phrase"),
+        )
+    if kind == "image" or "image_path" in data:
+        return ImageAnchor(
+            image_path=str(data["image_path"]),
+            candidate_id=data.get("candidate_id"),
+        )
+    raise ValueError(f"unknown anchor payload: {data}")
+
+
+def _anchor_to_dict(anchor: Anchor) -> Dict[str, Any]:
+    payload = anchor.to_dict() if hasattr(anchor, "to_dict") else _jsonable(anchor)
+    if isinstance(anchor, FrontierAnchor):
+        payload["kind"] = "frontier"
+    elif isinstance(anchor, SpatialBranchAnchor):
+        payload["kind"] = "spatial_branch"
+    elif isinstance(anchor, ImageAnchor):
+        payload["kind"] = "image"
+    elif isinstance(anchor, ObjectAnchor):
+        payload["kind"] = "object"
+    elif isinstance(anchor, CandidateAnchor):
+        payload["kind"] = "candidate"
+    return payload
+
+
+@dataclass
+class FrontierInstance(JsonDataclassMixin):
+    frontier_id: int
+    position: Any
+    orientation: Any = None
+    area: float = 0.0
+    local_index: Optional[int] = None
+    spatial_branch_id: Optional[str] = None
+    image: Optional[str] = None
+    is_selectable: bool = True
+    created_step: int = 0
+    updated_step: int = 0
+
+    def __post_init__(self) -> None:
+        self.frontier_id = int(self.frontier_id)
+        self.position = _jsonable(self.position)
+        self.orientation = _jsonable(self.orientation)
+
+    def to_prompt_str(self) -> str:
+        branch = self.spatial_branch_id or "unassigned"
+        return (
+            f"F_{self.frontier_id:03d}/{branch}: "
+            f"area={self.area:.1f}, selectable={self.is_selectable}"
+        )
+
+
+@dataclass
+class SpatialBranchRecord(JsonDataclassMixin):
+    spatial_branch_id: str
+    frontier_ids: List[int] = field(default_factory=list)
+    spine: List[Any] = field(default_factory=list)
+    active_tip_frontier_id: Optional[int] = None
+    aliases: List[str] = field(default_factory=list)
+    merged_into: Optional[str] = None
+    created_step: int = 0
+    updated_step: int = 0
+
+    def __post_init__(self) -> None:
+        self.frontier_ids = [int(fid) for fid in self.frontier_ids]
+        if self.active_tip_frontier_id is not None:
+            self.active_tip_frontier_id = int(self.active_tip_frontier_id)
+        self.spine = [_jsonable(p) for p in self.spine]
+
+    def to_prompt_str(self) -> str:
+        tip = (
+            f"F_{self.active_tip_frontier_id:03d}"
+            if self.active_tip_frontier_id is not None
+            else "none"
+        )
+        merged = f", merged_into={self.merged_into}" if self.merged_into else ""
+        return (
+            f"{self.spatial_branch_id}: tip={tip}, "
+            f"frontiers={self.frontier_ids}{merged}"
+        )
+
+
+@dataclass
+class BranchTaskState(JsonDataclassMixin):
+    spatial_branch_id: str
+    status: BranchTaskStatus = BranchTaskStatus.NEW
+    progress_score: float = 0.0
+    steps_without_progress: int = 0
+    selected_count: int = 0
+    reached_count: int = 0
+    active_hypothesis_id: Optional[str] = None
+    last_frontier_id: Optional[int] = None
+    closed_reason: Optional[str] = None
+    updated_step: int = 0
+
+    def __post_init__(self) -> None:
+        self.status = _coerce_enum(BranchTaskStatus, self.status)
+        if self.last_frontier_id is not None:
+            self.last_frontier_id = int(self.last_frontier_id)
+
+    def to_prompt_str(self) -> str:
+        fid = (
+            f"F_{self.last_frontier_id:03d}"
+            if self.last_frontier_id is not None
+            else "none"
+        )
+        return (
+            f"{self.spatial_branch_id}: status={self.status.value}, "
+            f"progress={self.progress_score:.2f}, last={fid}"
+        )
+
+
+@dataclass
+class HypothesisBranch(JsonDataclassMixin):
+    hypothesis_id: str
+    description: str
+    anchors: List[Anchor] = field(default_factory=list)
+    status: HypothesisStatus = HypothesisStatus.ACTIVE
+    confidence: float = 0.0
+    evidence: List[str] = field(default_factory=list)
+    conflicts: List[str] = field(default_factory=list)
+    created_step: int = 0
+    updated_step: int = 0
+    writer: str = "HypothesisManager"
+
+    def __post_init__(self) -> None:
+        self.status = _coerce_enum(HypothesisStatus, self.status)
+        normalized = []
+        for anchor in self.anchors:
+            if isinstance(anchor, dict):
+                normalized.append(anchor_from_dict(anchor))
+            else:
+                normalized.append(anchor)
+        self.anchors = normalized
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = super().to_dict()
+        data["anchors"] = [_anchor_to_dict(a) for a in self.anchors]
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "HypothesisBranch":
+        payload = dict(data)
+        payload["anchors"] = [
+            anchor_from_dict(a) if isinstance(a, dict) else a
+            for a in payload.get("anchors", [])
+        ]
+        return cls(**payload)
+
+    def to_prompt_str(self) -> str:
+        anchor_str = ", ".join(
+            _anchor_to_dict(anchor).get("kind", "anchor")
+            for anchor in self.anchors
+        ) or "none"
+        return (
+            f"{self.hypothesis_id}: {self.description} "
+            f"(status={self.status.value}, conf={self.confidence:.2f}, "
+            f"anchors={anchor_str})"
+        )
+
+
+@dataclass
+class TypedEvent(JsonDataclassMixin):
+    event_id: str
+    type: EventType
+    step: int
+    entity_id: Optional[str] = None
+    active_hypothesis_id: Optional[str] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+    severity: str = "info"
+    ttl_steps: int = 4
+    created_step: int = 0
+
+    def __post_init__(self) -> None:
+        self.type = _coerce_enum(EventType, self.type)
+        if self.created_step == 0:
+            self.created_step = self.step
+
+    def debounce_key(self) -> tuple:
+        return (self.type.value, self.entity_id, self.active_hypothesis_id)
+
+    def to_prompt_str(self) -> str:
+        entity = f" entity={self.entity_id}" if self.entity_id else ""
+        return f"- step {self.step} [{self.type.value}]{entity}: {self.payload}"
+
+
+@dataclass
+class ExploreIntent(JsonDataclassMixin):
+    mode: NavigationMode = NavigationMode.EXPLORE
+    frontier_id: Optional[int] = None
+    spatial_branch_id: Optional[str] = None
+    hypothesis_id: Optional[str] = None
+    action_mode: ExecutorActionMode = ExecutorActionMode.CONTINUE_SPATIAL_BRANCH
+    reason_code: str = ""
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        self.mode = _coerce_enum(NavigationMode, self.mode)
+        self.action_mode = _coerce_enum(ExecutorActionMode, self.action_mode)
+        if self.frontier_id is not None:
+            self.frontier_id = int(self.frontier_id)
+
+
+@dataclass
+class VisualApproachIntent(JsonDataclassMixin):
+    mode: NavigationMode = NavigationMode.VISUAL_APPROACH
+    candidate_id: str = ""
+    image_path: str = ""
+    target_phrase: str = ""
+    approach_xyz: Any = None
+    approach_yaw: Optional[float] = None
+    reason_code: str = "VISUAL_APPROACH"
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        self.mode = _coerce_enum(NavigationMode, self.mode)
+        self.approach_xyz = _jsonable(self.approach_xyz)
+
+
+@dataclass
+class TargetViewpointIntent(JsonDataclassMixin):
+    mode: NavigationMode = NavigationMode.TARGET_APPROACH
+    candidate_id: str = ""
+    image_path: str = ""
+    target_phrase: str = ""
+    target_xyz: Any = None
+    target_yaw: Optional[float] = None
+    viewpoint_id: Optional[str] = None
+    reason_code: str = "TARGET_VIEWPOINT"
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        self.mode = _coerce_enum(NavigationMode, self.mode)
+        self.target_xyz = _jsonable(self.target_xyz)
+
+
+NavigationIntent = Union[ExploreIntent, VisualApproachIntent, TargetViewpointIntent]
+
+
+def navigation_intent_from_dict(data: Dict[str, Any]) -> NavigationIntent:
+    mode = _coerce_enum(NavigationMode, data.get("mode", NavigationMode.EXPLORE))
+    if mode == NavigationMode.VISUAL_APPROACH:
+        return VisualApproachIntent.from_dict(data)
+    if mode in (NavigationMode.TARGET_APPROACH, NavigationMode.VERIFY):
+        return TargetViewpointIntent.from_dict(data)
+    return ExploreIntent.from_dict(data)
+
+
+@dataclass
+class NavigationResult(JsonDataclassMixin):
+    mode: NavigationMode
+    success: bool
+    target_arrived: bool = False
+    intent: Optional[NavigationIntent] = None
+    failure_reason: Optional[str] = None
+    verify_status: Optional[VerifyStatus] = None
+    frontier_id: Optional[int] = None
+    candidate_id: Optional[str] = None
+    step: int = 0
+
+    def __post_init__(self) -> None:
+        self.mode = _coerce_enum(NavigationMode, self.mode)
+        if self.verify_status is not None:
+            self.verify_status = _coerce_enum(VerifyStatus, self.verify_status)
+        if isinstance(self.intent, dict):
+            self.intent = navigation_intent_from_dict(self.intent)
+        if self.frontier_id is not None:
+            self.frontier_id = int(self.frontier_id)
+
+
+@dataclass
+class StepOutcome(JsonDataclassMixin):
+    step: int
+    mode: NavigationMode
+    intent: Optional[NavigationIntent] = None
+    navigation_result: Optional[NavigationResult] = None
+    events: List[TypedEvent] = field(default_factory=list)
+    answerer_decision: AnswererDecision = AnswererDecision.NOT_FOUND
+    verification_result: Optional[VerifyStatus] = None
+    done: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.mode = _coerce_enum(NavigationMode, self.mode)
+        self.answerer_decision = _coerce_enum(
+            AnswererDecision, self.answerer_decision
+        )
+        if self.verification_result is not None:
+            self.verification_result = _coerce_enum(
+                VerifyStatus, self.verification_result
+            )
+        if isinstance(self.intent, dict):
+            self.intent = navigation_intent_from_dict(self.intent)
+        if isinstance(self.navigation_result, dict):
+            self.navigation_result = NavigationResult.from_dict(
+                self.navigation_result
+            )
+        self.events = [
+            TypedEvent.from_dict(e) if isinstance(e, dict) else e
+            for e in self.events
+        ]
+
+
+def format_prompt_summary(items: Any, max_items: int = 8) -> str:
+    """Render typed rebuild state for VLM prompts without leaking raw dicts."""
+    if items is None:
+        return ""
+    if not isinstance(items, (list, tuple)):
+        items = [items]
+    lines = []
+    for item in list(items)[:max_items]:
+        if hasattr(item, "to_prompt_str"):
+            lines.append(item.to_prompt_str())
+        elif isinstance(item, dict):
+            lines.append(str(_jsonable(item)))
+        else:
+            lines.append(str(item))
+    if len(items) > max_items:
+        lines.append(f"... {len(items) - max_items} more")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +854,11 @@ class SubtaskWorkingMemory:
         self.pinned_ids: set = set()             # image paths that cannot be dropped
         self.target_candidates: Dict[str, TargetCandidate] = {}
         self.frontier_registry: Dict[int, FrontierState] = {}
+        self.spatial_branches: Dict[str, SpatialBranchRecord] = {}
+        self.frontier_to_branch: Dict[int, str] = {}
+        self.branch_task_states: Dict[str, BranchTaskState] = {}
+        self.hypotheses: Dict[str, HypothesisBranch] = {}
+        self.typed_events: List[TypedEvent] = []
         self.feedback: List[FeedbackEvent] = []
         self.plan_stale_count: int = 0
         self.high_level_plan: Optional[str] = None
@@ -370,6 +884,9 @@ class SubtaskWorkingMemory:
         self.question = question
         self.pinned_ids = set()
         self.target_candidates = {}
+        self.branch_task_states = {}
+        self.hypotheses = {}
+        self.typed_events = []
         self.feedback = []
         self.plan_stale_count = 0
         self.high_level_plan = None
@@ -382,6 +899,63 @@ class SubtaskWorkingMemory:
             fs.reached_count = 0
             fs.last_result = None
             # keep centroid/area/view_yaw/first_seen_step
+
+    # ---- typed rebuild state ----------------------------------------------
+    def upsert_spatial_branch(
+        self,
+        branch: SpatialBranchRecord,
+    ) -> SpatialBranchRecord:
+        self.spatial_branches[branch.spatial_branch_id] = branch
+        for fid in branch.frontier_ids:
+            self.frontier_to_branch[int(fid)] = branch.spatial_branch_id
+        if branch.active_tip_frontier_id is not None:
+            self.frontier_to_branch[
+                int(branch.active_tip_frontier_id)
+            ] = branch.spatial_branch_id
+        return branch
+
+    def get_branch_for_frontier(self, frontier_id: int) -> Optional[SpatialBranchRecord]:
+        bid = self.frontier_to_branch.get(int(frontier_id))
+        return self.spatial_branches.get(bid) if bid else None
+
+    def upsert_branch_task_state(
+        self,
+        state: BranchTaskState,
+    ) -> BranchTaskState:
+        self.branch_task_states[state.spatial_branch_id] = state
+        return state
+
+    def eligible_spatial_branches(self) -> List[SpatialBranchRecord]:
+        out = []
+        for bid, branch in self.spatial_branches.items():
+            if branch.merged_into:
+                continue
+            state = self.branch_task_states.get(bid)
+            if state is not None and state.status == BranchTaskStatus.CLOSED:
+                continue
+            out.append(branch)
+        return out
+
+    def set_hypotheses_from_manager(
+        self,
+        hypotheses: List[HypothesisBranch],
+        writer: str = "HypothesisManager",
+    ) -> None:
+        """Single-writer gate for HypothesisBranch updates."""
+        for hyp in hypotheses:
+            if hyp.writer != writer:
+                raise ValueError(
+                    "HypothesisBranch updates must come from HypothesisManager"
+                )
+            self.hypotheses[hyp.hypothesis_id] = hyp
+
+    def add_typed_event(self, event: TypedEvent) -> None:
+        self.typed_events.append(event)
+        if len(self.typed_events) > 32:
+            self.typed_events = self.typed_events[-32:]
+
+    def clear_task_scope_events(self) -> None:
+        self.typed_events = []
 
     # ---- candidates --------------------------------------------------------
     def get_or_create_candidate(

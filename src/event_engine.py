@@ -1,0 +1,247 @@
+"""Typed event detection and trigger routing for the rebuild flow."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from src.memory_structures import (
+    AnswererDecision,
+    EventType,
+    NavigationMode,
+    NavigationResult,
+    StepOutcome,
+    SubtaskWorkingMemory,
+    TypedEvent,
+    VerifyStatus,
+)
+
+
+@dataclass
+class EventEngineConfig:
+    debounce_steps: int = 2
+    memory_pool_budget: int = 6
+
+
+@dataclass
+class EventRoutingDecision:
+    call_memory_manager: bool = False
+    call_hypothesis_manager: bool = False
+    reasons: List[str] = field(default_factory=list)
+
+
+class EventEngine:
+    """Creates task-scoped typed events and debounces trigger routing."""
+
+    HYPOTHESIS_TRIGGERS = {
+        EventType.CANDIDATE_VISIBLE,
+        EventType.CANDIDATE_GROUNDED_3D,
+        EventType.EVIDENCE_CONFLICT,
+        EventType.SPATIAL_BRANCH_CREATED,
+        EventType.SPATIAL_BRANCH_STALLED,
+        EventType.SPATIAL_BRANCH_REVISITING,
+        EventType.NO_VALID_FRONTIER,
+        EventType.WRONG_INSTANCE,
+        EventType.POOR_VIEW,
+        EventType.TARGET_NOT_VISIBLE,
+        EventType.HYPOTHESIS_UPDATE_REQUIRED,
+    }
+    MEMORY_TRIGGERS = {
+        EventType.WORKING_MEMORY_OVER_BUDGET,
+        EventType.MEMORY_UPDATE_REQUIRED,
+    }
+
+    def __init__(self, config: Optional[EventEngineConfig] = None) -> None:
+        self.config = config or EventEngineConfig()
+        self._last_emitted: Dict[Tuple[str, Optional[str], Optional[str]], int] = {}
+
+    def reset_task_scope(self) -> None:
+        self._last_emitted = {}
+
+    def emit(
+        self,
+        type_: EventType,
+        step: int,
+        entity_id: Optional[str] = None,
+        active_hypothesis_id: Optional[str] = None,
+        payload: Optional[Dict] = None,
+        severity: str = "info",
+    ) -> Optional[TypedEvent]:
+        event = TypedEvent(
+            event_id=f"{type_.value}:{entity_id or 'global'}:{step}",
+            type=type_,
+            step=step,
+            entity_id=entity_id,
+            active_hypothesis_id=active_hypothesis_id,
+            payload=payload or {},
+            severity=severity,
+        )
+        key = event.debounce_key()
+        last_step = self._last_emitted.get(key)
+        if last_step is not None and step - last_step < self.config.debounce_steps:
+            return None
+        self._last_emitted[key] = step
+        return event
+
+    def detect_memory_events(
+        self,
+        pool_size: int,
+        step: int,
+        working_memory: Optional[SubtaskWorkingMemory] = None,
+    ) -> List[TypedEvent]:
+        if pool_size <= self.config.memory_pool_budget:
+            return []
+        event = self.emit(
+            EventType.WORKING_MEMORY_OVER_BUDGET,
+            step=step,
+            entity_id="image_pool",
+            payload={
+                "pool_size": pool_size,
+                "budget": self.config.memory_pool_budget,
+            },
+            severity="warning",
+        )
+        if event is None:
+            return []
+        if working_memory is not None:
+            working_memory.add_typed_event(event)
+        return [event]
+
+    def detect_answerer_events(
+        self,
+        decision: AnswererDecision,
+        step: int,
+        candidate_id: Optional[str] = None,
+        image_path: Optional[str] = None,
+        evidence_conflict: bool = False,
+        working_memory: Optional[SubtaskWorkingMemory] = None,
+    ) -> List[TypedEvent]:
+        events: List[TypedEvent] = []
+        if decision in (
+            AnswererDecision.CANDIDATE_VISIBLE,
+            AnswererDecision.TARGET_CONFIRMED,
+            AnswererDecision.ANSWER_READY,
+        ):
+            event = self.emit(
+                EventType.CANDIDATE_VISIBLE,
+                step=step,
+                entity_id=candidate_id or image_path,
+                payload={
+                    "decision": decision.value,
+                    "candidate_id": candidate_id,
+                    "image_path": image_path,
+                },
+            )
+            if event is not None:
+                events.append(event)
+        if evidence_conflict:
+            event = self.emit(
+                EventType.EVIDENCE_CONFLICT,
+                step=step,
+                entity_id=candidate_id or image_path,
+                payload={"candidate_id": candidate_id, "image_path": image_path},
+                severity="warning",
+            )
+            if event is not None:
+                events.append(event)
+        if working_memory is not None:
+            for event in events:
+                working_memory.add_typed_event(event)
+        return events
+
+    def detect_navigation_events(
+        self,
+        result: NavigationResult,
+        working_memory: Optional[SubtaskWorkingMemory] = None,
+    ) -> List[TypedEvent]:
+        events: List[TypedEvent] = []
+        if result.mode == NavigationMode.EXPLORE and result.target_arrived:
+            event = self.emit(
+                EventType.FRONTIER_REACHED,
+                step=result.step,
+                entity_id=(
+                    f"F_{result.frontier_id:03d}"
+                    if result.frontier_id is not None
+                    else None
+                ),
+                payload={"frontier_id": result.frontier_id},
+            )
+            if event is not None:
+                events.append(event)
+        elif result.mode == NavigationMode.TARGET_APPROACH and result.target_arrived:
+            event = self.emit(
+                EventType.TARGET_VIEWPOINT_REACHED,
+                step=result.step,
+                entity_id=result.candidate_id,
+                payload={"candidate_id": result.candidate_id},
+            )
+            if event is not None:
+                events.append(event)
+
+        if not result.success:
+            event = self.emit(
+                EventType.NAVIGATION_FAILED,
+                step=result.step,
+                entity_id=result.candidate_id
+                or (
+                    f"F_{result.frontier_id:03d}"
+                    if result.frontier_id is not None
+                    else None
+                ),
+                payload={"failure_reason": result.failure_reason},
+                severity="warning",
+            )
+            if event is not None:
+                events.append(event)
+
+        if result.verify_status is not None:
+            verify_type = {
+                VerifyStatus.SUCCESS: EventType.VERIFY_SUCCESS,
+                VerifyStatus.WRONG_INSTANCE: EventType.WRONG_INSTANCE,
+                VerifyStatus.POOR_VIEW: EventType.POOR_VIEW,
+                VerifyStatus.TARGET_NOT_VISIBLE: EventType.TARGET_NOT_VISIBLE,
+            }[result.verify_status]
+            event = self.emit(
+                verify_type,
+                step=result.step,
+                entity_id=result.candidate_id,
+                payload={"verify_status": result.verify_status.value},
+                severity="info"
+                if result.verify_status == VerifyStatus.SUCCESS
+                else "warning",
+            )
+            if event is not None:
+                events.append(event)
+
+        if working_memory is not None:
+            for event in events:
+                working_memory.add_typed_event(event)
+        return events
+
+    def route(self, events: Iterable[TypedEvent]) -> EventRoutingDecision:
+        routing = EventRoutingDecision()
+        for event in events:
+            if event.type in self.MEMORY_TRIGGERS:
+                routing.call_memory_manager = True
+                routing.reasons.append(event.type.value)
+            if event.type in self.HYPOTHESIS_TRIGGERS:
+                routing.call_hypothesis_manager = True
+                routing.reasons.append(event.type.value)
+        return routing
+
+    def build_step_outcome(
+        self,
+        step: int,
+        mode: NavigationMode,
+        events: Iterable[TypedEvent],
+        decision: AnswererDecision = AnswererDecision.NOT_FOUND,
+        navigation_result: Optional[NavigationResult] = None,
+        done: bool = False,
+    ) -> StepOutcome:
+        return StepOutcome(
+            step=step,
+            mode=mode,
+            events=list(events),
+            answerer_decision=decision,
+            navigation_result=navigation_result,
+            done=done,
+        )
