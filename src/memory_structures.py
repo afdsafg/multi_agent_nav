@@ -11,9 +11,43 @@ Implements the three memory layers from 诊断.md:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Navigation state enums (deep-research-report §TargetCandidateMemory)
+# ---------------------------------------------------------------------------
+class NavTargetKind(Enum):
+    FRONTIER = auto()
+    EVIDENCE_POSE = auto()
+    VISUAL_APPROACH_POSE = auto()
+    VIEWPOINT_POSE = auto()
+
+
+class NavStatus(Enum):
+    NONE = auto()
+    PLANNED = auto()
+    IN_PROGRESS = auto()
+    REACHED = auto()
+    FAILED = auto()
+    STALE = auto()
+
+
+class CandidateState(Enum):
+    """Extended candidate state lifecycle (report §TargetCandidateMemory).
+    Not wired into existing str-based status yet — kept for reference/TTL."""
+    VISUAL_ONLY = auto()
+    GROUNDED_2D = auto()
+    GROUNDED_3D = auto()
+    NEED_CLOSER_VIEW = auto()
+    VIEWPOINT_READY = auto()
+    VERIFY_PENDING = auto()
+    SUCCEEDED = auto()
+    REJECTED = auto()
+    EXPIRED = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +142,28 @@ def get_aliases(target_phrase: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Grounding2D — Ultralytics-free intermediate (report §Visual Candidate Approach)
+# ---------------------------------------------------------------------------
+@dataclass
+class Grounding2D:
+    source: str               # "yolo_target" | "yolo_alias" | "class_agnostic_clip"
+    phrase: str
+    bbox_xyxy: Any            # np.ndarray shape (4,) int
+    mask: Optional[Any] = None
+    raw_score: float = 0.0
+    rank_score: Optional[float] = None
+    conf: float = 0.0
+
+
+@dataclass
+class ApproachPose:
+    xyz: Any
+    yaw: float
+    source: str
+    valid_depth_ratio: float
+
+
+# ---------------------------------------------------------------------------
 # Target candidate
 # ---------------------------------------------------------------------------
 # Status values
@@ -122,6 +178,19 @@ class GroundingAttempt:
     level: int            # 1=YOLO target, 2=YOLO alias, 3=class-agnostic+CLIP, 4=evidence-pose
     success: bool
     reason: str = ""
+
+
+def should_release(c: "TargetCandidate", step: int, ttl_steps: int = 12,
+                   max_closer_views: int = 3) -> bool:
+    """Report §TargetCandidateMemory release gate. Only reject/expire/cap
+    release; success release is handled by release_after_navigation."""
+    if c.status == S_REJECTED:
+        return True
+    if c.closer_view_attempts >= max_closer_views:
+        return True
+    if step - c.source_step > ttl_steps and c.status == S_VISUAL_ONLY:
+        return True
+    return False
 
 
 @dataclass
@@ -139,6 +208,11 @@ class TargetCandidate:
     pinned: bool = True
     last_failure_reason: Optional[str] = None
     closer_view_attempts: int = 0  # how many times we navigated closer and re-tried
+    # Navigation target tracking (report §AVU→VVD→task_check)
+    nav_target_kind: Optional[NavTargetKind] = None
+    nav_status: NavStatus = NavStatus.NONE
+    nav_goal_xyz: Optional[Any] = None       # habitat (x,y,z)
+    nav_goal_yaw: Optional[float] = None
 
     def record_attempt(self, level: int, success: bool, reason: str = "") -> None:
         self.grounding_attempts.append(
@@ -261,6 +335,7 @@ class SubtaskWorkingMemory:
         self.high_level_plan: Optional[str] = None
         self.last_plan_normalized: Optional[str] = None
         self.recent_frontier_ids: List[int] = []  # ordered, for recent_window
+        self._last_nav_candidate_id: Optional[str] = None
 
     # ---- subtask lifecycle -------------------------------------------------
     def reset_for_new_subtask(
@@ -285,6 +360,7 @@ class SubtaskWorkingMemory:
         self.high_level_plan = None
         self.last_plan_normalized = None
         self.recent_frontier_ids = []
+        self._last_nav_candidate_id = None
         for fs in self.frontier_registry.values():
             fs.status = F_STALE
             fs.selected_count = 0
@@ -377,6 +453,14 @@ class SubtaskWorkingMemory:
             c for c in self.target_candidates.values()
             if c.status in (S_VISUAL_ONLY, S_NEED_CLOSER_VIEW)
         ]
+
+    # ---- nav candidate tracking (report §AVU→VVD→task_check) --------------
+    def set_last_nav_candidate(self, candidate_id: str) -> None:
+        self._last_nav_candidate_id = candidate_id
+
+    def get_last_nav_candidate(self) -> Optional[TargetCandidate]:
+        cid = self._last_nav_candidate_id
+        return self.target_candidates.get(cid) if cid else None
 
     # ---- frontiers ---------------------------------------------------------
     def upsert_frontier(
