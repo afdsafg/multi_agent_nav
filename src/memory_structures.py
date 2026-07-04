@@ -305,6 +305,8 @@ class FeedbackEvent:
     target_candidate_id: Optional[str] = None
     frontier_id: Optional[int] = None
     suggested_fix: str = ""
+    ttl_steps: int = 4
+    created_step: int = 0
 
     def to_prompt_str(self) -> str:
         s = f"- Step {self.step} [{self.type}]: {self.reason}"
@@ -551,6 +553,7 @@ class SubtaskWorkingMemory:
         suggested_fix: str = "",
         target_candidate_id: Optional[str] = None,
         frontier_id: Optional[int] = None,
+        created_step: Optional[int] = None,
     ) -> None:
         self.feedback.append(
             FeedbackEvent(
@@ -560,14 +563,28 @@ class SubtaskWorkingMemory:
                 target_candidate_id=target_candidate_id,
                 frontier_id=frontier_id,
                 suggested_fix=suggested_fix,
+                created_step=step if created_step is None else created_step,
             )
         )
         # keep only the most recent N to bound prompt size
         if len(self.feedback) > 8:
             self.feedback = self.feedback[-8:]
 
-    def recent_feedback(self, n: int = 4) -> List[FeedbackEvent]:
-        return self.feedback[-n:] if self.feedback else []
+    def recent_feedback(self, n: int = 4, current_step: int = 0) -> List[FeedbackEvent]:
+        alive = [e for e in self.feedback if current_step - e.created_step < e.ttl_steps]
+        return alive[-n:] if alive else []
+
+    def summarize_feedback(self, agent_name: str, current_step: int = 0) -> List[FeedbackEvent]:
+        """Report §FeedbackMemory: agent-specific event filtering."""
+        alive = [e for e in self.feedback if current_step - e.created_step < e.ttl_steps]
+        _MAP = {
+            "ImageManager": {FB_AVU_FAIL, FB_AVU_VISUAL_ONLY},
+            "Answerer": {FB_TASK_CHECK_FAIL, FB_WRONG_INSTANCE},
+            "Planner": {FB_TASK_CHECK_FAIL, FB_AVU_FAIL, FB_FRONTIER_NO_INFO, FB_PLANNER_STALE},
+            "Executor": {FB_FRONTIER_NO_INFO},
+        }
+        types = _MAP.get(agent_name, set())
+        return [e for e in alive if e.type in types]
 
     def suggest_fix_for(self, type_: str, reason: str = "") -> str:
         """§7 failure-type → suggested_fix mapping. reason used to disambiguate
@@ -588,8 +605,16 @@ class SubtaskWorkingMemory:
             return "reject candidate, search for other instances"
         return ""
 
-    def feedback_prompt_block(self, n: int = 4) -> str:
-        events = self.recent_feedback(n)
+    def feedback_prompt_block(
+        self,
+        n: int = 4,
+        agent_name: Optional[str] = None,
+        current_step: int = 0,
+    ) -> str:
+        if agent_name is not None:
+            events = self.summarize_feedback(agent_name, current_step)
+        else:
+            events = self.recent_feedback(n, current_step)
         if not events:
             return ""
         lines = ["Recent Failure Feedback:"]

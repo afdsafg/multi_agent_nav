@@ -1345,7 +1345,9 @@ def explore_multi_agent(
     feedback_block = ""
     if working_memory is not None:
         candidates_block = working_memory.candidates_prompt_block()
-        feedback_block = working_memory.feedback_prompt_block()
+        feedback_block = working_memory.feedback_prompt_block(
+            agent_name="Answerer", current_step=step
+        )
     sys_p, content = format_answerer_prompt(
         question, pool, task_type, image_goal, high_level_plan,
         history_decision=history_decision,
@@ -1433,6 +1435,12 @@ def explore_multi_agent(
         logging.info("[High-Level Planner] no valid plan block, keeping old")
 
     # g. Executor
+    # Executor-specific feedback (FRONTIER_NO_INFO only)
+    _executor_fb = ""
+    if working_memory is not None:
+        _executor_fb = working_memory.feedback_prompt_block(
+            agent_name="Executor", current_step=step
+        )
     # §4: hard constraint — only offer valid frontiers (active, under reselect
     # cap, not in recent window)
     if tsdf_planner is not None and working_memory is not None:
@@ -1465,7 +1473,7 @@ def explore_multi_agent(
         question, frontier_imgs, pool, high_level_plan, task_type,
         history_decision=history_decision,
         frontier_states=frontier_states,
-        feedback_block=feedback_block,
+        feedback_block=_executor_fb,
     )
     if verbose:
         logging.info("[Executor] calling VLM")
