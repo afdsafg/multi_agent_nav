@@ -881,6 +881,40 @@ class TSDFPlanner(TSDFPlannerBase):
             true_views.append(self.normal2habitat(next_point_normal))
         return np.array(true_views)
 
+    def is_line_of_sight_clear(self, p1_habitat, p2_habitat):
+        """2D Bresenham line-of-sight check against TSDF occupied grid.
+        Returns True if no occupied voxel between p1 and p2 (2D top-down projection)."""
+        if self.occupied is None:
+            return True
+        v1 = self.habitat2voxel(p1_habitat)[:2]
+        v2 = self.habitat2voxel(p2_habitat)[:2]
+        x0, y0 = int(v1[0]), int(v1[1])
+        x1, y1 = int(v2[0]), int(v2[1])
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        H, W = self.occupied.shape
+        # cap iterations to avoid infinite loop
+        max_iter = dx + dy + 1
+        for _ in range(max_iter + 1):
+            if 0 <= x0 < H and 0 <= y0 < W:
+                if self.occupied[x0, y0]:
+                    return False
+            else:
+                return False  # out of bounds = blocked
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+        return True
+
     def get_frontier_region_map(self, frontier_coordinates):
         # frontier_coordinates: [N, 2] ndarray of the coordinates covered by the frontier in voxel space
         region_map = np.zeros_like(self.frontier_map, dtype=bool)

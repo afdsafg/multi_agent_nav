@@ -56,7 +56,18 @@ def Visibility_based_Viewpoint_Decision(target_points, scene_points, pts, tsdf_p
     best_viewpoint = None
     candidate_viewpoints = generate_candidate_viewpoints(bbox_center, radius_factor, pts)
     filtered_viewpoints = tsdf_planner.mask_true_point(candidate_viewpoints)
-    for vp in filtered_viewpoints:### filtered_viewpoints: candidates of best_viewpoint
+    # bbox_center habitat 2D for LOS check: (x, z) = (bbox_center[0], bbox_center[2])
+    # vp format is [habitat_x, ground_height, habitat_z]
+    logging.info(f"[VVD] bbox_center={bbox_center}, n_candidates={len(candidate_viewpoints)}, n_filtered={len(filtered_viewpoints)}")
+    los_passed = []
+    for vp in filtered_viewpoints:
+        vp_habitat = np.array([vp[0], pts[1], vp[2]])
+        bc_habitat = np.array([bbox_center[0], pts[1], bbox_center[2]])
+        if tsdf_planner.is_line_of_sight_clear(vp_habitat, bc_habitat):
+            los_passed.append(vp)
+    logging.info(f"[VVD] LOS check: {len(los_passed)}/{len(filtered_viewpoints)} passed")
+    search_pool = los_passed if los_passed else filtered_viewpoints
+    for vp in search_pool:### filtered_viewpoints: candidates of best_viewpoint
         vp[1] += 1.5 #camera height
         visibility_score = compute_visibility(vp, target_points, scene_points_tree)
         vp[1] -= 1.5
@@ -72,7 +83,7 @@ def Visibility_based_Viewpoint_Decision(target_points, scene_points, pts, tsdf_p
             if visibility_score > best_visibility: ###update: vp is best view point
                 best_visibility = visibility_score
                 best_viewpoint = vp
-    print("Best viewpoint:", best_viewpoint)
+    logging.info(f"[VVD] best_viewpoint={best_viewpoint}, visibility={best_visibility:.3f}")
     return best_viewpoint
     """Calculate the best viewpoint from a set of candidate viewpoints."""
     # Prepare data
