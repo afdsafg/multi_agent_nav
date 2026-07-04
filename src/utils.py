@@ -5,7 +5,88 @@ from habitat_sim.utils.common import quat_to_angle_axis, quat_from_coeffs
 import quaternion
 from scipy.spatial import KDTree
 import logging
+import math
 import open3d as o3d
+
+
+def build_visual_approach_pose(
+    bbox_xyxy,
+    depth_array,
+    intrinsics,
+    cam_pose,
+    tsdf_planner,
+    desired_standoff: float = 1.2,
+):
+    """Visual Candidate Approach v0 (report §Visual Candidate Approach).
+
+    Build a navigation pose by advancing along the bbox-center depth ray,
+    then snapping to a navigable cell. Returns an ApproachPose or None
+    (caller falls back to evidence-pose). None when:
+      - depth valid ratio < 0.25 (bbox too small / far)
+      - LOS check from cam to snapped point blocked by wall
+    """
+    from src.memory_structures import ApproachPose
+
+    x1, y1, x2, y2 = [int(v) for v in bbox_xyxy[:4]]
+    H, W = depth_array.shape[:2]
+    x1, x2 = max(0, x1), min(W, x2)
+    y1, y2 = max(0, y1), min(H, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    u = (x1 + x2) / 2.0
+    v = (y1 + y2) / 2.0
+
+    depth_crop = depth_array[y1:y2, x1:x2]
+    valid = depth_crop[depth_crop > 0]
+    area = max(depth_crop.size, 1)
+    valid_ratio = len(valid) / area
+    if valid_ratio < 0.25:
+        return None
+
+    z = float(np.quantile(valid, 0.30))
+
+    # pixel ray -> camera frame -> world frame (horizontal plane)
+    K = np.asarray(intrinsics, dtype=float)
+    ray_cam = np.linalg.inv(K) @ np.array([u, v, 1.0])
+    ray_cam = ray_cam / max(np.linalg.norm(ray_cam), 1e-6)
+    cam_R = np.asarray(cam_pose)[:3, :3]
+    cam_t = np.asarray(cam_pose)[:3, 3]
+    ray_world = cam_R @ ray_cam
+    ray_world[1] = 0.0  # zero out vertical, keep bearing
+    norm = np.linalg.norm(ray_world)
+    if norm < 1e-6:
+        return None
+    ray_world = ray_world / norm
+
+    advance = float(np.clip(z - desired_standoff, 0.5, 1.5))
+    raw_xyz = cam_t + advance * ray_world
+
+    snapped = tsdf_planner.get_near_true_point(np.array([raw_xyz]))
+    if snapped is None or len(snapped) == 0:
+        return None
+    xyz = np.asarray(snapped[0], dtype=float)
+
+    # LOS check: if wall blocks cam -> snapped point, reject
+    if hasattr(tsdf_planner, "is_line_of_sight_clear"):
+        if not tsdf_planner.is_line_of_sight_clear(cam_t, xyz):
+            logging.info(
+                f"[VisualApproach] LOS blocked cam->{xyz}, fallback to evidence-pose"
+            )
+            return None
+
+    yaw = float(math.atan2(ray_world[2], ray_world[0]))
+    logging.info(
+        f"[VisualApproach] approach pose={xyz} yaw={yaw:.2f} "
+        f"valid_ratio={valid_ratio:.2f} z={z:.2f} advance={advance:.2f}"
+    )
+    return ApproachPose(
+        xyz=xyz,
+        yaw=yaw,
+        source="visual_ray",
+        valid_depth_ratio=float(valid_ratio),
+    )
+
+
 def generate_candidate_viewpoints(bbox_center, radius, pts, num_points=20):
     """Generate candidate viewpoints around the target bounding box center on a circle."""
     angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)

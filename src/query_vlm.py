@@ -11,7 +11,7 @@ from src.explore_utils import (
     encode_tensor2base64,
 )
 from src.explore_multi_agent import explore_multi_agent
-from src.utils import Visibility_based_Viewpoint_Decision
+from src.utils import Visibility_based_Viewpoint_Decision, build_visual_approach_pose
 from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
 from src.conceptgraph.slam.utils import (
@@ -673,14 +673,43 @@ def query_vlm_multi_agent(
                         if candidate is not None:
                             candidate.record_attempt(3, False, "no generic class detection")
 
-            # ---- Level 4: evidence-pose navigation (no detection) ----
+            # ---- Level 4: visual approach (preferred) or evidence-pose ----
             if ground2d is None:
                 logging.info(
-                    f"[AVU] L4 all detection failed, navigate to evidence-pose "
+                    f"[AVU] L4 all detection failed; trying visual approach "
                     f"(img {img_path}, yaw={view_yaw:.2f})"
                 )
                 if candidate is not None:
-                    candidate.record_attempt(4, False, "evidence-pose navigation")
+                    candidate.record_attempt(4, False, "visual approach / evidence-pose")
+                # Visual approach: use L3 proposals even if CLIP rejected
+                if _l3_xyxy_all is not None and _l3_best_idx is not None:
+                    try:
+                        _approach = build_visual_approach_pose(
+                            _l3_xyxy_all[_l3_best_idx],
+                            scene.all_depths[img_path],
+                            scene.intrinsics[:3, :3],
+                            cam_pose,
+                            tsdf_planner,
+                        )
+                        if _approach is not None:
+                            logging.info(
+                                f"[AVU] L4 visual approach accepted, "
+                                f"nav_target_kind=VISUAL_APPROACH_POSE"
+                            )
+                            if candidate is not None:
+                                candidate.nav_target_kind = NavTargetKind.VISUAL_APPROACH_POSE
+                                candidate.nav_goal_xyz = _approach.xyz
+                                candidate.nav_goal_yaw = _approach.yaw
+                                candidate.nav_status = NavStatus.PLANNED
+                                if working_memory is not None:
+                                    working_memory.set_last_nav_candidate(candidate.candidate_id)
+                            return target_type, _approach.xyz, n_filtered_snapshots, target_index
+                    except Exception as _ve:
+                        logging.info(f"[AVU] visual approach exception: {_ve}")
+                # Visual approach failed/unavailable -> evidence-pose fallback
+                logging.info(
+                    f"[AVU] L4 visual approach unavailable, navigate to evidence-pose"
+                )
                 if working_memory is not None:
                     _reason_l4a = f"VLM saw '{object_class}' in {img_path} but YOLO/CLIP grounded nothing; navigating to evidence-pose"
                     _fix_l4a = working_memory.suggest_fix_for(FB_AVU_VISUAL_ONLY, _reason_l4a) if working_memory is not None else "re-observe from closer view; try aliases"
