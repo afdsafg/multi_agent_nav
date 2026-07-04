@@ -23,6 +23,7 @@ from src.memory_structures import (
     S_GROUNDED_3D, S_VISUAL_ONLY, S_NEED_CLOSER_VIEW, S_REJECTED,
     FB_AVU_FAIL, FB_AVU_VISUAL_ONLY,
     get_aliases,
+    NavTargetKind, NavStatus,
 )
 
 # Phase C: generic class proposals for class-agnostic grounding (Level 3).
@@ -691,6 +692,12 @@ def query_vlm_multi_agent(
                             target_candidate_id=candidate.candidate_id if candidate else None,
                         )
                     return None
+                if candidate is not None:
+                    candidate.nav_target_kind = NavTargetKind.EVIDENCE_POSE
+                    candidate.nav_goal_xyz = cam_pos_habitat
+                    candidate.nav_status = NavStatus.PLANNED
+                    if working_memory is not None:
+                        working_memory.set_last_nav_candidate(candidate.candidate_id)
                 return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
 
             # ---- Grounded (L1/L2/L3): run SAM + point cloud + VVD ----
@@ -750,6 +757,12 @@ def query_vlm_multi_agent(
                     cam_pos_habitat = None
                 if cam_pos_habitat is None:
                     return None
+                if candidate is not None:
+                    candidate.nav_target_kind = NavTargetKind.EVIDENCE_POSE
+                    candidate.nav_goal_xyz = cam_pos_habitat
+                    candidate.nav_status = NavStatus.PLANNED
+                    if working_memory is not None:
+                        working_memory.set_last_nav_candidate(candidate.candidate_id)
                 return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
             target_obj = valid_objs[0]
             if candidate is not None:
@@ -777,6 +790,12 @@ def query_vlm_multi_agent(
                     f"multi_agent target Image {img_path}: {obj_pos} "
                     f"(Visible Center, conf={max_confidence})"
                 )
+            if candidate is not None:
+                candidate.nav_target_kind = NavTargetKind.VIEWPOINT_POSE
+                candidate.nav_goal_xyz = obj_pos
+                candidate.nav_status = NavStatus.PLANNED
+                if working_memory is not None:
+                    working_memory.set_last_nav_candidate(candidate.candidate_id)
             return target_type, obj_pos, n_filtered_snapshots, target_index
         except Exception as e:
             logging.info(
@@ -800,6 +819,12 @@ def query_vlm_multi_agent(
                 cam_pos_habitat = None
             if cam_pos_habitat is None:
                 return None
+            if candidate is not None:
+                candidate.nav_target_kind = NavTargetKind.EVIDENCE_POSE
+                candidate.nav_goal_xyz = cam_pos_habitat
+                candidate.nav_status = NavStatus.PLANNED
+                if working_memory is not None:
+                    working_memory.set_last_nav_candidate(candidate.candidate_id)
             return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
 
     elif target_type == "frontier":
