@@ -37,7 +37,7 @@ from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
 from src.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
 from src.dataset_utils import prepare_goatbench_navigation_goals
-from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end, query_vlm_multi_agent
+from src.query_vlm import query_vlm_for_response_end, query_vlm_multi_agent
 from src.long_term_memory import TextLongTermMemory
 from src.logger_goatbench import Logger
 from src.memory_structures import (
@@ -273,9 +273,10 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     tsdf_planner=tsdf_planner,
                 )
 
-                # multi-agent: carry high-level plan + reset snapshot/frontier state.
+                # Rebuild flow: carry hypothesis/search state and reset
+                # snapshot/frontier task scope.
                 # is_new_subtask is set per-step in the main loop (L451-454).
-                # M4: pass episode_memory reference so High-Level Planner can
+                # M4: pass episode_memory reference so Hypothesis Manager can
                 # retrieve step summaries via subtask_metadata -> step_dict
                 subtask_metadata['episode_memory'] = episode_memory
                 # Phase H: explicit working memory reset + plan clear.
@@ -497,44 +498,35 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         else:
                             subtask_metadata['is_new_subtask'] = False
 
-                        if cfg.get('use_multi_agent', False):
-                            # F4: set current_step so multi-agent pipeline + obs keys align
-                            subtask_metadata['current_step'] = global_step
-                            vlm_response = query_vlm_multi_agent(
-                                subtask_metadata=subtask_metadata,
-                                scene=scene,
-                                tsdf_planner=tsdf_planner,
-                                rgb_egocentric_views=rgb_egocentric_views,
-                                cfg=cfg,
-                                pts=pts,
-                                verbose=True,
-                            )
-                            # update high-level plan in subtask_metadata + episode_memory
-                            if vlm_response is not None and hasattr(episode_memory, 'add_entry'):
-                                hlp = subtask_metadata.get('high_level_plan', None)
-                                # C4: defensive - hlp may be TextMemoryEntry, extract .content
-                                if hasattr(hlp, 'content'):
-                                    hlp = hlp.content
-                                if hlp is not None:
-                                    episode_memory.add_entry(
-                                        content=hlp,
-                                        entry_type='high_level_planner_output',
-                                        step=cnt_step,
-                                    )
-                        else:
-                            vlm_response = query_vlm_for_response(
-                                subtask_metadata=subtask_metadata,
-                                scene=scene,
-                                tsdf_planner=tsdf_planner,
-                                rgb_egocentric_views=rgb_egocentric_views,
-                                cfg=cfg,
-                                pts = pts,
-                                verbose=True,
-                            )
+                        # Direct-replacement rebuild path: GOAT evaluation always
+                        # uses the typed multi-agent flow, with no legacy feature
+                        # flag fallback.
+                        subtask_metadata['current_step'] = global_step
+                        vlm_response = query_vlm_multi_agent(
+                            subtask_metadata=subtask_metadata,
+                            scene=scene,
+                            tsdf_planner=tsdf_planner,
+                            rgb_egocentric_views=rgb_egocentric_views,
+                            cfg=cfg,
+                            pts=pts,
+                            verbose=True,
+                        )
+                        # update high-level plan in subtask_metadata + episode_memory
+                        if vlm_response is not None and hasattr(episode_memory, 'add_entry'):
+                            hlp = subtask_metadata.get('high_level_plan', None)
+                            # C4: defensive - hlp may be TextMemoryEntry, extract .content
+                            if hasattr(hlp, 'content'):
+                                hlp = hlp.content
+                            if hlp is not None:
+                                episode_memory.add_entry(
+                                    content=hlp,
+                                    entry_type='high_level_planner_output',
+                                    step=cnt_step,
+                                )
                         if vlm_response is None:
                             n_filtered_frames = 0
                             logging.info(
-                                f"Subtask id {subtask_id} invalid: query_vlm_for_response failed!"
+                                f"Subtask id {subtask_id} invalid: query_vlm_multi_agent failed!"
                             )
                             # M5: record high-level plan before break
                             hlp_break = subtask_metadata.get('high_level_plan')

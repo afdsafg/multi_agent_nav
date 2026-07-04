@@ -647,6 +647,14 @@ def test_agent_json_parsers_fail_safe_without_random_frontier():
             sys.modules["src.explore_utils"] = old_explore_utils
 
 
+def test_goat_runner_uses_rebuild_path_without_legacy_flag_fallback():
+    runner = (ROOT / "run_goatbench_evaluation.py").read_text()
+
+    assert "use_multi_agent" not in runner
+    assert "query_vlm_for_response(" not in runner
+    assert "query_vlm_multi_agent(" in runner
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

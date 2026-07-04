@@ -339,14 +339,13 @@ def query_vlm_multi_agent(
     pts=None,
     verbose: bool = False,
 ):
-    """Multi-agent variant of query_vlm_for_response.
+    """Typed rebuild VLM bridge for GOAT evaluation.
 
-    Uses explore_multi_agent (5-agent chain) instead of explore_two_step.
-    Reuses the AVU+VVD logic from query_vlm_for_response's 'image' branch,
-    but img_path now comes directly from explore_multi_agent (Answerer)
-    rather than image_map_reverse mapping.
+    Uses explore_multi_agent's Answerer/Event/Hypothesis/Executor path. When
+    the Answerer returns a visible target image, CandidateController owns
+    L1/L2/L3 grounding, visual approach, and VVD target-viewpoint intent.
     """
-    # prepare step_dict (mirrors query_vlm_for_response)
+    # prepare step_dict for explore_multi_agent
     step_dict = {}
 
     object_id_to_name = {
@@ -387,7 +386,7 @@ def query_vlm_multi_agent(
     step_dict["step_index"] = subtask_metadata.get("current_step", 0)
     step_dict["current_step"] = subtask_metadata.get("current_step", 0)
     step_dict["current_position"] = pts
-    # M4: pass episode_memory so High-Level Planner can retrieve step summaries
+    # M4: pass episode_memory so Hypothesis Manager can retrieve step summaries
     step_dict["episode_memory"] = subtask_metadata.get("episode_memory", None)
     # Phase H: pass working_memory so agents can read candidates/feedback
     step_dict["working_memory"] = subtask_metadata.get("working_memory", None)
