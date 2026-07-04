@@ -66,7 +66,12 @@ def Visibility_based_Viewpoint_Decision(target_points, scene_points, pts, tsdf_p
         if tsdf_planner.is_line_of_sight_clear(vp_habitat, bc_habitat):
             los_passed.append(vp)
     logging.info(f"[VVD] LOS check: {len(los_passed)}/{len(filtered_viewpoints)} passed")
-    search_pool = los_passed if los_passed else filtered_viewpoints
+    if los_passed:
+        search_pool = los_passed
+        logging.info("[VVD] using LOS-passed candidates")
+    else:
+        search_pool = []
+        logging.info("[VVD] LOS all blocked, fallback to get_near_true_point")
     for vp in search_pool:### filtered_viewpoints: candidates of best_viewpoint
         vp[1] += 1.5 #camera height
         visibility_score = compute_visibility(vp, target_points, scene_points_tree)
@@ -75,6 +80,7 @@ def Visibility_based_Viewpoint_Decision(target_points, scene_points, pts, tsdf_p
             best_visibility = visibility_score
             best_viewpoint = vp
     if best_viewpoint is None:
+        # LOS all blocked or no reachable candidates: snap to nearest reachable
         near_viewpoints = tsdf_planner.get_near_true_point(candidate_viewpoints)
         for vp in near_viewpoints:
             vp[1] += 1.5
