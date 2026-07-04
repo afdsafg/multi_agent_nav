@@ -14,6 +14,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from src.explore_utils import call_openai_api, encode_tensor2base64, resize_image, format_question
 from src.plan_extraction_utils import extract_todo_list_from_text
 from src.branch_tracker import BranchTracker
+from src.candidate_controller import CandidateController
 from src.event_engine import EventEngine, EventEngineConfig
 from src.memory_structures import (
     AnswererDecision,
@@ -1357,6 +1358,28 @@ def _events_prompt_block(events: List[TypedEvent]) -> str:
     return "Typed Events:\n" + "\n".join(e.to_prompt_str() for e in events) + "\n"
 
 
+def _append_events(
+    typed_events: List[TypedEvent],
+    events: List[TypedEvent],
+    working_memory,
+) -> None:
+    typed_events.extend(events)
+    if working_memory is None:
+        return
+    for event in events:
+        working_memory.add_typed_event(event)
+
+
+def _finalize_events(
+    step: Dict[str, Any],
+    working_memory,
+    typed_events: List[TypedEvent],
+) -> None:
+    step["typed_events"] = typed_events
+    if working_memory is not None:
+        working_memory.mark_events_consumed(typed_events)
+
+
 def _hypotheses_prompt_block(working_memory) -> str:
     if working_memory is None or not getattr(working_memory, "hypotheses", None):
         return ""
@@ -1390,14 +1413,22 @@ def _has_active_hypothesis(working_memory) -> bool:
     return False
 
 
-def _safe_bev_block(tsdf_planner, frontier_instances, current_position) -> Tuple[str, list]:
+def _safe_bev_block(
+    tsdf_planner,
+    frontier_instances,
+    current_position,
+    current_yaw=None,
+    recent_decision_poses=None,
+) -> Tuple[str, list]:
     if tsdf_planner is None:
         return "", []
     try:
         bev = render_bev_context(
             tsdf_planner,
             current_pose=current_position,
+            current_yaw=current_yaw,
             frontier_instances=frontier_instances,
+            recent_decision_poses=recent_decision_poses,
         )
         img_b64 = encode_tensor2base64(bev.image)
         labels = ", ".join(bev.labels)
@@ -1452,11 +1483,87 @@ def format_hypothesis_manager_prompt(
     return sys_prompt, content
 
 
+def _run_hypothesis_manager(
+    question: str,
+    task_type: str,
+    typed_events: List[TypedEvent],
+    working_memory,
+    bev_label_block: str,
+    bev_content: list,
+    step_index: int,
+    step: Dict[str, Any],
+    verbose: bool,
+) -> None:
+    sys_p, content = format_hypothesis_manager_prompt(
+        question=question,
+        task_type=task_type,
+        events=typed_events,
+        working_memory=working_memory,
+        bev_label_block=bev_label_block,
+    )
+    if bev_content:
+        content.extend(bev_content)
+    if verbose:
+        logging.info("[Hypothesis Manager] calling VLM")
+    raw = call_openai_api(sys_p, content)
+    hypotheses, hyp_reason = parse_hypothesis_manager_response(
+        raw, step_index
+    )
+    if hypotheses and working_memory is not None:
+        working_memory.set_hypotheses_from_manager(hypotheses)
+        logging.info(
+            f"[Hypothesis Manager] applied {len(hypotheses)} updates"
+        )
+    else:
+        logging.info("[Hypothesis Manager] no valid hypothesis updates")
+    if hyp_reason:
+        _record_step_summary(step, f"Hypothesis Manager: {hyp_reason}")
+
+
+def _hypothesis_state_after_routing(
+    question: str,
+    task_type: str,
+    typed_events: List[TypedEvent],
+    working_memory,
+    event_engine: EventEngine,
+    bev_label_block: str,
+    bev_content: list,
+    step_index: int,
+    step: Dict[str, Any],
+    verbose: bool,
+) -> str:
+    routing = event_engine.route(typed_events, working_memory=working_memory)
+    if routing.call_hypothesis_manager:
+        _run_hypothesis_manager(
+            question=question,
+            task_type=task_type,
+            typed_events=typed_events,
+            working_memory=working_memory,
+            bev_label_block=bev_label_block,
+            bev_content=bev_content,
+            step_index=step_index,
+            step=step,
+            verbose=verbose,
+        )
+    else:
+        logging.info("[Hypothesis Manager] skipped (no trigger)")
+
+    hypothesis_state = (
+        _hypotheses_prompt_block(working_memory)
+        + _branches_prompt_block(working_memory)
+    )
+    if hypothesis_state:
+        step["high_level_plan"] = hypothesis_state
+        if working_memory is not None:
+            working_memory.update_plan(hypothesis_state)
+    return hypothesis_state
+
+
 def explore_multi_agent(
     step: Dict[str, Any],
     cfg,
     verbose: bool = False,
-) -> Tuple[str, Any, Optional[str], int, Optional[str]]:
+) -> Tuple[Any, Any, Optional[str], int, Optional[str]]:
     """Rebuild exploration workflow main entry.
 
     Runs the direct-replacement typed flow:
@@ -1479,14 +1586,13 @@ def explore_multi_agent(
         verbose: enable verbose logging.
 
     Returns:
-        (target_type, target_index_or_choice, reason, n_filtered, class_name)
-        - target_type: 'image' | 'frontier' | 'stop'
-        - image: target_index = pool[i].img_path (for query_vlm depth/cam_pose)
-        - frontier: target_index = frontier index
+        (target_type_or_intent, target_index_or_goal, reason, n_filtered, class_name)
+        - typed intent: target_index_or_goal = navigation goal for planner
+        - frontier: target_index_or_goal = frontier local index
         - stop: target_index = None
         - reason: VLM reasoning string (may be "")
         - n_filtered: number of images filtered by Image Manager
-        - class_name_if_image: target class name for image answers, else None
+        - class_name: image path for typed candidate intents, else None
     """
     logging.info("[explore_multi_agent] start")
 
@@ -1549,7 +1655,11 @@ def explore_multi_agent(
 
     # BranchTracker: FrontierInstance is transient, SpatialBranchRecord is
     # durable. The VLM Frontier Manager is not called in the rebuild path.
-    typed_events: List[TypedEvent] = []
+    typed_events: List[TypedEvent] = (
+        working_memory.pop_pending_typed_events(step_index)
+        if working_memory is not None
+        else []
+    )
     if tsdf_planner is not None and working_memory is not None:
         frontier_instances, branch_events = branch_tracker.sync_frontiers(
             tsdf_planner=tsdf_planner,
@@ -1557,7 +1667,8 @@ def explore_multi_agent(
             step=step_index,
             current_position=step.get("current_position"),
         )
-        typed_events.extend(branch_events)
+        branch_events = event_engine.debounce_events(branch_events)
+        _append_events(typed_events, branch_events, working_memory)
     else:
         frontier_instances = []
         if tsdf_planner is not None:
@@ -1600,9 +1711,8 @@ def explore_multi_agent(
             severity="warning",
         )
         if no_hypothesis_event is not None:
-            typed_events.append(no_hypothesis_event)
-            working_memory.add_typed_event(no_hypothesis_event)
-    routing = event_engine.route(typed_events)
+            _append_events(typed_events, [no_hypothesis_event], working_memory)
+    routing = event_engine.route(typed_events, working_memory=working_memory)
 
     if routing.call_memory_manager and len(nonpinned_idx) > 0:
         sys_p, content = format_image_manager_prompt(
@@ -1651,7 +1761,11 @@ def explore_multi_agent(
         logging.info("[Image Manager] skipped (no memory trigger)")
 
     bev_label_block, bev_content = _safe_bev_block(
-        tsdf_planner, frontier_instances, step.get("current_position")
+        tsdf_planner,
+        frontier_instances,
+        step.get("current_position"),
+        current_yaw=step.get("current_yaw"),
+        recent_decision_poses=step.get("recent_decision_poses"),
     )
 
     # Answerer / Evidence Assessor.
@@ -1693,12 +1807,15 @@ def explore_multi_agent(
         else AnswererDecision.NOT_FOUND
     )
     reason = _extract_reason(raw)
+    answerer_events_recorded = False
+    visible_candidate_handled = False
 
     if (
         decision in ("CANDIDATE_VISIBLE", "TARGET_CONFIRMED", "ANSWER_READY")
         and idx is not None
         and 0 <= idx < len(pool)
     ):
+        visible_candidate_handled = True
         img_path = pool[idx]["img_path"]
         answerer_events = event_engine.detect_answerer_events(
             answerer_decision,
@@ -1709,7 +1826,7 @@ def explore_multi_agent(
             working_memory=working_memory,
         )
         typed_events.extend(answerer_events)
-        step["typed_events"] = typed_events
+        answerer_events_recorded = True
         step["evidence_updates"] = evidence_updates
         _record_step_summary(
             step,
@@ -1718,64 +1835,61 @@ def explore_multi_agent(
         logging.info(
             f"[Answerer] {decision} Image {idx} ({img_path}), class={class_name}"
         )
-        return ("image", img_path, reason, n_filtered, class_name)
+        controller_result = CandidateController(cfg).handle_visible_candidate(
+            scene=scene,
+            tsdf_planner=tsdf_planner,
+            working_memory=working_memory,
+            img_path=img_path,
+            target_phrase=class_name or "",
+            pts=step.get("current_position"),
+            step_index=step_index,
+        )
+        typed_events.extend(controller_result.events)
+        step["candidate_controller_events"] = controller_result.events
+        if controller_result.intent is not None:
+            step["navigation_intent"] = controller_result.intent
+            _finalize_events(step, working_memory, typed_events)
+            return (
+                controller_result.intent,
+                controller_result.navigation_goal,
+                controller_result.reason or reason,
+                n_filtered,
+                img_path,
+            )
+        logging.info(
+            f"[CandidateController] no navigation intent: "
+            f"{controller_result.reason}"
+        )
 
-    if decision != "NOT_FOUND":
+    if decision != "NOT_FOUND" and not visible_candidate_handled:
         logging.info(
             f"[Answerer] {decision} but index {idx} out of pool range "
             f"{len(pool)}, falling through to exploration"
         )
-    else:
+    elif decision == "NOT_FOUND":
         logging.info("[Answerer] NOT_FOUND, continue exploration")
 
-    answerer_events = event_engine.detect_answerer_events(
-        answerer_decision,
-        step=step_index,
-        evidence_updates=evidence_updates,
-        evidence_conflict=evidence_conflict,
-        working_memory=working_memory,
-    )
-    typed_events.extend(answerer_events)
-    routing = event_engine.route(typed_events)
-
-    # Hypothesis Manager replaces the old per-step High-Level Planner and is
-    # called only on routed trigger events.
-    if routing.call_hypothesis_manager:
-        sys_p, content = format_hypothesis_manager_prompt(
-            question=question,
-            task_type=task_type,
-            events=typed_events,
+    if not answerer_events_recorded:
+        answerer_events = event_engine.detect_answerer_events(
+            answerer_decision,
+            step=step_index,
+            evidence_updates=evidence_updates,
+            evidence_conflict=evidence_conflict,
             working_memory=working_memory,
-            bev_label_block=bev_label_block,
         )
-        if bev_content:
-            content.extend(bev_content)
-        if verbose:
-            logging.info("[Hypothesis Manager] calling VLM")
-        raw = call_openai_api(sys_p, content)
-        hypotheses, hyp_reason = parse_hypothesis_manager_response(
-            raw, step_index
-        )
-        if hypotheses and working_memory is not None:
-            working_memory.set_hypotheses_from_manager(hypotheses)
-            logging.info(
-                f"[Hypothesis Manager] applied {len(hypotheses)} updates"
-            )
-        else:
-            logging.info("[Hypothesis Manager] no valid hypothesis updates")
-        if hyp_reason:
-            _record_step_summary(step, f"Hypothesis Manager: {hyp_reason}")
-    else:
-        logging.info("[Hypothesis Manager] skipped (no trigger)")
-
-    hypothesis_state = (
-        _hypotheses_prompt_block(working_memory)
-        + _branches_prompt_block(working_memory)
+        typed_events.extend(answerer_events)
+    hypothesis_state = _hypothesis_state_after_routing(
+        question=question,
+        task_type=task_type,
+        typed_events=typed_events,
+        working_memory=working_memory,
+        event_engine=event_engine,
+        bev_label_block=bev_label_block,
+        bev_content=bev_content,
+        step_index=step_index,
+        step=step,
+        verbose=verbose,
     )
-    if hypothesis_state:
-        step["high_level_plan"] = hypothesis_state
-        if working_memory is not None:
-            working_memory.update_plan(hypothesis_state)
 
     # Eligibility filter.
     if working_memory is not None:
@@ -1797,10 +1911,20 @@ def explore_multi_agent(
             severity="warning",
         )
         if no_frontier_event is not None:
-            typed_events.append(no_frontier_event)
-            if working_memory is not None:
-                working_memory.add_typed_event(no_frontier_event)
-        step["typed_events"] = typed_events
+            _append_events(typed_events, [no_frontier_event], working_memory)
+            _hypothesis_state_after_routing(
+                question=question,
+                task_type=task_type,
+                typed_events=typed_events,
+                working_memory=working_memory,
+                event_engine=event_engine,
+                bev_label_block=bev_label_block,
+                bev_content=bev_content,
+                step_index=step_index,
+                step=step,
+                verbose=verbose,
+            )
+        _finalize_events(step, working_memory, typed_events)
         logging.info("[Executor] no valid frontiers after eligibility filter")
         return ("stop", None, "no valid frontier", n_filtered, None)
 
@@ -1808,7 +1932,28 @@ def explore_multi_agent(
         frontier_imgs, eligible_instances
     )
     if not frontier_imgs_exec:
-        step["typed_events"] = typed_events
+        no_valid_event = event_engine.emit(
+            EventType.NO_VALID_FRONTIER,
+            step=step_index,
+            entity_id="frontier_image",
+            payload={"reason": "no valid frontier image after filtering"},
+            severity="warning",
+        )
+        if no_valid_event is not None:
+            _append_events(typed_events, [no_valid_event], working_memory)
+            _hypothesis_state_after_routing(
+                question=question,
+                task_type=task_type,
+                typed_events=typed_events,
+                working_memory=working_memory,
+                event_engine=event_engine,
+                bev_label_block=bev_label_block,
+                bev_content=bev_content,
+                step_index=step_index,
+                step=step,
+                verbose=verbose,
+            )
+        _finalize_events(step, working_memory, typed_events)
         logging.info("[Executor] no frontier images available after filtering")
         return ("stop", None, "no valid frontier image", n_filtered, None)
 
@@ -1836,14 +1981,14 @@ def explore_multi_agent(
     raw = call_openai_api(sys_p, content)
     intent, reason = parse_executor_json_response(raw)
     if intent is None or intent.mode == NavigationMode.STOP:
-        step["typed_events"] = typed_events
+        _finalize_events(step, working_memory, typed_events)
         logging.info("[Executor] Stop Exploration")
         _record_step_summary(step, "Executor Stop Exploration")
         return ("stop", None, reason, n_filtered, None)
 
     by_id = {inst.frontier_id: inst for inst in frontier_instances_exec}
     if intent.frontier_id not in by_id:
-        step["typed_events"] = typed_events
+        _finalize_events(step, working_memory, typed_events)
         logging.info(
             f"[Executor] Frontier F_{intent.frontier_id:03d} not eligible, stop"
             if intent.frontier_id is not None
@@ -1861,7 +2006,7 @@ def explore_multi_agent(
     if tsdf_planner is not None:
         tsdf_planner.mark_frontier_selected(intent.frontier_id)
     step["navigation_intent"] = intent
-    step["typed_events"] = typed_events
+    _finalize_events(step, working_memory, typed_events)
     _record_step_summary(
         step,
         f"Executor chose Frontier F_{intent.frontier_id:03d} "

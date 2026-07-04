@@ -1022,6 +1022,8 @@ class SubtaskWorkingMemory:
         self.branch_task_states: Dict[str, BranchTaskState] = {}
         self.hypotheses: Dict[str, HypothesisBranch] = {}
         self.typed_events: List[TypedEvent] = []
+        self._pending_typed_event_ids: set = set()
+        self._consumed_typed_event_ids: set = set()
         self.feedback: List[FeedbackEvent] = []
         self.plan_stale_count: int = 0
         self.high_level_plan: Optional[str] = None
@@ -1050,6 +1052,8 @@ class SubtaskWorkingMemory:
         self.branch_task_states = {}
         self.hypotheses = {}
         self.typed_events = []
+        self._pending_typed_event_ids = set()
+        self._consumed_typed_event_ids = set()
         self.feedback = []
         self.plan_stale_count = 0
         self.high_level_plan = None
@@ -1112,13 +1116,39 @@ class SubtaskWorkingMemory:
                 )
             self.hypotheses[hyp.hypothesis_id] = hyp
 
-    def add_typed_event(self, event: TypedEvent) -> None:
+    def add_typed_event(self, event: TypedEvent, pending: bool = True) -> None:
         self.typed_events.append(event)
+        if pending and event.event_id not in self._consumed_typed_event_ids:
+            self._pending_typed_event_ids.add(event.event_id)
         if len(self.typed_events) > 32:
             self.typed_events = self.typed_events[-32:]
+            alive_ids = {e.event_id for e in self.typed_events}
+            self._pending_typed_event_ids &= alive_ids
+            self._consumed_typed_event_ids &= alive_ids
 
     def clear_task_scope_events(self) -> None:
         self.typed_events = []
+        self._pending_typed_event_ids = set()
+        self._consumed_typed_event_ids = set()
+
+    def pop_pending_typed_events(self, current_step: int) -> List[TypedEvent]:
+        """Return unconsumed task events that are still within TTL."""
+        events = []
+        alive_pending = set()
+        for event in self.typed_events:
+            age = current_step - event.created_step
+            if age < 0 or age >= event.ttl_steps:
+                continue
+            if event.event_id in self._pending_typed_event_ids:
+                events.append(event)
+                alive_pending.add(event.event_id)
+        self._pending_typed_event_ids = alive_pending
+        return events
+
+    def mark_events_consumed(self, events: List[TypedEvent]) -> None:
+        for event in events:
+            self._pending_typed_event_ids.discard(event.event_id)
+            self._consumed_typed_event_ids.add(event.event_id)
 
     # ---- candidates --------------------------------------------------------
     def get_or_create_candidate(

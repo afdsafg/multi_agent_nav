@@ -38,6 +38,7 @@ from src.multimodal_3d_scene_graph import Scene
 from src.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
 from src.dataset_utils import prepare_goatbench_navigation_goals
 from src.query_vlm import query_vlm_for_verify, query_vlm_multi_agent
+from src.event_engine import EventEngine, EventEngineConfig
 from src.long_term_memory import TextLongTermMemory
 from src.logger_goatbench import Logger
 from src.memory_structures import (
@@ -53,6 +54,26 @@ from src.memory_structures import (
     should_enter_verify,
 )
 import time
+
+
+def _get_event_engine(working_memory):
+    if working_memory is None:
+        return None
+    event_engine = getattr(working_memory, "_event_engine", None)
+    if event_engine is None:
+        event_engine = EventEngine(EventEngineConfig())
+        setattr(working_memory, "_event_engine", event_engine)
+    return event_engine
+
+
+def _record_navigation_events(working_memory, navigation_result):
+    event_engine = _get_event_engine(working_memory)
+    if event_engine is None:
+        return []
+    return event_engine.detect_navigation_events(
+        navigation_result,
+        working_memory=working_memory,
+    )
 
 
 class Timer:
@@ -288,6 +309,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 )
                 subtask_metadata['working_memory'] = working_memory
                 subtask_metadata['high_level_plan'] = None  # do NOT inherit plan
+                subtask_metadata['decision_pose_history'] = []
                 scene.image_pool = None
                 if hasattr(episode_memory, 'start_new_subtask'):
                     episode_memory.start_new_subtask(subtask_id)
@@ -501,6 +523,13 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         # uses the typed multi-agent flow, with no legacy feature
                         # flag fallback.
                         subtask_metadata['current_step'] = global_step
+                        subtask_metadata['current_yaw'] = angle
+                        decision_history = subtask_metadata.setdefault(
+                            'decision_pose_history', []
+                        )
+                        decision_history.append(np.asarray(pts).tolist())
+                        if len(decision_history) > 12:
+                            del decision_history[:-12]
                         vlm_response = query_vlm_multi_agent(
                             subtask_metadata=subtask_metadata,
                             scene=scene,
@@ -718,6 +747,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         intent=navigation_intent,
                         navigation_result=navigation_result,
                     )
+                    nav_events_recorded = False
                     should_verify = should_enter_verify(
                         target_arrived, navigation_intent, _nav_candidate
                     )
@@ -757,6 +787,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                     if c.status == "GROUNDED_3D":
                                         wm.release_after_navigation(c.candidate_id)
                                         logging.info(f"[VERIFY] released pinned candidate {c.candidate_id} after nav success")
+                            _record_navigation_events(_wm, navigation_result)
+                            nav_events_recorded = True
                             subtask_metadata["navigation_intent"] = None
                             subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
                             break
@@ -780,6 +812,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                         else "reject candidate, search for other instances"
                                     ),
                                 )
+                            _record_navigation_events(_wm, navigation_result)
+                            nav_events_recorded = True
                             subtask_metadata["navigation_intent"] = None
                             subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
                     elif target_arrived and navigation_intent is not None:
@@ -788,6 +822,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         # trigger verification directly.
                         subtask_metadata["navigation_intent"] = None
                         subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
+                    if not nav_events_recorded:
+                        _record_navigation_events(_wm, navigation_result)
 
                     his_decision[cnt_step] = decision
 

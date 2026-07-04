@@ -56,6 +56,7 @@ class FakeFrontier:
 class FakeTSDFPlanner:
     def __init__(self, frontiers):
         self.frontiers = frontiers
+        self.frontier_registry = {}
         self.unexplored = np.ones((16, 16), dtype=bool)
         self.unoccupied = np.zeros((16, 16), dtype=bool)
         self.occupied = np.zeros((16, 16), dtype=bool)
@@ -73,6 +74,9 @@ class FakeTSDFPlanner:
             return np.array([round(arr[0]), round(arr[2]), 0], dtype=int)
         return np.array([round(arr[0]), round(arr[1]), 0], dtype=int)
 
+    def mark_frontier_selected(self, frontier_id):
+        self.last_selected_frontier_id = frontier_id
+
 
 def _install_explore_utils_stub():
     old_module = sys.modules.get("src.explore_utils")
@@ -80,7 +84,23 @@ def _install_explore_utils_stub():
     module.call_openai_api = lambda *args, **kwargs: None
     module.encode_tensor2base64 = lambda value: value
     module.resize_image = lambda image, *args, **kwargs: image
-    module.format_question = lambda question, *args, **kwargs: question
+
+    def format_question_stub(step, *args, **kwargs):
+        if isinstance(step, dict):
+            return step.get("question", ""), step.get("image")
+        return step, None
+
+    module.format_question = format_question_stub
+    module.explore_two_step = lambda *args, **kwargs: None
+    module.Key_Subgraph_Selection = lambda *args, **kwargs: (
+        "",
+        None,
+        [],
+        [],
+        [],
+        {},
+        [],
+    )
     sys.modules["src.explore_utils"] = module
     return old_module
 
@@ -266,6 +286,88 @@ def test_event_engine_debounce_and_routing():
     assert routing.call_memory_manager is True
     assert EventType.HYPOTHESIS_SUPPORTED.value in routing.reasons
     assert EventType.WORKING_MEMORY_OVER_BUDGET.value in routing.reasons
+
+
+def test_pending_typed_events_are_consumed_once_and_ttl_bound():
+    memory = SubtaskWorkingMemory()
+    event = TypedEvent(
+        event_id="candidate-rejected-1",
+        type=EventType.CANDIDATE_REJECTED,
+        step=10,
+        entity_id="C001",
+        ttl_steps=4,
+    )
+    memory.add_typed_event(event)
+
+    assert memory.pop_pending_typed_events(current_step=11) == [event]
+    memory.mark_events_consumed([event])
+    assert memory.pop_pending_typed_events(current_step=12) == []
+
+    expired = TypedEvent(
+        event_id="expired",
+        type=EventType.WRONG_INSTANCE,
+        step=1,
+        ttl_steps=2,
+    )
+    memory.add_typed_event(expired)
+    assert memory.pop_pending_typed_events(current_step=4) == []
+
+
+def test_spatial_events_route_only_when_linked_and_over_threshold():
+    engine = EventEngine(
+        EventEngineConfig(
+            spatial_stalled_steps_threshold=2,
+            spatial_revisit_reversal_threshold=2,
+            spatial_revisit_overlap_threshold=0.7,
+        )
+    )
+    memory = SubtaskWorkingMemory()
+    memory.upsert_branch_task_state(
+        BranchTaskState(
+            spatial_branch_id="B001",
+            status=BranchTaskStatus.STALLED,
+            steps_without_progress=2,
+        )
+    )
+    stalled_event = TypedEvent(
+        event_id="stalled",
+        type=EventType.SPATIAL_BRANCH_STALLED,
+        step=3,
+        entity_id="B001",
+    )
+
+    assert engine.route([stalled_event], working_memory=memory).call_hypothesis_manager is False
+
+    memory.set_hypotheses_from_manager(
+        [
+            HypothesisBranch(
+                hypothesis_id="H001",
+                claim="Check branch B001.",
+                linked_spatial_branches=["B001"],
+                status=HypothesisStatus.ACTIVE,
+            )
+        ]
+    )
+    assert engine.route([stalled_event], working_memory=memory).call_hypothesis_manager is True
+
+    memory.branch_task_states["B001"].steps_without_progress = 1
+    assert engine.route([stalled_event], working_memory=memory).call_hypothesis_manager is False
+
+    memory.branch_task_states["B001"] = BranchTaskState(
+        spatial_branch_id="B001",
+        status=BranchTaskStatus.REVISITING,
+        reversal_count=1,
+        recent_region_overlap=0.6,
+    )
+    revisit_event = TypedEvent(
+        event_id="revisit",
+        type=EventType.SPATIAL_BRANCH_REVISITING,
+        step=4,
+        entity_id="B001",
+    )
+    assert engine.route([revisit_event], working_memory=memory).call_hypothesis_manager is False
+    memory.branch_task_states["B001"].reversal_count = 2
+    assert engine.route([revisit_event], working_memory=memory).call_hypothesis_manager is True
 
 
 def test_answerer_evidence_updates_route_to_hypothesis_manager():
@@ -684,12 +786,320 @@ def test_agent_json_parsers_fail_safe_without_random_frontier():
             sys.modules["src.explore_utils"] = old_explore_utils
 
 
+def test_visible_candidate_rejection_falls_through_to_executor_frontier():
+    old_explore_utils = _install_explore_utils_stub()
+    old_explore_multi_agent = sys.modules.get("src.explore_multi_agent")
+    sys.modules.pop("src.explore_multi_agent", None)
+    try:
+        import src.explore_multi_agent as explore_multi_agent
+
+        memory = SubtaskWorkingMemory()
+        planner = FakeTSDFPlanner([FakeFrontier(10, [1.0, 0.0, 2.0])])
+        scene = SimpleNamespace(objects={}, img_to_edge={})
+        step = {
+            "question": "Find the chair",
+            "task_type": "object",
+            "image": None,
+            "CLR": {},
+            "scene": scene,
+            "tsdf_planner": planner,
+            "working_memory": memory,
+            "image_pool": [
+                {
+                    "img_path": "1-view_0.png",
+                    "img_b64": "candidate-img",
+                    "connected_objects": [],
+                    "source": "egocentric",
+                    "step": 1,
+                }
+            ],
+            "frontier_imgs": ["frontier-img"],
+            "processed_images": {},
+            "image_map_reverse": {},
+            "step_index": 1,
+            "current_position": np.array([0.0, 0.0, 0.0]),
+        }
+        calls = []
+
+        def fake_call(sys_prompt, content):
+            joined = "\n".join(
+                part[0] if isinstance(part, tuple) else str(part)
+                for part in content
+            )
+            calls.append((sys_prompt, joined))
+            if "HYPOTHESIS MANAGER" in sys_prompt:
+                return '{"updates": [], "new_hypotheses": [], "reason": "candidate rejected"}'
+            if "frontier_id" in joined and "Available Frontier IDs" in joined:
+                return json.dumps(
+                    {
+                        "frontier_id": 10,
+                        "spatial_branch_id": None,
+                        "hypothesis_id": None,
+                        "action_mode": "CONTINUE_SPATIAL_BRANCH",
+                        "reason_code": "TEST",
+                        "reason": "continue after rejected candidate",
+                    }
+                )
+            return json.dumps(
+                {
+                    "decision": "CANDIDATE_VISIBLE",
+                    "candidate": {"image": 0, "target_phrase": "chair"},
+                    "evidence_updates": [],
+                    "evidence_conflict": False,
+                    "visibility": {
+                        "directly_visible": "yes",
+                        "central_enough": "no",
+                        "partially_occluded": "yes",
+                        "confidence": 0.4,
+                    },
+                    "reason": "plausible chair",
+                }
+            )
+
+        class RejectingController:
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def handle_visible_candidate(self, **kwargs):
+                return SimpleNamespace(
+                    intent=None,
+                    navigation_goal=None,
+                    reason="grounding rejected",
+                    events=[
+                        TypedEvent(
+                            event_id="candidate-rejected",
+                            type=EventType.CANDIDATE_REJECTED,
+                            step=kwargs["step_index"],
+                            entity_id="C001",
+                        )
+                    ],
+                )
+
+        old_call = explore_multi_agent.call_openai_api
+        old_controller = explore_multi_agent.CandidateController
+        explore_multi_agent.call_openai_api = fake_call
+        explore_multi_agent.CandidateController = RejectingController
+        try:
+            result = explore_multi_agent.explore_multi_agent(
+                step,
+                SimpleNamespace(max_pool_size=6),
+                verbose=False,
+            )
+        finally:
+            explore_multi_agent.call_openai_api = old_call
+            explore_multi_agent.CandidateController = old_controller
+
+        assert result[0] == "frontier"
+        assert result[1] == 0
+        assert any(
+            event.type is EventType.CANDIDATE_REJECTED
+            for event in step["typed_events"]
+        )
+        assert any(
+            "CANDIDATE_REJECTED" in prompt
+            for sys_prompt, prompt in calls
+            if "HYPOTHESIS MANAGER" in sys_prompt
+        )
+    finally:
+        if old_explore_multi_agent is None:
+            sys.modules.pop("src.explore_multi_agent", None)
+        else:
+            sys.modules["src.explore_multi_agent"] = old_explore_multi_agent
+        if old_explore_utils is None:
+            sys.modules.pop("src.explore_utils", None)
+        else:
+            sys.modules["src.explore_utils"] = old_explore_utils
+
+
+def test_no_eligible_frontier_routes_hypothesis_manager_before_stop():
+    old_explore_utils = _install_explore_utils_stub()
+    old_explore_multi_agent = sys.modules.get("src.explore_multi_agent")
+    sys.modules.pop("src.explore_multi_agent", None)
+    try:
+        import src.explore_multi_agent as explore_multi_agent
+
+        memory = SubtaskWorkingMemory()
+        memory.recent_frontier_ids = [10]
+        planner = FakeTSDFPlanner([FakeFrontier(10, [1.0, 0.0, 2.0])])
+        step = {
+            "question": "Find the chair",
+            "task_type": "object",
+            "image": None,
+            "CLR": {},
+            "scene": SimpleNamespace(objects={}, img_to_edge={}),
+            "tsdf_planner": planner,
+            "working_memory": memory,
+            "image_pool": [],
+            "frontier_imgs": ["frontier-img"],
+            "processed_images": {},
+            "image_map_reverse": {},
+            "step_index": 3,
+            "current_position": np.array([0.0, 0.0, 0.0]),
+        }
+        calls = []
+
+        def fake_call(sys_prompt, content):
+            joined = "\n".join(
+                part[0] if isinstance(part, tuple) else str(part)
+                for part in content
+            )
+            calls.append((sys_prompt, joined))
+            if "HYPOTHESIS MANAGER" in sys_prompt:
+                return json.dumps(
+                    {
+                        "updates": [],
+                        "new_hypotheses": [
+                            {
+                                "id": "H001",
+                                "summary": "Check another branch.",
+                                "status": "ACTIVE",
+                            }
+                        ],
+                        "reason": "route no-frontier event",
+                    }
+                )
+            return json.dumps(
+                {
+                    "decision": "NOT_FOUND",
+                    "candidate": {"image": None, "target_phrase": None},
+                    "evidence_updates": [],
+                    "evidence_conflict": False,
+                    "reason": "nothing visible",
+                }
+            )
+
+        old_call = explore_multi_agent.call_openai_api
+        explore_multi_agent.call_openai_api = fake_call
+        try:
+            result = explore_multi_agent.explore_multi_agent(
+                step,
+                SimpleNamespace(max_pool_size=6),
+                verbose=False,
+            )
+        finally:
+            explore_multi_agent.call_openai_api = old_call
+
+        assert result[0] == "stop"
+        hypothesis_prompts = [
+            prompt for sys_prompt, prompt in calls
+            if "HYPOTHESIS MANAGER" in sys_prompt
+        ]
+        assert any("NO_ACTIVE_HYPOTHESIS" in prompt for prompt in hypothesis_prompts)
+        assert any("NO_ELIGIBLE_FRONTIER" in prompt for prompt in hypothesis_prompts)
+        assert any(
+            event.type is EventType.NO_ELIGIBLE_FRONTIER
+            for event in step["typed_events"]
+        )
+    finally:
+        if old_explore_multi_agent is None:
+            sys.modules.pop("src.explore_multi_agent", None)
+        else:
+            sys.modules["src.explore_multi_agent"] = old_explore_multi_agent
+        if old_explore_utils is None:
+            sys.modules.pop("src.explore_utils", None)
+        else:
+            sys.modules["src.explore_utils"] = old_explore_utils
+
+
+def test_query_vlm_multi_agent_preserves_typed_intent_and_spatial_metadata():
+    old_explore_utils = _install_explore_utils_stub()
+    old_explore_multi_agent = sys.modules.get("src.explore_multi_agent")
+    old_query_vlm = sys.modules.get("src.query_vlm")
+    sys.modules.pop("src.explore_multi_agent", None)
+    sys.modules.pop("src.query_vlm", None)
+    try:
+        import src.query_vlm as query_vlm
+
+        expected_intent = VisualApproachIntent(
+            candidate_id="C001",
+            image_path="1-view_0.png",
+            target_phrase="chair",
+            approach_xyz=[1.0, 0.0, 2.0],
+        )
+        captured_step = {}
+
+        def fake_explore(step, cfg, verbose=False):
+            captured_step.update(step)
+            return (expected_intent, [1.0, 0.0, 2.0], "approach", 0, "1-view_0.png")
+
+        old_explore = query_vlm.explore_multi_agent
+        query_vlm.explore_multi_agent = fake_explore
+        try:
+            subtask_metadata = {
+                "question": "Find the chair",
+                "task_type": "object",
+                "class": "chair",
+                "image": None,
+                "CLR": {},
+                "is_new_subtask": False,
+                "current_step": 5,
+                "current_yaw": 1.25,
+                "decision_pose_history": [[0.0, 0.0, 0.0]],
+                "working_memory": SubtaskWorkingMemory(),
+            }
+            scene = SimpleNamespace(
+                objects={},
+                edges=[],
+                img_to_edge={},
+                all_observations={},
+                image_pool=[],
+            )
+            planner = FakeTSDFPlanner([FakeFrontier(10, [1.0, 0.0, 2.0])])
+            planner.frontiers[0].feature = np.zeros((2, 2, 3), dtype=np.uint8)
+            cfg = SimpleNamespace(
+                prompt_h=16,
+                prompt_w=16,
+                use_full_obj_list=False,
+                egocentric_views=False,
+                prefiltering=False,
+                top_k_categories=1,
+                use_room_filter=False,
+                use_ollama=False,
+            )
+
+            result = query_vlm.query_vlm_multi_agent(
+                subtask_metadata=subtask_metadata,
+                scene=scene,
+                tsdf_planner=planner,
+                rgb_egocentric_views=[],
+                cfg=cfg,
+                pts=np.array([2.0, 0.0, 3.0]),
+                verbose=False,
+            )
+        finally:
+            query_vlm.explore_multi_agent = old_explore
+
+        assert result == (expected_intent, [1.0, 0.0, 2.0], 0, "1-view_0.png")
+        assert subtask_metadata["navigation_intent"] is expected_intent
+        assert captured_step["current_yaw"] == 1.25
+        assert captured_step["recent_decision_poses"] == [[0.0, 0.0, 0.0]]
+        assert np.array_equal(captured_step["current_position"], np.array([2.0, 0.0, 3.0]))
+    finally:
+        if old_query_vlm is None:
+            sys.modules.pop("src.query_vlm", None)
+        else:
+            sys.modules["src.query_vlm"] = old_query_vlm
+        if old_explore_multi_agent is None:
+            sys.modules.pop("src.explore_multi_agent", None)
+        else:
+            sys.modules["src.explore_multi_agent"] = old_explore_multi_agent
+        if old_explore_utils is None:
+            sys.modules.pop("src.explore_utils", None)
+        else:
+            sys.modules["src.explore_utils"] = old_explore_utils
+
+
 def test_goat_runner_uses_rebuild_path_without_legacy_flag_fallback():
     runner = (ROOT / "run_goatbench_evaluation.py").read_text()
 
     assert "use_multi_agent" not in runner
     assert "query_vlm_for_response(" not in runner
     assert "query_vlm_multi_agent(" in runner
+    assert "decision_pose_history" in runner
+    assert "current_yaw" in runner
+    assert "_record_navigation_events" in runner
+    assert "detect_navigation_events" in runner
+
 
 
 if __name__ == "__main__":

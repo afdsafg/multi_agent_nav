@@ -151,8 +151,6 @@ class BranchTracker:
 
         self._refresh_active_tips(working_memory, current_tips, step)
         self._close_missing_active_tips(working_memory, current_fids, step)
-        for event in events:
-            working_memory.add_typed_event(event)
         return instances, events
 
     def eligible_frontier_instances(

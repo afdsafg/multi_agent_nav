@@ -15,8 +15,12 @@ from src.explore_utils import (
     format_question,
 )
 from src.explore_multi_agent import explore_multi_agent
-from src.candidate_controller import CandidateController
-from src.memory_structures import VerifyStatus
+from src.memory_structures import (
+    ExploreIntent,
+    TargetViewpointIntent,
+    VerifyStatus,
+    VisualApproachIntent,
+)
 
 if TYPE_CHECKING:
     from src.tsdf_planner import TSDFPlanner
@@ -406,6 +410,10 @@ def query_vlm_multi_agent(
     step_dict["step_index"] = subtask_metadata.get("current_step", 0)
     step_dict["current_step"] = subtask_metadata.get("current_step", 0)
     step_dict["current_position"] = pts
+    step_dict["current_yaw"] = subtask_metadata.get("current_yaw", None)
+    step_dict["recent_decision_poses"] = subtask_metadata.get(
+        "decision_pose_history", []
+    )
     # M4: pass episode_memory so Hypothesis Manager can retrieve step summaries
     step_dict["episode_memory"] = subtask_metadata.get("episode_memory", None)
     # Phase H: pass working_memory so agents can read candidates/feedback
@@ -496,47 +504,19 @@ def query_vlm_multi_agent(
         f"reason=[{reason}]"
     )
 
-    # parse by target_type
-    if target_type == "image":
-        # Phase C: four-level grounding. img_path is target_index (Answerer).
-        img_path = target_index
-        object_class = class_name_if_image
-        if object_class is None:
-            logging.info(
-                f"image target but no class_name, stop (no random frontier)"
-            )
-            return None
-        if img_path not in scene.all_observations:
-            logging.info(
-                f"img_path {img_path} not in all_observations, stop (no random frontier)"
-            )
-            return None
-        controller = CandidateController(cfg)
-        controller_result = controller.handle_visible_candidate(
-            scene=scene,
-            tsdf_planner=tsdf_planner,
-            working_memory=subtask_metadata.get("working_memory", None),
-            img_path=img_path,
-            target_phrase=object_class,
-            pts=pts,
-            step_index=subtask_metadata.get("current_step", 0),
-        )
-        if controller_result.intent is None:
-            logging.info(
-                f"[multi_agent] CandidateController produced no intent: "
-                f"{controller_result.reason}"
-            )
-            return None
-        subtask_metadata["navigation_intent"] = controller_result.intent
-        subtask_metadata["candidate_controller_events"] = controller_result.events
+    if isinstance(
+        target_type,
+        (ExploreIntent, VisualApproachIntent, TargetViewpointIntent),
+    ):
+        subtask_metadata["navigation_intent"] = target_type
         return (
-            controller_result.intent,
-            controller_result.navigation_goal,
-            n_filtered_snapshots,
+            target_type,
             target_index,
+            n_filtered_snapshots,
+            class_name_if_image,
         )
 
-    elif target_type == "frontier":
+    if target_type == "frontier":
         target_index = int(target_index)
         if target_index < 0 or target_index >= len(tsdf_planner.frontiers):
             logging.info(
@@ -550,9 +530,8 @@ def query_vlm_multi_agent(
         )
         return target_type, pred_target_frontier, n_filtered_snapshots, target_index
 
-    else:  # target_type == 'stop'
-        logging.info("multi_agent Stop Exploration, returning None")
-        return None
+    logging.info("multi_agent Stop Exploration, returning None")
+    return None
 
 
 def _extract_json_object(text: Optional[str]) -> Dict[str, Any]:

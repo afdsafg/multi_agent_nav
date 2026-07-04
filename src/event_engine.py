@@ -6,7 +6,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from src.memory_structures import (
     AnswererDecision,
+    BranchTaskStatus,
     EventType,
+    HypothesisStatus,
     NavigationMode,
     NavigationResult,
     StepOutcome,
@@ -20,6 +22,9 @@ from src.memory_structures import (
 class EventEngineConfig:
     debounce_steps: int = 2
     memory_pool_budget: int = 6
+    spatial_stalled_steps_threshold: int = 2
+    spatial_revisit_reversal_threshold: int = 2
+    spatial_revisit_overlap_threshold: float = 0.7
 
 
 @dataclass
@@ -83,6 +88,18 @@ class EventEngine:
             return None
         self._last_emitted[key] = step
         return event
+
+    def debounce_events(self, events: Iterable[TypedEvent]) -> List[TypedEvent]:
+        """Apply EventEngine debounce to events created by code modules."""
+        debounced = []
+        for event in events:
+            key = event.debounce_key()
+            last_step = self._last_emitted.get(key)
+            if last_step is not None and event.step - last_step < self.config.debounce_steps:
+                continue
+            self._last_emitted[key] = event.step
+            debounced.append(event)
+        return debounced
 
     def detect_memory_events(
         self,
@@ -252,16 +269,75 @@ class EventEngine:
                 working_memory.add_typed_event(event)
         return events
 
-    def route(self, events: Iterable[TypedEvent]) -> EventRoutingDecision:
+    def route(
+        self,
+        events: Iterable[TypedEvent],
+        working_memory: Optional[SubtaskWorkingMemory] = None,
+    ) -> EventRoutingDecision:
         routing = EventRoutingDecision()
         for event in events:
             if event.type in self.MEMORY_TRIGGERS:
                 routing.call_memory_manager = True
                 routing.reasons.append(event.type.value)
-            if event.type in self.HYPOTHESIS_TRIGGERS:
+            if event.type in self.HYPOTHESIS_TRIGGERS and self._should_route_hypothesis_event(
+                event, working_memory
+            ):
                 routing.call_hypothesis_manager = True
                 routing.reasons.append(event.type.value)
         return routing
+
+    def _should_route_hypothesis_event(
+        self,
+        event: TypedEvent,
+        working_memory: Optional[SubtaskWorkingMemory],
+    ) -> bool:
+        if event.type not in (
+            EventType.SPATIAL_BRANCH_STALLED,
+            EventType.SPATIAL_BRANCH_REVISITING,
+        ):
+            return True
+        if working_memory is None or not event.entity_id:
+            return False
+        if not self._branch_linked_to_active_hypothesis(
+            working_memory, event.entity_id
+        ):
+            return False
+        state = working_memory.branch_task_states.get(event.entity_id)
+        if state is None:
+            return False
+        if event.type == EventType.SPATIAL_BRANCH_STALLED:
+            return (
+                state.status == BranchTaskStatus.STALLED
+                and state.steps_without_progress
+                >= self.config.spatial_stalled_steps_threshold
+            )
+        return (
+            state.status == BranchTaskStatus.REVISITING
+            and (
+                state.reversal_count
+                >= self.config.spatial_revisit_reversal_threshold
+                or state.recent_region_overlap
+                >= self.config.spatial_revisit_overlap_threshold
+            )
+        )
+
+    @staticmethod
+    def _branch_linked_to_active_hypothesis(
+        working_memory: SubtaskWorkingMemory,
+        branch_id: str,
+    ) -> bool:
+        active_statuses = {
+            HypothesisStatus.PENDING,
+            HypothesisStatus.ACTIVE,
+            HypothesisStatus.SUPPORTED,
+            HypothesisStatus.CONFIRMED,
+        }
+        for hyp in working_memory.hypotheses.values():
+            if hyp.status not in active_statuses:
+                continue
+            if branch_id in hyp.linked_spatial_branches:
+                return True
+        return False
 
     def build_step_outcome(
         self,
