@@ -2,6 +2,7 @@ import logging
 from typing import Tuple, Optional, Union, List, Dict, Any
 import random
 import numpy as np
+import torch
 
 from src.explore_utils import (
     task_check,
@@ -24,6 +25,7 @@ from src.memory_structures import (
     FB_AVU_FAIL, FB_AVU_VISUAL_ONLY,
     get_aliases,
     NavTargetKind, NavStatus,
+    Grounding2D,
 )
 
 # Phase C: generic class proposals for class-agnostic grounding (Level 3).
@@ -594,12 +596,23 @@ def query_vlm_multi_agent(
             )
 
         try:
+            ground2d = None  # Grounding2D, set by L1/L2/L3 success
+            _l3_xyxy_all = None  # keep L3 proposals even if CLIP rejects (for visual approach)
+            _l3_best_idx = None
             # ---- Level 1: YOLO(target_phrase) ----
             result = _yolo_detect(scene, [object_class], target_image, cfg.AVU_conf_threshold)
             if result is not None:
                 logging.info(f"[AVU] L1 YOLO('{object_class}') detected")
                 if candidate is not None:
                     candidate.record_attempt(1, True, "YOLO target phrase")
+                _conf = result.boxes.conf.cpu().numpy()
+                _bi = int(_conf.argmax())
+                ground2d = Grounding2D(
+                    source="yolo_target",
+                    phrase=object_class,
+                    bbox_xyxy=result.boxes.xyxy[_bi].cpu().numpy().astype(int),
+                    conf=float(_conf[_bi]),
+                )
             else:
                 logging.info(f"[AVU] L1 YOLO('{object_class}') no detection, trying aliases")
                 if candidate is not None:
@@ -613,8 +626,16 @@ def query_vlm_multi_agent(
                         logging.info(f"[AVU] L2 YOLO alias '{alias}' detected")
                         if candidate is not None:
                             candidate.record_attempt(2, True, f"alias '{alias}'")
+                        _conf = result.boxes.conf.cpu().numpy()
+                        _bi = int(_conf.argmax())
+                        ground2d = Grounding2D(
+                            source="yolo_alias",
+                            phrase=alias,
+                            bbox_xyxy=result.boxes.xyxy[_bi].cpu().numpy().astype(int),
+                            conf=float(_conf[_bi]),
+                        )
                         break
-                if result is None:
+                if ground2d is None:
                     if candidate is not None:
                         candidate.record_attempt(2, False, "no alias detected")
                     # ---- Level 3: generic classes + CLIP rerank ----
@@ -624,6 +645,8 @@ def query_vlm_multi_agent(
                         best_idx, best_score = _clip_rerank_bbox(
                             scene, target_image, xyxy_np_all, object_class, aliases
                         )
+                        _l3_xyxy_all = xyxy_np_all
+                        _l3_best_idx = best_idx
                         if best_score >= _CLIP_RERANK_THRESH:
                             logging.info(
                                 f"[AVU] L3 class-agnostic + CLIP rerank accepted "
@@ -631,11 +654,14 @@ def query_vlm_multi_agent(
                             )
                             if candidate is not None:
                                 candidate.record_attempt(3, True, f"CLIP score {best_score:.3f}")
-                            # keep only the best bbox
-                            keep = result.boxes.xyxy[best_idx:best_idx+1, ...]
-                            result.boxes.xyxy = keep
-                            result.boxes.conf = result.boxes.conf[best_idx:best_idx+1]
-                            result.boxes.cls = result.boxes.cls[best_idx:best_idx+1]
+                            ground2d = Grounding2D(
+                                source="class_agnostic_clip",
+                                phrase=object_class,
+                                bbox_xyxy=xyxy_np_all[best_idx].astype(int),
+                                raw_score=float(best_score),
+                                rank_score=float(best_score),
+                                conf=float(result.boxes.conf[best_idx].cpu().numpy()),
+                            )
                         else:
                             logging.info(
                                 f"[AVU] L3 CLIP rerank rejected (score={best_score:.3f} "
@@ -643,13 +669,12 @@ def query_vlm_multi_agent(
                             )
                             if candidate is not None:
                                 candidate.record_attempt(3, False, f"CLIP score {best_score:.3f}")
-                            result = None
                     else:
                         if candidate is not None:
                             candidate.record_attempt(3, False, "no generic class detection")
 
             # ---- Level 4: evidence-pose navigation (no detection) ----
-            if result is None:
+            if ground2d is None:
                 logging.info(
                     f"[AVU] L4 all detection failed, navigate to evidence-pose "
                     f"(img {img_path}, yaw={view_yaw:.2f})"
@@ -701,10 +726,8 @@ def query_vlm_multi_agent(
                 return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
 
             # ---- Grounded (L1/L2/L3): run SAM + point cloud + VVD ----
-            confidences = result.boxes.conf.cpu().numpy()
-            max_idx = int(confidences.argmax())
-            max_confidence = confidences[max_idx: max_idx + 1]
-            xyxy_tensor = result.boxes.xyxy[max_idx: max_idx + 1, ...]
+            max_confidence = np.array([ground2d.conf])
+            xyxy_tensor = torch.as_tensor(ground2d.bbox_xyxy, dtype=torch.float32, device=scene.device).reshape(1, 4)
             sam_out = scene.sam_predictor.predict(
                 target_image, bboxes=xyxy_tensor, verbose=False
             )
