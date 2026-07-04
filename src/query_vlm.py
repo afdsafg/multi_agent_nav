@@ -1,24 +1,26 @@
+from __future__ import annotations
+
+import json
 import logging
-from typing import Tuple, Optional, Union, List, Dict, Any
+import re
+from typing import Tuple, Optional, Union, List, Dict, Any, TYPE_CHECKING
 import random
 import numpy as np
 
 from src.explore_utils import (
-    task_check,
     explore_two_step,
     Key_Subgraph_Selection,
     encode_tensor2base64,
+    call_openai_api,
+    format_question,
 )
 from src.explore_multi_agent import explore_multi_agent
 from src.candidate_controller import CandidateController
-from src.utils import Visibility_based_Viewpoint_Decision
-from src.tsdf_planner import TSDFPlanner, Frontier
-from src.multimodal_3d_scene_graph import Scene
-from src.conceptgraph.slam.utils import (
-    get_bounding_box,
-    init_process_pcd,
-    detections_to_obj_pcd_and_bbox,
-)
+from src.memory_structures import VerifyStatus
+
+if TYPE_CHECKING:
+    from src.tsdf_planner import TSDFPlanner
+    from src.multimodal_3d_scene_graph import Scene
 
 
 def random_frontier_choice(tsdf_planner: TSDFPlanner, n_filtered_snapshots):
@@ -114,6 +116,17 @@ def select_navigation_corner(aabb, selection_strategy="closest_to_robot", robot_
         # Default: select the lowest-height corner point
         return corners[np.argmin(corners[:, 2])]
 
+
+def _legacy_conceptgraph_slam_utils():
+    from src.conceptgraph.slam.utils import (
+        get_bounding_box,
+        init_process_pcd,
+        detections_to_obj_pcd_and_bbox,
+    )
+
+    return get_bounding_box, init_process_pcd, detections_to_obj_pcd_and_bbox
+
+
 def query_vlm_for_response(
     subtask_metadata: dict,
     scene: Scene,
@@ -123,6 +136,8 @@ def query_vlm_for_response(
     pts = None,
     verbose: bool = False,
 ):
+    from src.utils import Visibility_based_Viewpoint_Decision
+
     # prepare input for vlm
     step_dict = {}
 
@@ -186,6 +201,11 @@ def query_vlm_for_response(
 
 
     if target_type == "image":
+        (
+            get_bounding_box,
+            init_process_pcd,
+            detections_to_obj_pcd_and_bbox,
+        ) = _legacy_conceptgraph_slam_utils()
         #Implementation of AVU.
         #We update only the words we consider to be the target, 
         #so we perform re-perception directly and select it as the answer.
@@ -535,12 +555,130 @@ def query_vlm_multi_agent(
         return None
 
 
+def _extract_json_object(text: Optional[str]) -> Dict[str, Any]:
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match is None:
+        return {}
+    try:
+        payload = json.loads(match.group(0))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _parse_verify_status(response: Optional[str]) -> Tuple[VerifyStatus, str]:
+    payload = _extract_json_object(response)
+    reason = ""
+    raw_status = ""
+    if payload:
+        raw_status = str(
+            payload.get("verification")
+            or payload.get("verify_status")
+            or payload.get("status")
+            or payload.get("result")
+            or ""
+        ).strip().upper()
+        reason = str(payload.get("reason") or payload.get("rationale") or "")
+    else:
+        text = (response or "").strip()
+        reason = text
+        raw_status = text.splitlines()[0].strip().upper() if text else ""
+
+    aliases = {
+        "YES": "SUCCESS",
+        "PASS": "SUCCESS",
+        "CONFIRMED": "SUCCESS",
+        "NO": "WRONG_INSTANCE",
+        "WRONG": "WRONG_INSTANCE",
+        "NOT_VISIBLE": "TARGET_NOT_VISIBLE",
+        "NOT FOUND": "TARGET_NOT_VISIBLE",
+    }
+    raw_status = aliases.get(raw_status, raw_status)
+    if raw_status in VerifyStatus.__members__:
+        return VerifyStatus[raw_status], reason
+
+    text_l = f"{raw_status} {reason}".lower()
+    if "success" in text_l or "correct target" in text_l:
+        return VerifyStatus.SUCCESS, reason
+    if "not visible" in text_l or "cannot see" in text_l or "not found" in text_l:
+        return VerifyStatus.TARGET_NOT_VISIBLE, reason
+    if "view" in text_l or "facing" in text_l or "occlud" in text_l:
+        return VerifyStatus.POOR_VIEW, reason
+    if "wrong" in text_l or "different" in text_l or "another instance" in text_l:
+        return VerifyStatus.WRONG_INSTANCE, reason
+    return VerifyStatus.POOR_VIEW, reason or "VERIFY response unavailable or malformed"
+
+
+def query_vlm_for_verify(
+    subtask_metadata: dict,
+    rgb_egocentric_views: dict,
+    cfg,
+    verbose: bool = False,
+) -> Tuple[VerifyStatus, str]:
+    step_dict = {
+        "question": subtask_metadata["question"],
+        "task_type": subtask_metadata["task_type"],
+        "class": subtask_metadata["class"],
+        "image": subtask_metadata["image"],
+    }
+    question, image_goal = format_question(step_dict)
+    sys_prompt = (
+        "Task: You are the Answerer in VERIFY mode for indoor target "
+        "navigation. Decide whether the agent has reached the specific target "
+        "required by the question. Return only JSON."
+    )
+    content = [
+        (
+            "VERIFY mode. Use the recent egocentric observations to classify "
+            "the outcome.\n"
+            f"Question: {question}\n"
+            "Allowed verification values: SUCCESS, WRONG_INSTANCE, POOR_VIEW, "
+            "TARGET_NOT_VISIBLE.\n"
+            "SUCCESS means the requested target instance or answer is visible "
+            "with enough evidence. WRONG_INSTANCE means a plausible but "
+            "incorrect instance is reached. POOR_VIEW means the target might "
+            "be nearby but the current view is insufficient. TARGET_NOT_VISIBLE "
+            "means the target is not visible in these observations.\n",
+        )
+    ]
+    if image_goal is not None:
+        content.append(("Reference target image:\n", image_goal))
+    for frame_idx in sorted(rgb_egocentric_views.keys(), reverse=True):
+        content.append((f"Recent step {frame_idx} observations:\n",))
+        for view_idx, image in enumerate(rgb_egocentric_views[frame_idx]):
+            content.append((f"View {view_idx}: ", encode_tensor2base64(image)))
+    content.append(
+        (
+            "Return exactly:\n"
+            "{\n"
+            '  "verification": "SUCCESS|WRONG_INSTANCE|POOR_VIEW|TARGET_NOT_VISIBLE",\n'
+            '  "reason": "<short evidence-based reason>"\n'
+            "}\n",
+        )
+    )
+    if verbose:
+        logging.info("[VERIFY] calling VLM")
+    response = call_openai_api(sys_prompt, content)
+    status, reason = _parse_verify_status(response)
+    logging.info(f"[VERIFY] status={status.value} reason={reason}")
+    return status, reason
+
+
 def query_vlm_for_response_end(
     subtask_metadata: dict,
     rgb_egocentric_views: dict,
     cfg,
     verbose: bool = False,
 ):
+    from src.explore_utils import task_check
+
     # prepare input for vlm
     step_dict = {}
     # prepare egocentric views

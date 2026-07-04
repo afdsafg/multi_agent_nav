@@ -10,6 +10,7 @@ Implements the three memory layers from 诊断.md:
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Type, TypeVar, Union
@@ -67,9 +68,11 @@ class BranchTaskStatus(Enum):
 
 
 class HypothesisStatus(Enum):
+    PENDING = "PENDING"
     ACTIVE = "ACTIVE"
     SUPPORTED = "SUPPORTED"
     REJECTED = "REJECTED"
+    DONE = "DONE"
     CONFIRMED = "CONFIRMED"
 
 
@@ -78,12 +81,22 @@ class EventType(Enum):
     SPATIAL_BRANCH_ADVANCED = "SPATIAL_BRANCH_ADVANCED"
     SPATIAL_BRANCH_STALLED = "SPATIAL_BRANCH_STALLED"
     SPATIAL_BRANCH_REVISITING = "SPATIAL_BRANCH_REVISITING"
+    TRAJECTORY_LOOP = "TRAJECTORY_LOOP"
     NEW_FRONTIER = "NEW_FRONTIER"
     FRONTIER_REACHED = "FRONTIER_REACHED"
+    NO_ACTIVE_HYPOTHESIS = "NO_ACTIVE_HYPOTHESIS"
     NO_VALID_FRONTIER = "NO_VALID_FRONTIER"
+    NO_ELIGIBLE_FRONTIER = "NO_ELIGIBLE_FRONTIER"
     SEMANTIC_EVIDENCE = "SEMANTIC_EVIDENCE"
+    HYPOTHESIS_SUPPORTED = "HYPOTHESIS_SUPPORTED"
+    HYPOTHESIS_CONTRADICTED = "HYPOTHESIS_CONTRADICTED"
+    HYPOTHESIS_TEST_COMPLETED = "HYPOTHESIS_TEST_COMPLETED"
+    NEW_TASK_RELEVANT_ANCHOR = "NEW_TASK_RELEVANT_ANCHOR"
     EVIDENCE_CONFLICT = "EVIDENCE_CONFLICT"
+    ANSWERER_EVIDENCE_CONFLICT = "ANSWERER_EVIDENCE_CONFLICT"
     CANDIDATE_VISIBLE = "CANDIDATE_VISIBLE"
+    GROUNDING_FAILED = "GROUNDING_FAILED"
+    CANDIDATE_REJECTED = "CANDIDATE_REJECTED"
     CANDIDATE_GROUNDED_3D = "CANDIDATE_GROUNDED_3D"
     VISUAL_APPROACH_READY = "VISUAL_APPROACH_READY"
     TARGET_VIEWPOINT_READY = "TARGET_VIEWPOINT_READY"
@@ -315,29 +328,53 @@ class FrontierInstance(JsonDataclassMixin):
 @dataclass
 class SpatialBranchRecord(JsonDataclassMixin):
     spatial_branch_id: str
+    origin: Any = None
     frontier_ids: List[int] = field(default_factory=list)
     spine: List[Any] = field(default_factory=list)
     active_tip_frontier_id: Optional[int] = None
+    active_tip_ids: List[int] = field(default_factory=list)
+    frontier_history: List[int] = field(default_factory=list)
+    tip_history: List[Any] = field(default_factory=list)
+    max_progress: float = 0.0
+    geometric_status: str = "OPEN"
     aliases: List[str] = field(default_factory=list)
     merged_into: Optional[str] = None
     created_step: int = 0
     updated_step: int = 0
 
     def __post_init__(self) -> None:
+        if self.origin is None and self.spine:
+            self.origin = self.spine[0]
+        self.origin = _jsonable(self.origin)
         self.frontier_ids = [int(fid) for fid in self.frontier_ids]
         if self.active_tip_frontier_id is not None:
             self.active_tip_frontier_id = int(self.active_tip_frontier_id)
+        self.active_tip_ids = [int(fid) for fid in self.active_tip_ids]
+        if not self.active_tip_ids and self.active_tip_frontier_id is not None:
+            self.active_tip_ids = [self.active_tip_frontier_id]
+        self.frontier_history = [int(fid) for fid in self.frontier_history]
+        if not self.frontier_history:
+            self.frontier_history = list(self.frontier_ids)
         self.spine = [_jsonable(p) for p in self.spine]
+        self.tip_history = [_jsonable(p) for p in self.tip_history]
+        if not self.tip_history:
+            self.tip_history = list(self.spine)
+        if self.merged_into:
+            self.geometric_status = "MERGED"
+        else:
+            self.geometric_status = str(self.geometric_status or "OPEN").upper()
 
     def to_prompt_str(self) -> str:
-        tip = (
-            f"F_{self.active_tip_frontier_id:03d}"
-            if self.active_tip_frontier_id is not None
-            else "none"
-        )
+        if self.active_tip_ids:
+            tip = ",".join(f"F_{fid:03d}" for fid in self.active_tip_ids)
+        elif self.active_tip_frontier_id is not None:
+            tip = f"F_{self.active_tip_frontier_id:03d}"
+        else:
+            tip = "none"
         merged = f", merged_into={self.merged_into}" if self.merged_into else ""
         return (
-            f"{self.spatial_branch_id}: tip={tip}, "
+            f"{self.spatial_branch_id}: status={self.geometric_status}, "
+            f"tips={tip}, progress={self.max_progress:.2f}m, "
             f"frontiers={self.frontier_ids}{merged}"
         )
 
@@ -345,18 +382,27 @@ class SpatialBranchRecord(JsonDataclassMixin):
 @dataclass
 class BranchTaskState(JsonDataclassMixin):
     spatial_branch_id: str
+    subtask_id: str = ""
     status: BranchTaskStatus = BranchTaskStatus.NEW
     progress_score: float = 0.0
     steps_without_progress: int = 0
     selected_count: int = 0
     reached_count: int = 0
+    recent_visit_count: int = 0
+    reversal_count: int = 0
+    recent_spatial_gain: float = 0.0
+    recent_region_overlap: float = 0.0
     active_hypothesis_id: Optional[str] = None
+    linked_hypothesis_ids: List[str] = field(default_factory=list)
     last_frontier_id: Optional[int] = None
+    last_selected_step: Optional[int] = None
     closed_reason: Optional[str] = None
     updated_step: int = 0
 
     def __post_init__(self) -> None:
         self.status = _coerce_enum(BranchTaskStatus, self.status)
+        if self.active_hypothesis_id and self.active_hypothesis_id not in self.linked_hypothesis_ids:
+            self.linked_hypothesis_ids.append(self.active_hypothesis_id)
         if self.last_frontier_id is not None:
             self.last_frontier_id = int(self.last_frontier_id)
 
@@ -368,17 +414,29 @@ class BranchTaskState(JsonDataclassMixin):
         )
         return (
             f"{self.spatial_branch_id}: status={self.status.value}, "
-            f"progress={self.progress_score:.2f}, last={fid}"
+            f"gain={self.recent_spatial_gain:.2f}m, "
+            f"overlap={self.recent_region_overlap:.2f}, "
+            f"reversal={self.reversal_count}, visits={self.recent_visit_count}, "
+            f"last={fid}"
         )
 
 
 @dataclass
 class HypothesisBranch(JsonDataclassMixin):
     hypothesis_id: str
-    description: str
+    claim: str = ""
+    expected_cues: List[str] = field(default_factory=list)
+    contradiction_cues: List[str] = field(default_factory=list)
+    anchor: Optional[Anchor] = None
     anchors: List[Anchor] = field(default_factory=list)
     status: HypothesisStatus = HypothesisStatus.ACTIVE
+    positive_evidence: List[str] = field(default_factory=list)
+    negative_evidence: List[str] = field(default_factory=list)
+    next_test: str = ""
+    linked_spatial_branches: List[str] = field(default_factory=list)
+    revision_reason: Optional[str] = None
     confidence: float = 0.0
+    description: str = ""
     evidence: List[str] = field(default_factory=list)
     conflicts: List[str] = field(default_factory=list)
     created_step: int = 0
@@ -387,22 +445,64 @@ class HypothesisBranch(JsonDataclassMixin):
 
     def __post_init__(self) -> None:
         self.status = _coerce_enum(HypothesisStatus, self.status)
-        normalized = []
+        if not self.claim and self.description:
+            self.claim = self.description
+        if not self.description and self.claim:
+            self.description = self.claim
+        if not self.positive_evidence and self.evidence:
+            self.positive_evidence = list(self.evidence)
+        if not self.evidence and self.positive_evidence:
+            self.evidence = list(self.positive_evidence)
+        if not self.negative_evidence and self.conflicts:
+            self.negative_evidence = list(self.conflicts)
+        if not self.conflicts and self.negative_evidence:
+            self.conflicts = list(self.negative_evidence)
+
+        normalized_anchors = []
+        seen_anchors = set()
+
+        def _append_anchor(value) -> None:
+            anchor = anchor_from_dict(value) if isinstance(value, dict) else value
+            key = json.dumps(_anchor_to_dict(anchor), sort_keys=True)
+            if key in seen_anchors:
+                return
+            seen_anchors.add(key)
+            normalized_anchors.append(anchor)
+
+        if self.anchor is not None:
+            _append_anchor(self.anchor)
         for anchor in self.anchors:
-            if isinstance(anchor, dict):
-                normalized.append(anchor_from_dict(anchor))
-            else:
-                normalized.append(anchor)
-        self.anchors = normalized
+            _append_anchor(anchor)
+        self.anchors = normalized_anchors
+        self.anchor = self.anchors[0] if self.anchors else None
+
+        linked = set(str(bid) for bid in self.linked_spatial_branches if bid)
+        for anchor in self.anchors:
+            if isinstance(anchor, SpatialBranchAnchor):
+                linked.add(anchor.spatial_branch_id)
+            elif isinstance(anchor, FrontierAnchor) and anchor.spatial_branch_id:
+                linked.add(anchor.spatial_branch_id)
+        self.linked_spatial_branches = sorted(linked)
 
     def to_dict(self) -> Dict[str, Any]:
         data = super().to_dict()
+        data["anchor"] = _anchor_to_dict(self.anchor) if self.anchor is not None else None
         data["anchors"] = [_anchor_to_dict(a) for a in self.anchors]
         return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HypothesisBranch":
         payload = dict(data)
+        if "summary" in payload and "claim" not in payload:
+            payload["claim"] = payload.pop("summary")
+        if "description" in payload and "claim" not in payload:
+            payload["claim"] = payload["description"]
+        if "evidence" in payload and "positive_evidence" not in payload:
+            payload["positive_evidence"] = payload["evidence"]
+        if "conflicts" in payload and "negative_evidence" not in payload:
+            payload["negative_evidence"] = payload["conflicts"]
+        if "anchor" in payload and isinstance(payload["anchor"], dict):
+            payload["anchor"] = anchor_from_dict(payload["anchor"])
         payload["anchors"] = [
             anchor_from_dict(a) if isinstance(a, dict) else a
             for a in payload.get("anchors", [])
@@ -414,10 +514,13 @@ class HypothesisBranch(JsonDataclassMixin):
             _anchor_to_dict(anchor).get("kind", "anchor")
             for anchor in self.anchors
         ) or "none"
+        cues = "; ".join(self.expected_cues[:3]) or "none"
+        contra = "; ".join(self.contradiction_cues[:2]) or "none"
         return (
-            f"{self.hypothesis_id}: {self.description} "
+            f"{self.hypothesis_id}: {self.claim or self.description} "
             f"(status={self.status.value}, conf={self.confidence:.2f}, "
-            f"anchors={anchor_str})"
+            f"anchors={anchor_str}, expected={cues}, "
+            f"contradiction={contra}, next_test={self.next_test or 'none'})"
         )
 
 
@@ -535,6 +638,16 @@ class StepOutcome(JsonDataclassMixin):
     step: int
     mode: NavigationMode
     intent: Optional[NavigationIntent] = None
+    spatial_branch_id: Optional[str] = None
+    frontier_id: Optional[int] = None
+    hypothesis_id: Optional[str] = None
+    distance_moved: float = 0.0
+    explored_area_delta: float = 0.0
+    new_free_space_delta: float = 0.0
+    branch_progress_delta: float = 0.0
+    recent_region_overlap: float = 0.0
+    trajectory_reversal: bool = False
+    semantic_updates: List[Any] = field(default_factory=list)
     navigation_result: Optional[NavigationResult] = None
     events: List[TypedEvent] = field(default_factory=list)
     answerer_decision: AnswererDecision = AnswererDecision.NOT_FOUND
@@ -553,6 +666,16 @@ class StepOutcome(JsonDataclassMixin):
             )
         if isinstance(self.intent, dict):
             self.intent = navigation_intent_from_dict(self.intent)
+        if self.frontier_id is not None:
+            self.frontier_id = int(self.frontier_id)
+        if self.intent is not None:
+            if self.spatial_branch_id is None and hasattr(self.intent, "spatial_branch_id"):
+                self.spatial_branch_id = getattr(self.intent, "spatial_branch_id")
+            if self.frontier_id is None and hasattr(self.intent, "frontier_id"):
+                fid = getattr(self.intent, "frontier_id")
+                self.frontier_id = int(fid) if fid is not None else None
+            if self.hypothesis_id is None and hasattr(self.intent, "hypothesis_id"):
+                self.hypothesis_id = getattr(self.intent, "hypothesis_id")
         if isinstance(self.navigation_result, dict):
             self.navigation_result = NavigationResult.from_dict(
                 self.navigation_result
@@ -561,6 +684,7 @@ class StepOutcome(JsonDataclassMixin):
             TypedEvent.from_dict(e) if isinstance(e, dict) else e
             for e in self.events
         ]
+        self.semantic_updates = _jsonable(self.semantic_updates)
 
 
 def should_enter_verify(

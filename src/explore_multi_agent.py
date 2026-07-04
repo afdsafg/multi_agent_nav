@@ -460,6 +460,11 @@ def format_answerer_prompt(
         "   - for attribute questions, the attribute itself is visible.\n"
         "   Otherwise use CANDIDATE_VISIBLE (if something plausible is "
         "visible) or NOT_FOUND.\n"
+        "6. Also assess active hypotheses. For each active hypothesis with "
+        "new visual evidence, add an evidence_updates item with result "
+        "SUPPORT, WEAKEN, CONTRADICT, or TEST_COMPLETED. Mention observed "
+        "cues, missing expected cues, coverage, confidence, and test_status. "
+        "Do not directly edit hypotheses; only report evidence.\n"
     )
 
     content = []
@@ -506,7 +511,11 @@ def format_answerer_prompt(
         "{\n"
         '  "decision": "NOT_FOUND | CANDIDATE_VISIBLE | TARGET_CONFIRMED | ANSWER_READY",\n'
         '  "candidate": {"image": <int or null>, "target_phrase": "<phrase or null>"},\n'
-        '  "evidence_updates": [],\n'
+        '  "evidence_updates": [\n'
+        '    {"hypothesis_id": "H001", "result": "SUPPORT|WEAKEN|CONTRADICT|TEST_COMPLETED", '
+        '"observed_cues": [], "missing_expected_cues": [], "coverage": "NONE|PARTIAL|FULL", '
+        '"confidence": 0.0, "test_status": "IN_PROGRESS|COMPLETED"}\n'
+        "  ],\n"
         '  "evidence_conflict": false,\n'
         '  "visibility": {\n'
         '    "directly_visible": "yes|no",\n'
@@ -1003,7 +1012,22 @@ def parse_answerer_evidence(response: Optional[str]) -> Tuple[List[Any], bool]:
     updates = payload.get("evidence_updates", [])
     if not isinstance(updates, list):
         updates = [updates]
-    return updates, bool(payload.get("evidence_conflict", False))
+    normalized = []
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        item = dict(update)
+        if "id" in item and "hypothesis_id" not in item:
+            item["hypothesis_id"] = item.pop("id")
+        if "result" in item:
+            item["result"] = str(item["result"]).strip().upper()
+        item.setdefault("observed_cues", [])
+        item.setdefault("missing_expected_cues", [])
+        item.setdefault("coverage", "UNKNOWN")
+        item.setdefault("confidence", 0.0)
+        item.setdefault("test_status", "IN_PROGRESS")
+        normalized.append(item)
+    return normalized, bool(payload.get("evidence_conflict", False))
 
 
 def sanitize_answerer_decision(
@@ -1161,8 +1185,10 @@ def parse_hypothesis_manager_response(
 
     Expected shape:
       {"updates": [...], "new_hypotheses": [...]}
-    Each item can contain hypothesis_id, description, anchors, status,
-    confidence, evidence, conflicts.
+    Each item should contain the new rebuild fields: claim, expected_cues,
+    contradiction_cues, anchor/anchors, status, evidence lists, next_test,
+    linked_spatial_branches, and revision_reason. Legacy description/summary
+    payloads are still accepted.
     """
     payload = _extract_json_object(response)
     if not payload:
@@ -1178,14 +1204,14 @@ def parse_hypothesis_manager_response(
             if not isinstance(item, dict):
                 continue
             hyp_id = item.get("hypothesis_id") or item.get("id")
-            desc = item.get("description") or item.get("summary")
-            if not hyp_id or not desc:
+            claim = item.get("claim") or item.get("description") or item.get("summary")
+            if not hyp_id or not claim:
                 continue
             item = dict(item)
             item.pop("id", None)
             item.pop("summary", None)
             item["hypothesis_id"] = str(hyp_id)
-            item["description"] = str(desc)
+            item["claim"] = str(claim)
             item.setdefault("created_step", step_index)
             item["updated_step"] = step_index
             item["writer"] = "HypothesisManager"
@@ -1354,6 +1380,16 @@ def _branches_prompt_block(working_memory) -> str:
     return "\n".join(blocks) + ("\n" if blocks else "")
 
 
+def _has_active_hypothesis(working_memory) -> bool:
+    if working_memory is None:
+        return False
+    for hyp in getattr(working_memory, "hypotheses", {}).values():
+        status = getattr(hyp.status, "value", str(hyp.status))
+        if status not in {"REJECTED", "DONE", "CONFIRMED"}:
+            return True
+    return False
+
+
 def _safe_bev_block(tsdf_planner, frontier_instances, current_position) -> Tuple[str, list]:
     if tsdf_planner is None:
         return "", []
@@ -1382,12 +1418,20 @@ def format_hypothesis_manager_prompt(
         "Task: You are the HYPOTHESIS MANAGER. You are the only writer of "
         "HypothesisBranch state. Update search hypotheses from typed events, "
         "spatial branches, and evidence. Do not choose navigation actions.\n\n"
+        "Maintain concrete, testable predictive hypotheses. Every active "
+        "hypothesis must state expected cues, contradiction cues, and the next "
+        "test that would support or reject it. Do not output a free-text TODO "
+        "list.\n\n"
         "Return only JSON with this schema:\n"
         "{\n"
         '  "updates": [\n'
-        '    {"hypothesis_id": "H001", "description": "...", "anchors": [], '
-        '"status": "ACTIVE|SUPPORTED|REJECTED|CONFIRMED", '
-        '"confidence": 0.0, "evidence": [], "conflicts": []}\n'
+        '    {"hypothesis_id": "H001", "claim": "...", '
+        '"expected_cues": [], "contradiction_cues": [], '
+        '"anchor": null, "anchors": [], '
+        '"status": "PENDING|ACTIVE|SUPPORTED|REJECTED|DONE|CONFIRMED", '
+        '"positive_evidence": [], "negative_evidence": [], '
+        '"next_test": "...", "linked_spatial_branches": [], '
+        '"revision_reason": null, "confidence": 0.0}\n'
         "  ],\n"
         '  "new_hypotheses": [],\n'
         '  "reason": "<short reason>"\n'
@@ -1547,6 +1591,17 @@ def explore_multi_agent(
         working_memory=working_memory,
     )
     typed_events.extend(memory_events)
+    if working_memory is not None and not _has_active_hypothesis(working_memory):
+        no_hypothesis_event = event_engine.emit(
+            EventType.NO_ACTIVE_HYPOTHESIS,
+            step=step_index,
+            entity_id=working_memory.subtask_id or "subtask",
+            payload={"reason": "no active hypotheses for current subtask"},
+            severity="warning",
+        )
+        if no_hypothesis_event is not None:
+            typed_events.append(no_hypothesis_event)
+            working_memory.add_typed_event(no_hypothesis_event)
     routing = event_engine.route(typed_events)
 
     if routing.call_memory_manager and len(nonpinned_idx) > 0:
@@ -1649,6 +1704,7 @@ def explore_multi_agent(
             answerer_decision,
             step=step_index,
             image_path=img_path,
+            evidence_updates=evidence_updates,
             evidence_conflict=evidence_conflict,
             working_memory=working_memory,
         )
@@ -1675,6 +1731,7 @@ def explore_multi_agent(
     answerer_events = event_engine.detect_answerer_events(
         answerer_decision,
         step=step_index,
+        evidence_updates=evidence_updates,
         evidence_conflict=evidence_conflict,
         working_memory=working_memory,
     )
@@ -1733,7 +1790,7 @@ def explore_multi_agent(
         eligible_instances = frontier_instances
     if not eligible_instances:
         no_frontier_event = event_engine.emit(
-            EventType.NO_VALID_FRONTIER,
+            EventType.NO_ELIGIBLE_FRONTIER,
             step=step_index,
             entity_id="frontier",
             payload={"reason": "eligibility filter removed all frontiers"},

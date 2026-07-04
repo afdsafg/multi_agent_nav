@@ -10,16 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import logging
-import math
 
 import numpy as np
 import torch
 
-from src.conceptgraph.slam.utils import (
-    get_bounding_box,
-    init_process_pcd,
-    detections_to_obj_pcd_and_bbox,
-)
 from src.memory_structures import (
     EventType,
     FB_AVU_FAIL,
@@ -29,15 +23,14 @@ from src.memory_structures import (
     NavStatus,
     NavTargetKind,
     S_GROUNDED_3D,
+    S_REJECTED,
     SubtaskWorkingMemory,
     TargetCandidate,
     TargetViewpointIntent,
     TypedEvent,
-    VerifyStatus,
     VisualApproachIntent,
     get_aliases,
 )
-from src.utils import Visibility_based_Viewpoint_Decision, build_visual_approach_pose
 
 
 GENERIC_CLASSES = ["object", "item", "thing", "furniture", "appliance"]
@@ -169,46 +162,17 @@ class CandidateController:
         except Exception as exc:
             logging.info(f"[CandidateController] grounding failed: {exc}")
             candidate.record_attempt(4, False, f"exception: {exc}")
-            if working_memory is not None:
-                working_memory.add_feedback(
-                    step=step_index,
-                    type_=FB_AVU_FAIL,
-                    reason=f"AVU exception: {exc}",
-                    suggested_fix=working_memory.suggest_fix_for(
-                        FB_AVU_FAIL, str(exc)
-                    ),
-                    target_candidate_id=candidate.candidate_id,
-                )
-            result = self._evidence_pose_fallback(
+            result = self._reject_grounding_result(
                 working_memory,
                 candidate,
                 img_path,
-                target_phrase,
-                cam_pose,
                 step_index,
                 f"AVU exception: {exc}",
+                feedback_type=FB_AVU_FAIL,
             )
             result.events = events + result.events
             self._store_events(working_memory, result.events)
             return result
-
-    def verify_from_task_check(
-        self,
-        candidate: Optional[TargetCandidate],
-        vlm_response: str,
-        reason: str = "",
-    ) -> VerifyStatus:
-        if vlm_response == "yes":
-            if candidate is not None:
-                candidate.status = "SUCCEEDED"
-                candidate.nav_status = NavStatus.REACHED
-            return VerifyStatus.SUCCESS
-        reason_l = (reason or "").lower()
-        if "view" in reason_l or "facing" in reason_l or "orient" in reason_l:
-            return VerifyStatus.POOR_VIEW
-        if "not visible" in reason_l or "cannot see" in reason_l:
-            return VerifyStatus.TARGET_NOT_VISIBLE
-        return VerifyStatus.WRONG_INSTANCE
 
     def _ground_2d(
         self,
@@ -315,9 +279,10 @@ class CandidateController:
         l3_best_idx,
         step_index: int,
     ) -> CandidateControllerResult:
-        candidate.record_attempt(4, False, "visual approach / evidence-pose")
         if l3_boxes is not None and l3_best_idx is not None:
             try:
+                from src.utils import build_visual_approach_pose
+
                 approach = build_visual_approach_pose(
                     l3_boxes[l3_best_idx],
                     scene.all_depths[img_path],
@@ -360,77 +325,58 @@ class CandidateController:
                     )
             except Exception as exc:
                 logging.info(f"[CandidateController] visual approach exception: {exc}")
-        return self._evidence_pose_fallback(
+        candidate.record_attempt(4, False, "visual approach unavailable")
+        return self._reject_grounding_result(
             working_memory,
             candidate,
             img_path,
-            target_phrase,
-            cam_pose,
             step_index,
             f"VLM saw '{target_phrase}' but grounding failed",
+            feedback_type=FB_AVU_VISUAL_ONLY,
         )
 
-    def _evidence_pose_fallback(
+    def _reject_grounding_result(
         self,
         working_memory,
         candidate: TargetCandidate,
         img_path: str,
-        target_phrase: str,
-        cam_pose,
         step_index: int,
         reason: str,
+        feedback_type: str = FB_AVU_FAIL,
     ) -> CandidateControllerResult:
-        try:
-            cam_pos = np.asarray(cam_pose)[:3, 3]
-        except Exception:
-            cam_pos = None
-        if cam_pos is None:
-            return CandidateControllerResult(
-                candidate=candidate,
-                events=[
-                    self._event(
-                        EventType.TARGET_NOT_VISIBLE,
-                        step_index,
-                        candidate.candidate_id,
-                        {"reason": "evidence pose unavailable"},
-                    )
-                ],
-                reason="evidence pose unavailable",
-            )
-        candidate.nav_target_kind = NavTargetKind.VISUAL_APPROACH_POSE
-        candidate.nav_goal_xyz = cam_pos
-        candidate.nav_status = NavStatus.PLANNED
+        candidate.status = S_REJECTED
+        candidate.pinned = False
+        candidate.last_failure_reason = reason
+        candidate.nav_target_kind = None
+        candidate.nav_goal_xyz = None
+        candidate.nav_goal_yaw = None
+        candidate.nav_status = NavStatus.FAILED
         if working_memory is not None:
-            working_memory.set_last_nav_candidate(candidate.candidate_id)
+            working_memory.reject_candidate(candidate.candidate_id, reason)
             working_memory.add_feedback(
                 step=step_index,
-                type_=FB_AVU_VISUAL_ONLY,
+                type_=feedback_type,
                 reason=reason,
                 suggested_fix=working_memory.suggest_fix_for(
-                    FB_AVU_VISUAL_ONLY, reason
+                    feedback_type, reason
                 ),
                 target_candidate_id=candidate.candidate_id,
             )
-        intent = VisualApproachIntent(
-            mode=NavigationMode.VISUAL_APPROACH,
-            candidate_id=candidate.candidate_id,
-            image_path=img_path,
-            target_phrase=target_phrase,
-            approach_xyz=cam_pos,
-            approach_yaw=None,
-            reason_code="EVIDENCE_POSE_FALLBACK",
-            reason=reason,
-        )
         return CandidateControllerResult(
-            intent=intent,
             candidate=candidate,
             events=[
                 self._event(
-                    EventType.VISUAL_APPROACH_READY,
+                    EventType.GROUNDING_FAILED,
                     step_index,
                     candidate.candidate_id,
-                    {"image_path": img_path, "fallback": "evidence_pose"},
-                )
+                    {"image_path": img_path, "reason": reason},
+                ),
+                self._event(
+                    EventType.CANDIDATE_REJECTED,
+                    step_index,
+                    candidate.candidate_id,
+                    {"image_path": img_path, "reason": reason},
+                ),
             ],
             reason=reason,
         )
@@ -449,6 +395,11 @@ class CandidateController:
         pts,
         step_index: int,
     ) -> CandidateControllerResult:
+        (
+            get_bounding_box,
+            init_process_pcd,
+            detections_to_obj_pcd_and_bbox,
+        ) = _conceptgraph_slam_utils()
         xyxy_tensor = torch.as_tensor(
             ground2d.bbox_xyxy,
             dtype=torch.float32,
@@ -486,14 +437,13 @@ class CandidateController:
         valid_objs = [obj for obj in obj_pcds_and_bboxes if obj is not None]
         if not valid_objs:
             candidate.record_attempt(3, False, "SAM/pcd invalid")
-            return self._evidence_pose_fallback(
+            return self._reject_grounding_result(
                 working_memory,
                 candidate,
                 img_path,
-                target_phrase,
-                cam_pose,
                 step_index,
                 "SAM or point cloud invalid after 2D grounding",
+                feedback_type=FB_AVU_FAIL,
             )
 
         target_obj = valid_objs[0]
@@ -513,6 +463,8 @@ class CandidateController:
             all_scene_points = np.concatenate(scene_points, axis=0)
         else:
             all_scene_points = target_points
+        from src.utils import Visibility_based_Viewpoint_Decision
+
         obj_pos = Visibility_based_Viewpoint_Decision(
             target_points,
             all_scene_points,
@@ -642,6 +594,16 @@ def _grounding_from_result(result, phrase: str, source: str) -> Grounding2D:
         conf=float(conf[best_idx]),
         raw_score=float(conf[best_idx]),
     )
+
+
+def _conceptgraph_slam_utils():
+    from src.conceptgraph.slam.utils import (
+        get_bounding_box,
+        init_process_pcd,
+        detections_to_obj_pcd_and_bbox,
+    )
+
+    return get_bounding_box, init_process_pcd, detections_to_obj_pcd_and_bbox
 
 
 def _clip_rerank_bbox(

@@ -37,7 +37,7 @@ from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
 from src.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
 from src.dataset_utils import prepare_goatbench_navigation_goals
-from src.query_vlm import query_vlm_for_response_end, query_vlm_multi_agent
+from src.query_vlm import query_vlm_for_verify, query_vlm_multi_agent
 from src.long_term_memory import TextLongTermMemory
 from src.logger_goatbench import Logger
 from src.memory_structures import (
@@ -300,7 +300,6 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
                 # run steps
                 task_success = False
-                task_check_obs = []
                 cnt_step = -1
                 his_decision = {}
                 subtask_metadata['CLR'] = his_decision
@@ -683,10 +682,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 
                     timer.print_summary(logging)
                     # (6) Check if the agent has arrived at the target to finish the question
-                    # Final verification: use VLM to confirm the reached target
-                    # Report §AVU→VVD→task_check: only VIEWPOINT_POSE arrival
-                    # triggers task_check. Evidence-pose / visual-approach arrival
-                    # re-observes (next loop iteration re-queries VLM).
+                    # Final verification: only VIEWPOINT_POSE arrival enters
+                    # Answerer VERIFY mode. Visual-approach arrivals re-observe
+                    # on the next loop iteration and never verify directly.
                     _wm = subtask_metadata.get("working_memory", None)
                     _nav_candidate = None
                     if _wm is not None and isinstance(navigation_intent, TargetViewpointIntent):
@@ -726,75 +724,68 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     if should_verify:
                         subtask_metadata["navigation_mode"] = NavigationMode.VERIFY
                         back_frames = min(cnt_step + 1, cfg.frames_to_check)
-                        task_check_obs_frames = {}
+                        verify_obs_frames = {}
                         for back_step in range(global_step, global_step - back_frames, -1):
-                            task_check_obs = []
+                            verify_obs = []
                             for view_idx in range(7):
                                 obs_file_name = f"{back_step}-view_{view_idx}.png"
                                 if obs_file_name not in scene.all_observations.keys():
                                     break
-                                task_check_obs.append(
+                                verify_obs.append(
                                     resize_image(scene.all_observations[obs_file_name], cfg.prompt_h, cfg.prompt_w)
                                 )
-                            task_check_obs_frames[global_step - back_step + 1] = task_check_obs.copy()
-                        vlm_response, tc_reason = query_vlm_for_response_end(
+                            verify_obs_frames[global_step - back_step + 1] = verify_obs.copy()
+                        verify_status, verify_reason = query_vlm_for_verify(
                             subtask_metadata=subtask_metadata,
-                            rgb_egocentric_views=task_check_obs_frames,
+                            rgb_egocentric_views=verify_obs_frames,
                             cfg=cfg,
                             verbose=True,
                         )
-                        if (vlm_response == 'yes'):
-                            navigation_result.verify_status = VerifyStatus.SUCCESS
-                            subtask_metadata["last_step_outcome"].verification_result = VerifyStatus.SUCCESS
+                        navigation_result.verify_status = verify_status
+                        subtask_metadata["last_step_outcome"].verification_result = verify_status
+                        if verify_status == VerifyStatus.SUCCESS:
                             subtask_metadata["last_step_outcome"].done = True
-                            # Phase F: record success feedback
                             wm = subtask_metadata.get("working_memory", None)
                             if wm is not None:
                                 wm.add_feedback(
                                     step=cnt_step,
-                                    type_="TASK_CHECK_PASS",
-                                    reason=tc_reason or "target confirmed",
+                                    type_="VERIFY_PASS",
+                                    reason=verify_reason or "target confirmed",
                                     suggested_fix="",
                                 )
                                 for c in list(wm.target_candidates.values()):
                                     if c.status == "GROUNDED_3D":
                                         wm.release_after_navigation(c.candidate_id)
-                                        logging.info(f"[Phase2] released pinned candidate {c.candidate_id} after nav success")
+                                        logging.info(f"[VERIFY] released pinned candidate {c.candidate_id} after nav success")
                             subtask_metadata["navigation_intent"] = None
                             subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
                             break
                         else:
-                            reason_l = (tc_reason or "").lower()
-                            if "view" in reason_l or "facing" in reason_l or "orient" in reason_l:
-                                verify_status = VerifyStatus.POOR_VIEW
-                            elif "not visible" in reason_l or "cannot see" in reason_l:
-                                verify_status = VerifyStatus.TARGET_NOT_VISIBLE
-                            else:
-                                verify_status = VerifyStatus.WRONG_INSTANCE
-                            navigation_result.verify_status = verify_status
-                            subtask_metadata["last_step_outcome"].verification_result = verify_status
-                            decision['object_judge'] = "no"
-                            # Phase F: record failure feedback with reason
+                            decision['verify_status'] = verify_status.value
                             wm = subtask_metadata.get("working_memory", None)
                             if wm is not None:
                                 if verify_status == VerifyStatus.WRONG_INSTANCE:
                                     for c in list(wm.target_candidates.values()):
                                         if c.status == "GROUNDED_3D":
-                                            wm.reject_candidate_by_vlm(c.image_path, f"task_check rejected at step {cnt_step}")
-                                            logging.info(f"[Phase2] rejected candidate {c.candidate_id} (wrong instance)")
+                                            wm.reject_candidate_by_vlm(c.image_path, f"VERIFY rejected at step {cnt_step}")
+                                            logging.info(f"[VERIFY] rejected candidate {c.candidate_id} (wrong instance)")
                                             break
                                 wm.add_feedback(
                                     step=cnt_step,
-                                    type_="TASK_CHECK_FAIL",
-                                    reason=tc_reason or "task_check rejected",
-                                    suggested_fix="rotate toward target / use VVD viewpoint",
+                                    type_="VERIFY_FAIL",
+                                    reason=verify_reason or "VERIFY rejected",
+                                    suggested_fix=(
+                                        "rotate toward target / use VVD viewpoint"
+                                        if verify_status == VerifyStatus.POOR_VIEW
+                                        else "reject candidate, search for other instances"
+                                    ),
                                 )
                             subtask_metadata["navigation_intent"] = None
                             subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
                     elif target_arrived and navigation_intent is not None:
-                        # Frontier, visual-approach, and evidence-pose arrivals
-                        # re-enter EXPLORE after the next observation; they never
-                        # trigger task verification directly.
+                        # Frontier and visual-approach arrivals re-enter
+                        # EXPLORE after the next observation; they never
+                        # trigger verification directly.
                         subtask_metadata["navigation_intent"] = None
                         subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
 

@@ -33,16 +33,18 @@ class EventEngine:
     """Creates task-scoped typed events and debounces trigger routing."""
 
     HYPOTHESIS_TRIGGERS = {
-        EventType.CANDIDATE_VISIBLE,
-        EventType.CANDIDATE_GROUNDED_3D,
-        EventType.EVIDENCE_CONFLICT,
-        EventType.SPATIAL_BRANCH_CREATED,
+        EventType.NO_ACTIVE_HYPOTHESIS,
+        EventType.HYPOTHESIS_SUPPORTED,
+        EventType.HYPOTHESIS_CONTRADICTED,
+        EventType.HYPOTHESIS_TEST_COMPLETED,
+        EventType.TRAJECTORY_LOOP,
+        EventType.CANDIDATE_REJECTED,
         EventType.SPATIAL_BRANCH_STALLED,
         EventType.SPATIAL_BRANCH_REVISITING,
+        EventType.NO_ELIGIBLE_FRONTIER,
         EventType.NO_VALID_FRONTIER,
         EventType.WRONG_INSTANCE,
-        EventType.POOR_VIEW,
-        EventType.TARGET_NOT_VISIBLE,
+        EventType.ANSWERER_EVIDENCE_CONFLICT,
         EventType.HYPOTHESIS_UPDATE_REQUIRED,
     }
     MEMORY_TRIGGERS = {
@@ -112,10 +114,43 @@ class EventEngine:
         step: int,
         candidate_id: Optional[str] = None,
         image_path: Optional[str] = None,
+        evidence_updates: Optional[List] = None,
         evidence_conflict: bool = False,
         working_memory: Optional[SubtaskWorkingMemory] = None,
     ) -> List[TypedEvent]:
         events: List[TypedEvent] = []
+        for idx, update in enumerate(evidence_updates or []):
+            if not isinstance(update, dict):
+                payload = {"raw": update}
+                hypothesis_id = None
+                result = ""
+            else:
+                payload = dict(update)
+                hypothesis_id = (
+                    payload.get("hypothesis_id")
+                    or payload.get("id")
+                    or payload.get("hypothesis")
+                )
+                result = str(payload.get("result") or payload.get("status") or "").upper()
+            event_type = EventType.SEMANTIC_EVIDENCE
+            if result in {"SUPPORT", "SUPPORTED", "STRENGTHEN"}:
+                event_type = EventType.HYPOTHESIS_SUPPORTED
+            elif result in {"WEAKEN", "CONTRADICT", "CONTRADICTED", "REJECT"}:
+                event_type = EventType.HYPOTHESIS_CONTRADICTED
+            elif result in {"TEST_COMPLETED", "COMPLETED", "DONE"}:
+                event_type = EventType.HYPOTHESIS_TEST_COMPLETED
+            event = self.emit(
+                event_type,
+                step=step,
+                entity_id=str(hypothesis_id or f"evidence_{idx}"),
+                active_hypothesis_id=str(hypothesis_id) if hypothesis_id else None,
+                payload=payload,
+                severity="warning"
+                if event_type == EventType.HYPOTHESIS_CONTRADICTED
+                else "info",
+            )
+            if event is not None:
+                events.append(event)
         if decision in (
             AnswererDecision.CANDIDATE_VISIBLE,
             AnswererDecision.TARGET_CONFIRMED,
@@ -135,7 +170,7 @@ class EventEngine:
                 events.append(event)
         if evidence_conflict:
             event = self.emit(
-                EventType.EVIDENCE_CONFLICT,
+                EventType.ANSWERER_EVIDENCE_CONFLICT,
                 step=step,
                 entity_id=candidate_id or image_path,
                 payload={"candidate_id": candidate_id, "image_path": image_path},

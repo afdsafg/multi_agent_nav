@@ -66,6 +66,7 @@ class BranchTracker:
         instances: List[FrontierInstance] = []
         events: List[TypedEvent] = []
         current_fids = set()
+        current_tips: Dict[str, List[int]] = {}
 
         for local_index, frontier in enumerate(getattr(tsdf_planner, "frontiers", [])):
             fid = int(getattr(frontier, "frontier_id"))
@@ -78,6 +79,7 @@ class BranchTracker:
                 position=position_habitat,
                 step=step,
             )
+            current_tips.setdefault(branch.spatial_branch_id, []).append(fid)
             instance = FrontierInstance(
                 frontier_id=fid,
                 position=position_habitat,
@@ -95,6 +97,7 @@ class BranchTracker:
             if state is None:
                 state = BranchTaskState(
                     spatial_branch_id=branch.spatial_branch_id,
+                    subtask_id=working_memory.subtask_id,
                     status=BranchTaskStatus.NEW,
                     progress_score=0.0,
                     last_frontier_id=fid,
@@ -146,6 +149,7 @@ class BranchTracker:
 
             working_memory.frontier_to_branch[fid] = branch.spatial_branch_id
 
+        self._refresh_active_tips(working_memory, current_tips, step)
         self._close_missing_active_tips(working_memory, current_fids, step)
         for event in events:
             working_memory.add_typed_event(event)
@@ -165,6 +169,8 @@ class BranchTracker:
             branch = working_memory.spatial_branches.get(inst.spatial_branch_id or "")
             state = working_memory.branch_task_states.get(inst.spatial_branch_id or "")
             if branch is not None and branch.merged_into:
+                continue
+            if branch is not None and branch.geometric_status == "CLOSED":
                 continue
             if state is not None and state.status == BranchTaskStatus.CLOSED:
                 continue
@@ -191,6 +197,7 @@ class BranchTracker:
             state = BranchTaskState(spatial_branch_id=branch.spatial_branch_id)
         state.selected_count += 1
         state.last_frontier_id = int(frontier_id)
+        state.last_selected_step = step
         state.updated_step = step
         if state.status == BranchTaskStatus.NEW:
             state.status = BranchTaskStatus.ADVANCING
@@ -211,6 +218,7 @@ class BranchTracker:
             state = BranchTaskState(spatial_branch_id=branch.spatial_branch_id)
         state.reached_count += 1
         state.last_frontier_id = int(frontier_id)
+        state.recent_spatial_gain = max(0.0, float(progress_delta))
         state.progress_score = max(state.progress_score, state.progress_score + progress_delta)
         state.updated_step = step
         working_memory.upsert_branch_task_state(state)
@@ -253,7 +261,10 @@ class BranchTracker:
             self._mark_close_branch_merges(working_memory, existing, position)
             return existing
 
-        match = self._nearest_branch(working_memory.spatial_branches.values(), position)
+        match = self._nearest_branch(
+            working_memory.spatial_branches.values(),
+            position,
+        )
         if match is not None:
             self._update_branch(match, frontier_id, position, step)
             working_memory.upsert_spatial_branch(match)
@@ -303,9 +314,13 @@ class BranchTracker:
         bid = self._next_branch_id(working_memory.spatial_branches.keys())
         branch = SpatialBranchRecord(
             spatial_branch_id=bid,
+            origin=position,
             frontier_ids=[int(frontier_id)],
             spine=[position],
             active_tip_frontier_id=int(frontier_id),
+            active_tip_ids=[int(frontier_id)],
+            frontier_history=[int(frontier_id)],
+            tip_history=[position],
             created_step=step,
             updated_step=step,
         )
@@ -321,10 +336,23 @@ class BranchTracker:
         fid = int(frontier_id)
         if fid not in branch.frontier_ids:
             branch.frontier_ids.append(fid)
+        branch.frontier_history.append(fid)
         branch.active_tip_frontier_id = fid
+        if fid not in branch.active_tip_ids:
+            branch.active_tip_ids.append(fid)
         branch.spine.append(position)
+        branch.tip_history.append(position)
         if len(branch.spine) > 24:
             branch.spine = branch.spine[-24:]
+        if len(branch.tip_history) > 64:
+            branch.tip_history = branch.tip_history[-64:]
+        if len(branch.frontier_history) > 64:
+            branch.frontier_history = branch.frontier_history[-64:]
+        branch.max_progress = max(branch.max_progress, self._arc_length(branch.spine))
+        if branch.merged_into:
+            branch.geometric_status = "MERGED"
+        elif branch.geometric_status != "CLOSED":
+            branch.geometric_status = "OPEN"
         branch.updated_step = step
 
     def _nearest_branch(
@@ -332,19 +360,56 @@ class BranchTracker:
         branches: Iterable[SpatialBranchRecord],
         position,
     ) -> Optional[SpatialBranchRecord]:
-        pos = _as_np_xy(position)
         best = None
-        best_d = float("inf")
+        best_score = 0.0
         for branch in branches:
-            if branch.merged_into or not branch.spine:
+            if branch.merged_into or branch.geometric_status == "CLOSED" or not branch.spine:
                 continue
-            d = float(np.linalg.norm(pos - _as_np_xy(branch.spine[-1])))
-            if d < best_d:
+            score = self._association_score(branch, position)
+            if score > best_score:
                 best = branch
-                best_d = d
-        if best is not None and best_d <= self.config.match_distance_m:
+                best_score = score
+        if best is not None and best_score >= 0.50:
             return best
         return None
+
+    def _association_score(self, branch: SpatialBranchRecord, position) -> float:
+        pos = _as_np_xy(position)
+        tip = _as_np_xy(branch.spine[-1])
+        tip_d = float(np.linalg.norm(pos - tip))
+        propagation = max(0.0, 1.0 - tip_d / max(self.config.match_distance_m, 1e-6))
+
+        origin = _as_np_xy(branch.origin if branch.origin is not None else branch.spine[0])
+        origin_to_tip = tip - origin
+        origin_to_pos = pos - origin
+        origin_norm = float(np.linalg.norm(origin_to_tip))
+        pos_norm = float(np.linalg.norm(origin_to_pos))
+        if origin_norm > 1e-6 and pos_norm > 1e-6:
+            gateway = max(0.0, float(np.dot(origin_to_tip, origin_to_pos) / (origin_norm * pos_norm)))
+        else:
+            gateway = propagation
+
+        if len(branch.spine) >= 2:
+            tangent = _as_np_xy(branch.spine[-1]) - _as_np_xy(branch.spine[-2])
+            tangent_norm = float(np.linalg.norm(tangent))
+            candidate_vec = pos - tip
+            candidate_norm = float(np.linalg.norm(candidate_vec))
+            if tangent_norm > 1e-6 and candidate_norm > 1e-6:
+                tangent_sim = max(0.0, float(np.dot(tangent, candidate_vec) / (tangent_norm * candidate_norm)))
+            else:
+                tangent_sim = propagation
+        else:
+            tangent_sim = propagation
+
+        trajectory = 1.0 if tip_d <= self.config.match_distance_m else 0.0
+        unknown = 1.0 if branch.geometric_status == "OPEN" else 0.0
+        return (
+            0.30 * propagation
+            + 0.25 * gateway
+            + 0.20 * tangent_sim
+            + 0.15 * trajectory
+            + 0.10 * unknown
+        )
 
     def _persistent_split_source(
         self,
@@ -356,7 +421,7 @@ class BranchTracker:
         source = None
         source_d = float("inf")
         for branch in branches:
-            if branch.merged_into or len(branch.spine) < 2:
+            if branch.merged_into or branch.geometric_status == "CLOSED" or len(branch.spine) < 2:
                 continue
             tip_d = float(np.linalg.norm(pos - _as_np_xy(branch.spine[-1])))
             if tip_d <= self.config.split_tip_distance_m:
@@ -423,6 +488,7 @@ class BranchTracker:
             d = float(np.linalg.norm(pos - _as_np_xy(other.spine[-1])))
             if d <= self.config.merge_distance_m:
                 other.merged_into = target_branch.spatial_branch_id
+                other.geometric_status = "MERGED"
                 alias = f"merged_into:{target_branch.spatial_branch_id}"
                 if alias not in other.aliases:
                     other.aliases.append(alias)
@@ -438,6 +504,7 @@ class BranchTracker:
         prev = _as_np_xy(branch.spine[-2]) if len(branch.spine) >= 2 else _as_np_xy(position)
         cur = _as_np_xy(position)
         progress = float(np.linalg.norm(cur - prev))
+        state.recent_spatial_gain = progress
         state.progress_score = max(state.progress_score, progress)
         if progress <= self.config.stalled_progress_epsilon:
             state.steps_without_progress += 1
@@ -450,13 +517,37 @@ class BranchTracker:
             )
             if d_to_old <= self.config.revisit_distance_m:
                 state.status = BranchTaskStatus.REVISITING
+                state.recent_visit_count += 1
+                state.reversal_count += 1
+                state.recent_region_overlap = 1.0
             else:
                 state.status = BranchTaskStatus.ADVANCING
+                state.recent_region_overlap = 0.0
         elif state.status == BranchTaskStatus.NEW:
             state.status = BranchTaskStatus.ADVANCING
         if state.steps_without_progress >= self.config.stalled_after_steps:
             state.status = BranchTaskStatus.STALLED
         state.updated_step = step
+
+    def _refresh_active_tips(
+        self,
+        working_memory: SubtaskWorkingMemory,
+        current_tips: Dict[str, List[int]],
+        step: int,
+    ) -> None:
+        for bid, tips in current_tips.items():
+            branch = working_memory.spatial_branches.get(bid)
+            if branch is None:
+                continue
+            unique_tips = sorted(set(int(fid) for fid in tips))
+            branch.active_tip_ids = unique_tips
+            branch.active_tip_frontier_id = unique_tips[-1] if unique_tips else None
+            if branch.merged_into:
+                branch.geometric_status = "MERGED"
+            elif branch.geometric_status != "CLOSED":
+                branch.geometric_status = "OPEN"
+            branch.updated_step = step
+            working_memory.upsert_spatial_branch(branch)
 
     def _close_missing_active_tips(
         self,
@@ -465,8 +556,17 @@ class BranchTracker:
         step: int,
     ) -> None:
         for branch in working_memory.spatial_branches.values():
-            tip = branch.active_tip_frontier_id
-            if tip is None or tip in current_fids:
+            missing_tips = [
+                int(fid) for fid in branch.active_tip_ids
+                if int(fid) not in current_fids
+            ]
+            branch.active_tip_ids = [
+                int(fid) for fid in branch.active_tip_ids
+                if int(fid) in current_fids
+            ]
+            if branch.active_tip_ids:
+                branch.active_tip_frontier_id = branch.active_tip_ids[-1]
+            if not missing_tips:
                 continue
             state = working_memory.branch_task_states.get(branch.spatial_branch_id)
             if state is None:
@@ -474,6 +574,17 @@ class BranchTracker:
             if state.status == BranchTaskStatus.ADVANCING:
                 state.status = BranchTaskStatus.STALLED
                 state.updated_step = step
+
+    @staticmethod
+    def _arc_length(spine: List) -> float:
+        if len(spine) < 2:
+            return 0.0
+        return float(
+            sum(
+                np.linalg.norm(_as_np_xy(spine[i]) - _as_np_xy(spine[i - 1]))
+                for i in range(1, len(spine))
+            )
+        )
 
     def _frontier_position_habitat(self, tsdf_planner, frontier):
         try:

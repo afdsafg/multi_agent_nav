@@ -30,6 +30,7 @@ from src.memory_structures import (
     NavTargetKind,
     NavigationMode,
     NavigationResult,
+    S_REJECTED,
     SpatialBranchRecord,
     StepOutcome,
     SubtaskWorkingMemory,
@@ -251,9 +252,9 @@ def test_hypothesis_single_writer_constraint():
 
 def test_event_engine_debounce_and_routing():
     engine = EventEngine(EventEngineConfig(debounce_steps=2, memory_pool_budget=1))
-    first = engine.emit(EventType.CANDIDATE_VISIBLE, step=4, entity_id="C001")
-    duplicate = engine.emit(EventType.CANDIDATE_VISIBLE, step=5, entity_id="C001")
-    later = engine.emit(EventType.CANDIDATE_VISIBLE, step=6, entity_id="C001")
+    first = engine.emit(EventType.HYPOTHESIS_SUPPORTED, step=4, entity_id="H001")
+    duplicate = engine.emit(EventType.HYPOTHESIS_SUPPORTED, step=5, entity_id="H001")
+    later = engine.emit(EventType.HYPOTHESIS_SUPPORTED, step=6, entity_id="H001")
 
     assert first is not None
     assert duplicate is None
@@ -263,8 +264,31 @@ def test_event_engine_debounce_and_routing():
     routing = engine.route([first] + memory_events)
     assert routing.call_hypothesis_manager is True
     assert routing.call_memory_manager is True
-    assert EventType.CANDIDATE_VISIBLE.value in routing.reasons
+    assert EventType.HYPOTHESIS_SUPPORTED.value in routing.reasons
     assert EventType.WORKING_MEMORY_OVER_BUDGET.value in routing.reasons
+
+
+def test_answerer_evidence_updates_route_to_hypothesis_manager():
+    memory = SubtaskWorkingMemory()
+    engine = EventEngine(EventEngineConfig(debounce_steps=1))
+    events = engine.detect_answerer_events(
+        AnswererDecision.NOT_FOUND,
+        step=7,
+        evidence_updates=[
+            {"hypothesis_id": "H001", "result": "SUPPORT", "observed_cues": ["red chair"]},
+            {"hypothesis_id": "H002", "result": "CONTRADICT", "missing_expected_cues": ["lamp"]},
+            {"hypothesis_id": "H003", "result": "TEST_COMPLETED"},
+        ],
+        working_memory=memory,
+    )
+
+    assert [event.type for event in events] == [
+        EventType.HYPOTHESIS_SUPPORTED,
+        EventType.HYPOTHESIS_CONTRADICTED,
+        EventType.HYPOTHESIS_TEST_COMPLETED,
+    ]
+    assert engine.route(events).call_hypothesis_manager is True
+    assert [event.type for event in memory.typed_events] == [event.type for event in events]
 
 
 def test_branch_tracker_sync_and_eligibility_filter():
@@ -464,7 +488,7 @@ def test_verify_gate_only_allows_reached_target_viewpoint():
     assert should_enter_verify(True, target_intent, candidate) is False
 
 
-def test_candidate_controller_visual_approach_does_not_enter_verify():
+def test_candidate_controller_rejects_when_visual_approach_unavailable():
     from src.candidate_controller import CandidateController
 
     memory = SubtaskWorkingMemory()
@@ -476,26 +500,34 @@ def test_candidate_controller_visual_approach_does_not_enter_verify():
         view_yaw=0.0,
     )
     controller = CandidateController(SimpleNamespace(AVU_conf_threshold=0.1, dicision_radius=1.0))
-    result = controller._evidence_pose_fallback(
+    result = controller._build_visual_approach_result(
+        scene=SimpleNamespace(),
+        tsdf_planner=SimpleNamespace(),
         working_memory=memory,
         candidate=candidate,
         img_path="1-view_0.png",
         target_phrase="chair",
         cam_pose=np.eye(4),
+        view_yaw=0.0,
+        l3_boxes=None,
+        l3_best_idx=None,
         step_index=1,
-        reason="no 3D grounding",
     )
 
-    assert isinstance(result.intent, VisualApproachIntent)
-    assert candidate.nav_target_kind is NavTargetKind.VISUAL_APPROACH_POSE
-    assert candidate.nav_status is NavStatus.PLANNED
+    assert result.intent is None
+    assert candidate.status == S_REJECTED
+    assert candidate.nav_target_kind is None
+    assert candidate.nav_status is NavStatus.FAILED
     assert should_enter_verify(True, result.intent, candidate) is False
+    assert {event.type for event in result.events} == {
+        EventType.GROUNDING_FAILED,
+        EventType.CANDIDATE_REJECTED,
+    }
 
 
 def test_candidate_clip_gate_uses_raw_margin_depth_and_does_not_mutate_boxes():
     import torch
     import src.candidate_controller as controller_module
-    import src.conceptgraph.utils.model_utils as model_utils
     from src.candidate_controller import CandidateController
 
     class FakeBoxes:
@@ -548,12 +580,14 @@ def test_candidate_clip_gate_uses_raw_margin_depth_and_does_not_mutate_boxes():
         target_phrase="chair",
     )
 
-    old_clip = model_utils.clip_recognition
-
     def fake_clip(_model, _tokenizer, _preprocess, crop, _prompt):
         return np.array([0.9 if crop.shape[0] == 3 else 0.2], dtype=float)
 
-    model_utils.clip_recognition = fake_clip
+    module_name = "src.conceptgraph.utils.model_utils"
+    old_model_utils = sys.modules.get(module_name)
+    fake_model_utils = types.ModuleType(module_name)
+    fake_model_utils.clip_recognition = fake_clip
+    sys.modules[module_name] = fake_model_utils
     try:
         controller = CandidateController(
             SimpleNamespace(AVU_conf_threshold=0.1, dicision_radius=1.0),
@@ -596,7 +630,10 @@ def test_candidate_clip_gate_uses_raw_margin_depth_and_does_not_mutate_boxes():
         assert rejected_idx == 0
         assert "depth 0.00" in zero_depth_candidate.grounding_attempts[-1].reason
     finally:
-        model_utils.clip_recognition = old_clip
+        if old_model_utils is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = old_model_utils
 
 
 def test_agent_json_parsers_fail_safe_without_random_frontier():
