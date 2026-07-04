@@ -933,6 +933,50 @@ def parse_answerer_response(
     return (decision, idx, class_name)
 
 
+def parse_answerer_visibility(response: Optional[str]) -> dict:
+    """Parse the Visibility block emitted by format_answerer_prompt.
+    Returns dict with directly_visible / central_enough / partially_occluded
+    / confidence. Missing fields are omitted (caller applies tolerant defaults)."""
+    if response is None:
+        return {}
+    out: dict = {}
+    for key in ("directly_visible", "central_enough", "partially_occluded"):
+        m = re.search(rf"{key}\s*[:：]\s*(\w+)", response, re.IGNORECASE)
+        if m:
+            out[key] = m.group(1).strip().lower()
+    m = re.search(r"confidence\s*[:：]\s*([0-9.]+)", response, re.IGNORECASE)
+    if m:
+        try:
+            out["confidence"] = float(m.group(1))
+        except ValueError:
+            pass
+    return out
+
+
+def sanitize_answerer_decision(
+    decision: str,
+    idx: Optional[int],
+    class_name: Optional[str],
+    vis: dict,
+    conf_thresh: float = 0.85,
+) -> Tuple[str, Optional[int], Optional[str]]:
+    """Downgrade TARGET_CONFIRMED -> CANDIDATE_VISIBLE when visibility flags
+    are weak (report §AVU→VVD→task_check Answerer guard). Tolerant: missing
+    fields default to passing values so the guard only fires on explicit
+    weak signals."""
+    if decision != "TARGET_CONFIRMED":
+        return decision, idx, class_name
+    if vis.get("directly_visible", "yes") != "yes":
+        return "CANDIDATE_VISIBLE", idx, class_name
+    if vis.get("central_enough", "yes") != "yes":
+        return "CANDIDATE_VISIBLE", idx, class_name
+    if vis.get("partially_occluded", "no") == "yes":
+        return "CANDIDATE_VISIBLE", idx, class_name
+    if "confidence" in vis and vis["confidence"] < conf_thresh:
+        return "CANDIDATE_VISIBLE", idx, class_name
+    return decision, idx, class_name
+
+
 def parse_executor_response(response: Optional[str]) -> int:
     """Parse Executor response.
 
@@ -1312,6 +1356,10 @@ def explore_multi_agent(
         logging.info("[Answerer] calling VLM")
     raw = call_openai_api(sys_p, content)
     decision, idx, class_name = parse_answerer_response(raw)
+    _vis = parse_answerer_visibility(raw)
+    decision, idx, class_name = sanitize_answerer_decision(decision, idx, class_name, _vis)
+    if decision == "CANDIDATE_VISIBLE" and _vis:
+        logging.info(f"[Answerer] sanitized TARGET_CONFIRMED->CANDIDATE_VISIBLE vis={_vis}")
     reason = _extract_reason(raw)
     if decision in ("CANDIDATE_VISIBLE", "TARGET_CONFIRMED") and idx is not None and 0 <= idx < len(pool):
         img_path = pool[idx]["img_path"]
