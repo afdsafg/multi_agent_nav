@@ -1190,6 +1190,8 @@ def parse_hypothesis_manager_response(
             if not hyp_id or not desc:
                 continue
             item = dict(item)
+            item.pop("id", None)
+            item.pop("summary", None)
             item["hypothesis_id"] = str(hyp_id)
             item["description"] = str(desc)
             item.setdefault("created_step", step_index)

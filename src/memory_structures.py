@@ -222,25 +222,48 @@ def anchor_from_dict(data: Dict[str, Any]) -> Anchor:
     kind = (data or {}).get("kind") or (data or {}).get("type")
     if kind:
         kind = str(kind).lower()
-    if kind == "frontier" or "frontier_id" in data:
+    if kind == "frontier":
         return FrontierAnchor(
             frontier_id=int(data["frontier_id"]),
             spatial_branch_id=data.get("spatial_branch_id"),
         )
-    if kind == "spatial_branch" or "spatial_branch_id" in data:
+    if kind == "spatial_branch":
         return SpatialBranchAnchor(spatial_branch_id=str(data["spatial_branch_id"]))
-    if kind == "object" or "object_id" in data:
+    if kind == "object":
         return ObjectAnchor(
             object_id=data["object_id"],
             class_name=data.get("class_name"),
         )
-    if kind == "candidate" or "candidate_id" in data:
+    if kind == "candidate":
         return CandidateAnchor(
             candidate_id=str(data["candidate_id"]),
             image_path=data.get("image_path"),
             target_phrase=data.get("target_phrase"),
         )
-    if kind == "image" or "image_path" in data:
+    if kind == "image":
+        return ImageAnchor(
+            image_path=str(data["image_path"]),
+            candidate_id=data.get("candidate_id"),
+        )
+    if "frontier_id" in data:
+        return FrontierAnchor(
+            frontier_id=int(data["frontier_id"]),
+            spatial_branch_id=data.get("spatial_branch_id"),
+        )
+    if "spatial_branch_id" in data:
+        return SpatialBranchAnchor(spatial_branch_id=str(data["spatial_branch_id"]))
+    if "object_id" in data:
+        return ObjectAnchor(
+            object_id=data["object_id"],
+            class_name=data.get("class_name"),
+        )
+    if "candidate_id" in data:
+        return CandidateAnchor(
+            candidate_id=str(data["candidate_id"]),
+            image_path=data.get("image_path"),
+            target_phrase=data.get("target_phrase"),
+        )
+    if "image_path" in data:
         return ImageAnchor(
             image_path=str(data["image_path"]),
             candidate_id=data.get("candidate_id"),
