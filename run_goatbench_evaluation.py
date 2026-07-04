@@ -40,7 +40,7 @@ from src.dataset_utils import prepare_goatbench_navigation_goals
 from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end, query_vlm_multi_agent
 from src.long_term_memory import TextLongTermMemory
 from src.logger_goatbench import Logger
-from src.memory_structures import SubtaskWorkingMemory
+from src.memory_structures import SubtaskWorkingMemory, NavTargetKind, NavStatus
 import time
 
 
@@ -635,7 +635,23 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     timer.print_summary(logging)
                     # (6) Check if the agent has arrived at the target to finish the question
                     # Final verification: use VLM to confirm the reached target
-                    if target_type != "frontier" and target_arrived:
+                    # Report §AVU→VVD→task_check: only VIEWPOINT_POSE arrival
+                    # triggers task_check. Evidence-pose / visual-approach arrival
+                    # re-observes (next loop iteration re-queries VLM).
+                    _wm = subtask_metadata.get("working_memory", None)
+                    _nav_candidate = _wm.get_last_nav_candidate() if _wm is not None else None
+                    _ntk = getattr(_nav_candidate, "nav_target_kind", None) if _nav_candidate is not None else None
+                    if target_arrived and _nav_candidate is not None:
+                        _nav_candidate.nav_status = NavStatus.REACHED
+                    # Gate task_check: VIEWPOINT_POSE reached, OR legacy fallback
+                    # when no working_memory/candidate (target_type != frontier).
+                    if (
+                        target_arrived
+                        and (
+                            _ntk == NavTargetKind.VIEWPOINT_POSE
+                            or (_nav_candidate is None and target_type != "frontier")
+                        )
+                    ):
                         back_frames = min(cnt_step + 1, cfg.frames_to_check)
                         task_check_obs_frames = {}
                         for back_step in range(global_step, global_step - back_frames, -1):
