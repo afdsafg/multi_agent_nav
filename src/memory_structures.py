@@ -563,6 +563,22 @@ class StepOutcome(JsonDataclassMixin):
         ]
 
 
+def should_enter_verify(
+    target_arrived: bool,
+    navigation_intent: Optional[NavigationIntent],
+    candidate: Optional[Any],
+) -> bool:
+    """Gate task verification to reached target-viewpoint intents only."""
+    return (
+        bool(target_arrived)
+        and isinstance(navigation_intent, TargetViewpointIntent)
+        and candidate is not None
+        and getattr(candidate, "nav_status", None) == NavStatus.REACHED
+        and getattr(candidate, "nav_target_kind", None)
+        == NavTargetKind.VIEWPOINT_POSE
+    )
+
+
 def format_prompt_summary(items: Any, max_items: int = 8) -> str:
     """Render typed rebuild state for VLM prompts without leaking raw dicts."""
     if items is None:

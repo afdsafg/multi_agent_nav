@@ -38,6 +38,10 @@ class BranchTrackerConfig:
     stalled_progress_epsilon: float = 0.05
     stalled_after_steps: int = 3
     revisit_distance_m: float = 0.6
+    split_distance_m: float = 0.8
+    split_tip_distance_m: float = 1.6
+    split_after_steps: int = 2
+    merge_distance_m: float = 0.5
 
 
 class BranchTracker:
@@ -46,10 +50,11 @@ class BranchTracker:
     def __init__(self, config: Optional[BranchTrackerConfig] = None) -> None:
         self.config = config or BranchTrackerConfig()
         self._counter = 0
+        self._split_candidates: Dict[int, Tuple[str, int]] = {}
 
     def reset_task_scope(self) -> None:
         """Do not clear branch records; only task-local state lives in memory."""
-        pass
+        self._split_candidates = {}
 
     def sync_frontiers(
         self,
@@ -227,15 +232,74 @@ class BranchTracker:
     ) -> SpatialBranchRecord:
         existing = working_memory.get_branch_for_frontier(frontier_id)
         if existing is not None:
+            split_from = self._persistent_split_source(
+                [existing], frontier_id, position
+            )
+            if split_from is not None:
+                self._split_candidates.pop(int(frontier_id), None)
+                branch = self._new_branch(
+                    working_memory,
+                    frontier_id=frontier_id,
+                    position=position,
+                    step=step,
+                )
+                branch.aliases.append(f"split_from:{split_from.spatial_branch_id}")
+                working_memory.upsert_spatial_branch(branch)
+                return branch
+            if self._pending_split_source(working_memory, frontier_id) is not None:
+                return existing
             self._update_branch(existing, frontier_id, position, step)
+            working_memory.upsert_spatial_branch(existing)
+            self._mark_close_branch_merges(working_memory, existing, position)
             return existing
 
         match = self._nearest_branch(working_memory.spatial_branches.values(), position)
         if match is not None:
             self._update_branch(match, frontier_id, position, step)
             working_memory.upsert_spatial_branch(match)
+            self._mark_close_branch_merges(working_memory, match, position)
             return match
 
+        split_from = self._persistent_split_source(
+            working_memory.spatial_branches.values(), frontier_id, position
+        )
+        if split_from is not None:
+            self._split_candidates.pop(int(frontier_id), None)
+            branch = self._new_branch(
+                working_memory,
+                frontier_id=frontier_id,
+                position=position,
+                step=step,
+            )
+            branch.aliases.append(f"split_from:{split_from.spatial_branch_id}")
+            working_memory.upsert_spatial_branch(branch)
+            return branch
+        pending_source = self._pending_split_source(working_memory, frontier_id)
+        if pending_source is not None:
+            return pending_source
+
+        branch = self._new_branch(
+            working_memory,
+            frontier_id=frontier_id,
+            position=position,
+            step=step,
+        )
+        merged_into = self._merge_target(
+            working_memory.spatial_branches.values(), branch, position
+        )
+        if merged_into is not None:
+            branch.merged_into = merged_into.spatial_branch_id
+            branch.aliases.append(f"merged_into:{merged_into.spatial_branch_id}")
+        working_memory.upsert_spatial_branch(branch)
+        return branch
+
+    def _new_branch(
+        self,
+        working_memory: SubtaskWorkingMemory,
+        frontier_id: int,
+        position,
+        step: int,
+    ) -> SpatialBranchRecord:
         bid = self._next_branch_id(working_memory.spatial_branches.keys())
         branch = SpatialBranchRecord(
             spatial_branch_id=bid,
@@ -245,7 +309,6 @@ class BranchTracker:
             created_step=step,
             updated_step=step,
         )
-        working_memory.upsert_spatial_branch(branch)
         return branch
 
     def _update_branch(
@@ -282,6 +345,87 @@ class BranchTracker:
         if best is not None and best_d <= self.config.match_distance_m:
             return best
         return None
+
+    def _persistent_split_source(
+        self,
+        branches: Iterable[SpatialBranchRecord],
+        frontier_id: int,
+        position,
+    ) -> Optional[SpatialBranchRecord]:
+        pos = _as_np_xy(position)
+        source = None
+        source_d = float("inf")
+        for branch in branches:
+            if branch.merged_into or len(branch.spine) < 2:
+                continue
+            tip_d = float(np.linalg.norm(pos - _as_np_xy(branch.spine[-1])))
+            if tip_d <= self.config.split_tip_distance_m:
+                continue
+            spine_d = min(
+                float(np.linalg.norm(pos - _as_np_xy(p)))
+                for p in branch.spine[:-1]
+            )
+            if spine_d <= self.config.split_distance_m and spine_d < source_d:
+                source = branch
+                source_d = spine_d
+        if source is None:
+            self._split_candidates.pop(int(frontier_id), None)
+            return None
+
+        prev_bid, count = self._split_candidates.get(int(frontier_id), ("", 0))
+        count = count + 1 if prev_bid == source.spatial_branch_id else 1
+        self._split_candidates[int(frontier_id)] = (source.spatial_branch_id, count)
+        return source if count >= self.config.split_after_steps else None
+
+    def _pending_split_source(
+        self,
+        working_memory: SubtaskWorkingMemory,
+        frontier_id: int,
+    ) -> Optional[SpatialBranchRecord]:
+        pending = self._split_candidates.get(int(frontier_id))
+        if pending is None:
+            return None
+        bid, _count = pending
+        return working_memory.spatial_branches.get(bid)
+
+    def _merge_target(
+        self,
+        branches: Iterable[SpatialBranchRecord],
+        branch: SpatialBranchRecord,
+        position,
+    ) -> Optional[SpatialBranchRecord]:
+        pos = _as_np_xy(position)
+        best = None
+        best_d = float("inf")
+        for other in branches:
+            if other.spatial_branch_id == branch.spatial_branch_id:
+                continue
+            if other.merged_into or not other.spine:
+                continue
+            d = float(np.linalg.norm(pos - _as_np_xy(other.spine[-1])))
+            if d <= self.config.merge_distance_m and d < best_d:
+                best = other
+                best_d = d
+        return best
+
+    def _mark_close_branch_merges(
+        self,
+        working_memory: SubtaskWorkingMemory,
+        target_branch: SpatialBranchRecord,
+        position,
+    ) -> None:
+        pos = _as_np_xy(position)
+        for other in working_memory.spatial_branches.values():
+            if other.spatial_branch_id == target_branch.spatial_branch_id:
+                continue
+            if other.merged_into or not other.spine:
+                continue
+            d = float(np.linalg.norm(pos - _as_np_xy(other.spine[-1])))
+            if d <= self.config.merge_distance_m:
+                other.merged_into = target_branch.spatial_branch_id
+                alias = f"merged_into:{target_branch.spatial_branch_id}"
+                if alias not in other.aliases:
+                    other.aliases.append(alias)
 
     def _update_branch_progress(
         self,

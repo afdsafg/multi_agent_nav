@@ -42,6 +42,8 @@ from src.utils import Visibility_based_Viewpoint_Decision, build_visual_approach
 
 GENERIC_CLASSES = ["object", "item", "thing", "furniture", "appliance"]
 DEFAULT_CLIP_RERANK_THRESH = 0.20
+DEFAULT_CLIP_MARGIN_THRESH = 0.0
+DEFAULT_CLIP_DEPTH_MIN_RATIO = 0.0
 
 
 @dataclass
@@ -61,9 +63,29 @@ class CandidateControllerResult:
 
 
 class CandidateController:
-    def __init__(self, cfg, clip_rerank_thresh: float = DEFAULT_CLIP_RERANK_THRESH) -> None:
+    def __init__(
+        self,
+        cfg,
+        clip_rerank_thresh: float = DEFAULT_CLIP_RERANK_THRESH,
+        clip_margin_thresh: Optional[float] = None,
+        clip_depth_min_ratio: Optional[float] = None,
+    ) -> None:
         self.cfg = cfg
         self.clip_rerank_thresh = clip_rerank_thresh
+        self.clip_margin_thresh = (
+            float(clip_margin_thresh)
+            if clip_margin_thresh is not None
+            else float(
+                getattr(cfg, "clip_rerank_margin_threshold", DEFAULT_CLIP_MARGIN_THRESH)
+            )
+        )
+        self.clip_depth_min_ratio = (
+            float(clip_depth_min_ratio)
+            if clip_depth_min_ratio is not None
+            else float(
+                getattr(cfg, "clip_depth_min_ratio", DEFAULT_CLIP_DEPTH_MIN_RATIO)
+            )
+        )
 
     def handle_visible_candidate(
         self,
@@ -103,7 +125,12 @@ class CandidateController:
 
         try:
             ground2d, l3_boxes, l3_best_idx = self._ground_2d(
-                scene, target_image, target_phrase, aliases, candidate
+                scene,
+                target_image,
+                target_phrase,
+                aliases,
+                candidate,
+                scene.all_depths.get(img_path) if hasattr(scene, "all_depths") else None,
             )
             if ground2d is None:
                 result = self._build_visual_approach_result(
@@ -190,6 +217,7 @@ class CandidateController:
         target_phrase: str,
         aliases: List[str],
         candidate: TargetCandidate,
+        depth_array=None,
     ) -> Tuple[Optional[Grounding2D], Optional[np.ndarray], Optional[int]]:
         l3_boxes = None
         l3_best_idx = None
@@ -222,30 +250,51 @@ class CandidateController:
             return None, None, None
 
         l3_boxes = result.boxes.xyxy.cpu().numpy()
-        best_idx, best_score = _clip_rerank_bbox(
+        best_idx, best_score, best_margin = _clip_rerank_bbox(
             scene, target_image, l3_boxes, target_phrase, aliases
         )
         l3_best_idx = best_idx
-        if best_score < self.clip_rerank_thresh:
+        best_depth_ratio = _bbox_valid_depth_ratio(depth_array, l3_boxes[best_idx])
+        if (
+            best_score < self.clip_rerank_thresh
+            or best_margin < self.clip_margin_thresh
+            or best_depth_ratio < self.clip_depth_min_ratio
+        ):
             logging.info(
                 f"[CandidateController] L3 CLIP rejected "
-                f"(score={best_score:.3f} < {self.clip_rerank_thresh})"
+                f"(score={best_score:.3f}, margin={best_margin:.3f}, "
+                f"depth={best_depth_ratio:.2f})"
             )
-            candidate.record_attempt(3, False, f"CLIP score {best_score:.3f}")
+            candidate.record_attempt(
+                3,
+                False,
+                (
+                    f"CLIP score {best_score:.3f}, margin {best_margin:.3f}, "
+                    f"depth {best_depth_ratio:.2f}"
+                ),
+            )
             return None, l3_boxes, l3_best_idx
 
         logging.info(
             f"[CandidateController] L3 class-agnostic + CLIP accepted "
-            f"(score={best_score:.3f})"
+            f"(score={best_score:.3f}, margin={best_margin:.3f}, "
+            f"depth={best_depth_ratio:.2f})"
         )
-        candidate.record_attempt(3, True, f"CLIP score {best_score:.3f}")
+        candidate.record_attempt(
+            3,
+            True,
+            (
+                f"CLIP score {best_score:.3f}, margin {best_margin:.3f}, "
+                f"depth {best_depth_ratio:.2f}"
+            ),
+        )
         return (
             Grounding2D(
                 source="class_agnostic_clip",
                 phrase=target_phrase,
                 bbox_xyxy=l3_boxes[best_idx].astype(int),
                 raw_score=float(best_score),
-                rank_score=1.0,
+                rank_score=float(best_margin),
                 conf=float(result.boxes.conf[best_idx].cpu().numpy()),
             ),
             l3_boxes,
@@ -601,22 +650,24 @@ def _clip_rerank_bbox(
     xyxy_np: np.ndarray,
     target_phrase: str,
     aliases: List[str],
-) -> Tuple[int, float]:
+) -> Tuple[int, float, float]:
     try:
         from src.conceptgraph.utils.model_utils import clip_recognition
     except Exception:
         clip_recognition = None
     if clip_recognition is None or scene.clip_model is None:
-        return 0, 0.0
+        return 0, 0.0, 0.0
     prompts = [target_phrase] + [
         alias for alias in aliases if alias.lower() != target_phrase.lower()
     ]
     best_idx, best_score = 0, -1.0
+    box_scores: List[float] = []
     for idx in range(len(xyxy_np)):
         x1, y1, x2, y2 = xyxy_np[idx].astype(int)
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(image_rgb.shape[1], x2), min(image_rgb.shape[0], y2)
         if x2 - x1 < 2 or y2 - y1 < 2:
+            box_scores.append(0.0)
             continue
         crop = image_rgb[y1:y2, x1:x2]
         best_for_box = 0.0
@@ -636,7 +687,32 @@ def _clip_rerank_bbox(
         if best_for_box > best_score:
             best_score = best_for_box
             best_idx = idx
-    return best_idx, best_score
+        box_scores.append(best_for_box)
+    sorted_scores = sorted(box_scores, reverse=True)
+    if len(sorted_scores) >= 2:
+        margin = sorted_scores[0] - sorted_scores[1]
+    elif sorted_scores:
+        margin = sorted_scores[0]
+    else:
+        margin = 0.0
+    return best_idx, best_score, float(margin)
+
+
+def _bbox_valid_depth_ratio(depth_array, bbox_xyxy) -> float:
+    if depth_array is None:
+        return 1.0
+    try:
+        depth = np.asarray(depth_array)
+        x1, y1, x2, y2 = [int(v) for v in bbox_xyxy[:4]]
+    except Exception:
+        return 0.0
+    h, w = depth.shape[:2]
+    x1, x2 = max(0, x1), min(w, x2)
+    y1, y2 = max(0, y1), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    crop = depth[y1:y2, x1:x2]
+    return float(np.count_nonzero(crop > 0) / max(crop.size, 1))
 
 
 def _select_navigation_corner(aabb, robot_position) -> np.ndarray:

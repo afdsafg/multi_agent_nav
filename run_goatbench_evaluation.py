@@ -45,12 +45,12 @@ from src.memory_structures import (
     NavigationMode,
     NavigationResult,
     NavStatus,
-    NavTargetKind,
     StepOutcome,
     SubtaskWorkingMemory,
     TargetViewpointIntent,
     VerifyStatus,
     VisualApproachIntent,
+    should_enter_verify,
 )
 import time
 
@@ -703,7 +703,6 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         )
                     if _nav_candidate is None and _wm is not None:
                         _nav_candidate = _wm.get_last_nav_candidate()
-                    _ntk = getattr(_nav_candidate, "nav_target_kind", None) if _nav_candidate is not None else None
                     if target_arrived and _nav_candidate is not None:
                         _nav_candidate.nav_status = NavStatus.REACHED
                     navigation_result = NavigationResult(
@@ -729,12 +728,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         intent=navigation_intent,
                         navigation_result=navigation_result,
                     )
-                    should_verify = (
-                        target_arrived
-                        and isinstance(navigation_intent, TargetViewpointIntent)
-                        and _nav_candidate is not None
-                        and _nav_candidate.nav_status == NavStatus.REACHED
-                        and _ntk == NavTargetKind.VIEWPOINT_POSE
+                    should_verify = should_enter_verify(
+                        target_arrived, navigation_intent, _nav_candidate
                     )
                     if should_verify:
                         subtask_metadata["navigation_mode"] = NavigationMode.VERIFY

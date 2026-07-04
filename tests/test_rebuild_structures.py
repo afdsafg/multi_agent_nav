@@ -2,6 +2,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -20,20 +21,25 @@ from src.memory_structures import (
     ExecutorActionMode,
     ExploreIntent,
     F_ACTIVE,
+    FrontierInstance,
     FrontierState,
     HypothesisBranch,
     HypothesisStatus,
     ImageAnchor,
+    NavStatus,
+    NavTargetKind,
     NavigationMode,
     NavigationResult,
     SpatialBranchRecord,
     StepOutcome,
     SubtaskWorkingMemory,
+    TargetCandidate,
     TargetViewpointIntent,
     TypedEvent,
     VerifyStatus,
     VisualApproachIntent,
     anchor_from_dict,
+    should_enter_verify,
 )
 
 
@@ -49,12 +55,22 @@ class FakeFrontier:
 class FakeTSDFPlanner:
     def __init__(self, frontiers):
         self.frontiers = frontiers
+        self.unexplored = np.ones((16, 16), dtype=bool)
+        self.unoccupied = np.zeros((16, 16), dtype=bool)
+        self.occupied = np.zeros((16, 16), dtype=bool)
+        self.frontier_map = np.zeros((16, 16), dtype=int)
 
     def voxel2habitat(self, position):
         arr = np.asarray(position, dtype=float)
         if arr.shape[0] == 2:
             return np.array([arr[0], 0.0, arr[1]], dtype=float)
         return arr.astype(float)
+
+    def habitat2voxel(self, position):
+        arr = np.asarray(position, dtype=float)
+        if arr.shape[0] >= 3:
+            return np.array([round(arr[0]), round(arr[2]), 0], dtype=int)
+        return np.array([round(arr[0]), round(arr[1]), 0], dtype=int)
 
 
 def _install_explore_utils_stub():
@@ -310,6 +326,277 @@ def test_branch_tracker_sync_and_eligibility_filter():
         max_reselect=2,
     )
     assert [inst.frontier_id for inst in eligible] == []
+
+
+def test_branch_tracker_stalled_revisiting_split_and_merge_v1():
+    tracker = BranchTracker(
+        BranchTrackerConfig(
+            match_distance_m=0.25,
+            stalled_progress_epsilon=0.05,
+            stalled_after_steps=2,
+            revisit_distance_m=0.4,
+            split_distance_m=0.4,
+            split_tip_distance_m=1.0,
+            split_after_steps=2,
+            merge_distance_m=0.5,
+        )
+    )
+    memory = SubtaskWorkingMemory()
+    planner = FakeTSDFPlanner([FakeFrontier(1, [0.0, 0.0, 0.0])])
+    tracker.sync_frontiers(planner, memory, step=1, current_position=[5.0, 0.0, 5.0])
+    branch = memory.get_branch_for_frontier(1)
+    assert branch is not None
+
+    planner.frontiers = [FakeFrontier(1, [0.01, 0.0, 0.01])]
+    tracker.sync_frontiers(planner, memory, step=2, current_position=[5.0, 0.0, 5.0])
+    planner.frontiers = [FakeFrontier(1, [0.01, 0.0, 0.01])]
+    _instances, events = tracker.sync_frontiers(
+        planner, memory, step=3, current_position=[5.0, 0.0, 5.0]
+    )
+    state = memory.branch_task_states[branch.spatial_branch_id]
+    assert state.status is BranchTaskStatus.STALLED
+    assert EventType.SPATIAL_BRANCH_STALLED in {event.type for event in events}
+
+    planner.frontiers = [FakeFrontier(1, [1.5, 0.0, 0.0])]
+    _instances, events = tracker.sync_frontiers(
+        planner, memory, step=4, current_position=[0.0, 0.0, 0.0]
+    )
+    state = memory.branch_task_states[branch.spatial_branch_id]
+    assert state.status is BranchTaskStatus.REVISITING
+    assert EventType.SPATIAL_BRANCH_REVISITING in {event.type for event in events}
+
+    planner.frontiers = [FakeFrontier(2, [0.05, 0.0, 0.0])]
+    instances, _events = tracker.sync_frontiers(
+        planner, memory, step=5, current_position=[5.0, 0.0, 5.0]
+    )
+    assert instances[0].spatial_branch_id == branch.spatial_branch_id
+    planner.frontiers = [FakeFrontier(2, [0.05, 0.0, 0.0])]
+    instances, _events = tracker.sync_frontiers(
+        planner, memory, step=6, current_position=[5.0, 0.0, 5.0]
+    )
+    split_branch = memory.get_branch_for_frontier(2)
+    assert split_branch is not None
+    assert split_branch.spatial_branch_id != branch.spatial_branch_id
+    assert f"split_from:{branch.spatial_branch_id}" in split_branch.aliases
+    assert instances[0].spatial_branch_id == split_branch.spatial_branch_id
+
+    merge_memory = SubtaskWorkingMemory()
+    merge_tracker = BranchTracker(BranchTrackerConfig(match_distance_m=0.25, merge_distance_m=0.5))
+    b1 = SpatialBranchRecord(
+        spatial_branch_id="B001",
+        frontier_ids=[10],
+        spine=[[0.0, 0.0, 0.0]],
+        active_tip_frontier_id=10,
+    )
+    b2 = SpatialBranchRecord(
+        spatial_branch_id="B002",
+        frontier_ids=[20],
+        spine=[[0.2, 0.0, 0.1]],
+        active_tip_frontier_id=20,
+    )
+    merge_memory.upsert_spatial_branch(b1)
+    merge_memory.upsert_spatial_branch(b2)
+    merge_planner = FakeTSDFPlanner([FakeFrontier(20, [0.25, 0.0, 0.1])])
+    merge_tracker.sync_frontiers(
+        merge_planner, merge_memory, step=2, current_position=[3.0, 0.0, 3.0]
+    )
+    assert merge_memory.spatial_branches["B001"].merged_into == "B002"
+    assert "merged_into:B002" in merge_memory.spatial_branches["B001"].aliases
+
+
+def test_bev_renderer_uses_tsdf_state_and_frontier_labels():
+    from src.spatial_context import render_bev_context
+
+    planner = FakeTSDFPlanner([])
+    planner.unexplored[:, :] = True
+    planner.unexplored[1:8, 1:8] = False
+    planner.unoccupied[2:7, 2:7] = True
+    planner.occupied[4, 4] = True
+    frontier = FrontierInstance(
+        frontier_id=10,
+        position=[5.0, 0.0, 5.0],
+        spatial_branch_id="B001",
+    )
+
+    bev = render_bev_context(
+        planner,
+        current_pose=[2.0, 0.0, 2.0],
+        current_yaw=0.0,
+        frontier_instances=[frontier],
+        recent_decision_poses=[[3.0, 0.0, 3.0]],
+    )
+
+    assert bev.image.shape == (512, 512, 3)
+    assert "F_010/B001" in bev.labels
+    assert len(np.unique(bev.image.reshape(-1, 3), axis=0)) > 1
+
+
+def test_verify_gate_only_allows_reached_target_viewpoint():
+    candidate = TargetCandidate(
+        candidate_id="C001",
+        subtask_id="task",
+        image_path="1-view_0.png",
+        source_step=1,
+        camera_pose=np.eye(4),
+        view_yaw=0.0,
+        target_phrase="chair",
+    )
+    target_intent = TargetViewpointIntent(
+        candidate_id="C001",
+        image_path="1-view_0.png",
+        target_phrase="chair",
+        target_xyz=[1.0, 0.0, 2.0],
+    )
+    visual_intent = VisualApproachIntent(
+        candidate_id="C001",
+        image_path="1-view_0.png",
+        target_phrase="chair",
+        approach_xyz=[1.0, 0.0, 2.0],
+    )
+    candidate.nav_target_kind = NavTargetKind.VIEWPOINT_POSE
+    candidate.nav_status = NavStatus.REACHED
+
+    assert should_enter_verify(True, target_intent, candidate) is True
+    assert should_enter_verify(False, target_intent, candidate) is False
+    assert should_enter_verify(True, visual_intent, candidate) is False
+    assert should_enter_verify(True, ExploreIntent(frontier_id=1), candidate) is False
+    candidate.nav_target_kind = NavTargetKind.VISUAL_APPROACH_POSE
+    assert should_enter_verify(True, target_intent, candidate) is False
+
+
+def test_candidate_controller_visual_approach_does_not_enter_verify():
+    from src.candidate_controller import CandidateController
+
+    memory = SubtaskWorkingMemory()
+    candidate = memory.get_or_create_candidate(
+        image_path="1-view_0.png",
+        target_phrase="chair",
+        source_step=1,
+        camera_pose=np.eye(4),
+        view_yaw=0.0,
+    )
+    controller = CandidateController(SimpleNamespace(AVU_conf_threshold=0.1, dicision_radius=1.0))
+    result = controller._evidence_pose_fallback(
+        working_memory=memory,
+        candidate=candidate,
+        img_path="1-view_0.png",
+        target_phrase="chair",
+        cam_pose=np.eye(4),
+        step_index=1,
+        reason="no 3D grounding",
+    )
+
+    assert isinstance(result.intent, VisualApproachIntent)
+    assert candidate.nav_target_kind is NavTargetKind.VISUAL_APPROACH_POSE
+    assert candidate.nav_status is NavStatus.PLANNED
+    assert should_enter_verify(True, result.intent, candidate) is False
+
+
+def test_candidate_clip_gate_uses_raw_margin_depth_and_does_not_mutate_boxes():
+    import torch
+    import src.candidate_controller as controller_module
+    import src.conceptgraph.utils.model_utils as model_utils
+    from src.candidate_controller import CandidateController
+
+    class FakeBoxes:
+        def __init__(self, xyxy, conf):
+            self.xyxy = torch.as_tensor(xyxy, dtype=torch.float32)
+            self.conf = torch.as_tensor(conf, dtype=torch.float32)
+
+        def __len__(self):
+            return int(self.xyxy.shape[0])
+
+    class FakeResult:
+        def __init__(self, xyxy, conf):
+            self.boxes = FakeBoxes(xyxy, conf)
+
+    class FakeDetectionModel:
+        def __init__(self, boxes):
+            self.boxes = boxes
+            self.classes = []
+
+        def set_classes(self, classes):
+            self.classes = list(classes)
+
+        def predict(self, image_rgb, conf=0.0, verbose=False):
+            if self.classes == controller_module.GENERIC_CLASSES:
+                return [FakeResult(self.boxes, [0.8, 0.7])]
+            return []
+
+    class FakeObjClasses:
+        def get_classes_arr(self):
+            return ["chair"]
+
+    boxes = np.array([[1, 1, 4, 4], [6, 6, 10, 10]], dtype=float)
+    original_boxes = boxes.copy()
+    scene = SimpleNamespace(
+        detection_model=FakeDetectionModel(boxes),
+        obj_classes=FakeObjClasses(),
+        clip_model=object(),
+        clip_tokenizer=object(),
+        clip_preprocess=object(),
+    )
+    image = np.zeros((12, 12, 3), dtype=np.uint8)
+    depth = np.ones((12, 12), dtype=float)
+    candidate = TargetCandidate(
+        candidate_id="C001",
+        subtask_id="task",
+        image_path="1-view_0.png",
+        source_step=1,
+        camera_pose=np.eye(4),
+        view_yaw=0.0,
+        target_phrase="chair",
+    )
+
+    old_clip = model_utils.clip_recognition
+
+    def fake_clip(_model, _tokenizer, _preprocess, crop, _prompt):
+        return np.array([0.9 if crop.shape[0] == 3 else 0.2], dtype=float)
+
+    model_utils.clip_recognition = fake_clip
+    try:
+        controller = CandidateController(
+            SimpleNamespace(AVU_conf_threshold=0.1, dicision_radius=1.0),
+            clip_rerank_thresh=0.5,
+            clip_margin_thresh=0.3,
+            clip_depth_min_ratio=0.8,
+        )
+        ground2d, l3_boxes, best_idx = controller._ground_2d(
+            scene,
+            image,
+            "chair",
+            ["chair"],
+            candidate,
+            depth_array=depth,
+        )
+        assert ground2d is not None
+        assert best_idx == 0
+        assert ground2d.raw_score == 0.9
+        assert abs(ground2d.rank_score - 0.7) < 1e-6
+        assert np.array_equal(l3_boxes, original_boxes)
+
+        zero_depth_candidate = TargetCandidate(
+            candidate_id="C002",
+            subtask_id="task",
+            image_path="1-view_0.png",
+            source_step=1,
+            camera_pose=np.eye(4),
+            view_yaw=0.0,
+            target_phrase="chair",
+        )
+        rejected, _l3, rejected_idx = controller._ground_2d(
+            scene,
+            image,
+            "chair",
+            ["chair"],
+            zero_depth_candidate,
+            depth_array=np.zeros_like(depth),
+        )
+        assert rejected is None
+        assert rejected_idx == 0
+        assert "depth 0.00" in zero_depth_candidate.grounding_attempts[-1].reason
+    finally:
+        model_utils.clip_recognition = old_clip
 
 
 def test_agent_json_parsers_fail_safe_without_random_frontier():
