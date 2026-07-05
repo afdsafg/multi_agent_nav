@@ -385,9 +385,11 @@ def format_answerer_prompt(
         sys_prompt += (
             "   - This is a DESCRIPTION task: find the target object named in "
             "the description. Treat location, containment, support, adjacency, "
-            "and attributes as contextual constraints for disambiguation. If "
-            "the object category is visible but the context is only partially "
-            "verified, use CANDIDATE_VISIBLE instead of NOT_FOUND.\n"
+            "and attributes as contextual constraints for disambiguation, not "
+            "as reasons to hide a visible category match. If the object "
+            "category is visible, relation or location uncertainty alone must "
+            "not produce NOT_FOUND; use CANDIDATE_VISIBLE unless another "
+            "visible candidate is clearly better.\n"
         )
     elif task_type == "image":
         sys_prompt += (

@@ -337,8 +337,9 @@ def test_description_prompts_use_candidate_when_context_is_uncertain():
         )
 
         assert "contextual constraints for disambiguation" in answerer_sys
-        assert "use CANDIDATE_VISIBLE instead of NOT_FOUND" in answerer_sys
-        assert "context/relationship is not fully verified" in answerer_sys
+        assert "not as reasons to hide a visible category match" in answerer_sys
+        assert "relation or location uncertainty alone must not produce NOT_FOUND" in answerer_sys
+        assert "use CANDIDATE_VISIBLE unless another visible candidate is clearly better" in answerer_sys
         assert "agent can only navigate and observe" in planner_sys
         assert "opening, moving, manipulating, or interacting" in planner_sys
         assert "finding a better viewpoint" in planner_sys
