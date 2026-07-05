@@ -37,148 +37,11 @@ from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
 from src.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
 from src.dataset_utils import prepare_goatbench_navigation_goals
-from src.query_vlm import query_vlm_for_verify, query_vlm_multi_agent
-from src.event_engine import EventEngine, EventEngineConfig
+from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end, query_vlm_multi_agent
 from src.long_term_memory import TextLongTermMemory
 from src.logger_goatbench import Logger
-from src.memory_structures import (
-    ExploreIntent,
-    NavigationMode,
-    NavigationResult,
-    NavStatus,
-    S_GROUNDED_3D,
-    S_NEED_CLOSER_VIEW,
-    StepOutcome,
-    SubtaskWorkingMemory,
-    TargetViewpointIntent,
-    VerifyStatus,
-    VisualApproachIntent,
-    should_enter_verify,
-)
+from src.memory_structures import SubtaskWorkingMemory, NavTargetKind, NavStatus
 import time
-
-
-def _get_event_engine(working_memory):
-    if working_memory is None:
-        return None
-    event_engine = getattr(working_memory, "_event_engine", None)
-    if event_engine is None:
-        event_engine = EventEngine(EventEngineConfig())
-        setattr(working_memory, "_event_engine", event_engine)
-    return event_engine
-
-
-def _record_navigation_events(working_memory, navigation_result):
-    event_engine = _get_event_engine(working_memory)
-    if event_engine is None:
-        return []
-    return event_engine.detect_navigation_events(
-        navigation_result,
-        working_memory=working_memory,
-    )
-
-
-def _explored_mask_2d(tsdf_planner):
-    vol = getattr(tsdf_planner, "_explore_vol_cpu", None)
-    if vol is None:
-        return None
-    arr = np.asarray(vol)
-    if arr.ndim == 3:
-        return np.any(arr > 0, axis=-1)
-    if arr.ndim == 2:
-        return arr > 0
-    return None
-
-
-def _area_delta_m2(before_mask, after_mask, voxel_size) -> float:
-    if before_mask is None or after_mask is None:
-        return 0.0
-    before = np.asarray(before_mask).astype(bool)
-    after = np.asarray(after_mask).astype(bool)
-    if before.shape != after.shape:
-        return 0.0
-    new_cells = np.logical_and(after, np.logical_not(before))
-    return float(np.count_nonzero(new_cells) * (float(voxel_size) ** 2))
-
-
-def _new_free_space_delta_m2(before_mask, after_mask, tsdf_planner) -> float:
-    if before_mask is None or after_mask is None:
-        return 0.0
-    free = getattr(tsdf_planner, "unoccupied", None)
-    if free is None:
-        return 0.0
-    before = np.asarray(before_mask).astype(bool)
-    after = np.asarray(after_mask).astype(bool)
-    free = np.asarray(free).astype(bool)
-    if before.shape != after.shape or after.shape != free.shape:
-        return 0.0
-    new_free = np.logical_and.reduce((after, np.logical_not(before), free))
-    voxel_size = float(getattr(tsdf_planner, "_voxel_size", 0.0) or 0.0)
-    return float(np.count_nonzero(new_free) * (voxel_size ** 2))
-
-
-def _branch_outcome_metrics(working_memory, navigation_intent):
-    if working_memory is None or not isinstance(navigation_intent, ExploreIntent):
-        return 0.0, 0.0, False
-    branch_id = navigation_intent.spatial_branch_id
-    if not branch_id:
-        return 0.0, 0.0, False
-    state = working_memory.branch_task_states.get(branch_id)
-    if state is None:
-        return 0.0, 0.0, False
-    return (
-        float(getattr(state, "recent_spatial_gain", 0.0) or 0.0),
-        float(getattr(state, "recent_region_overlap", 0.0) or 0.0),
-        bool(getattr(state, "reversal_count", 0) > 0),
-    )
-
-
-def _intent_goal_and_label(navigation_intent):
-    if isinstance(navigation_intent, VisualApproachIntent):
-        return navigation_intent.approach_xyz, navigation_intent.image_path
-    if isinstance(navigation_intent, TargetViewpointIntent):
-        return navigation_intent.target_xyz, navigation_intent.image_path
-    return None, None
-
-
-def _apply_verify_failure_transition(
-    subtask_metadata,
-    verify_status,
-    navigation_intent,
-    candidate,
-):
-    if (
-        verify_status == VerifyStatus.POOR_VIEW
-        and isinstance(navigation_intent, TargetViewpointIntent)
-        and candidate is not None
-        and candidate.status == S_GROUNDED_3D
-    ):
-        target_xyz = (
-            candidate.nav_goal_xyz
-            if candidate.nav_goal_xyz is not None
-            else navigation_intent.target_xyz
-        )
-        retry_intent = TargetViewpointIntent(
-            candidate_id=candidate.candidate_id,
-            image_path=candidate.image_path,
-            target_phrase=candidate.target_phrase,
-            target_xyz=target_xyz,
-            target_yaw=candidate.nav_goal_yaw,
-            viewpoint_id=navigation_intent.viewpoint_id,
-            reason_code="VERIFY_POOR_VIEW_RETRY",
-            reason="VERIFY returned POOR_VIEW; retry target viewpoint approach.",
-        )
-        candidate.nav_status = NavStatus.PLANNED
-        subtask_metadata["navigation_intent"] = retry_intent
-        subtask_metadata["navigation_mode"] = NavigationMode.TARGET_APPROACH
-        return
-
-    if verify_status == VerifyStatus.TARGET_NOT_VISIBLE and candidate is not None:
-        candidate.status = S_NEED_CLOSER_VIEW
-        candidate.nav_status = NavStatus.FAILED
-
-    subtask_metadata["navigation_intent"] = None
-    subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
 
 
 class Timer:
@@ -399,10 +262,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     tsdf_planner=tsdf_planner,
                 )
 
-                # Rebuild flow: carry hypothesis/search state and reset
-                # snapshot/frontier task scope.
+                # multi-agent: carry high-level plan + reset snapshot/frontier state.
                 # is_new_subtask is set per-step in the main loop (L451-454).
-                # M4: pass episode_memory reference so Hypothesis Manager can
+                # M4: pass episode_memory reference so High-Level Planner can
                 # retrieve step summaries via subtask_metadata -> step_dict
                 subtask_metadata['episode_memory'] = episode_memory
                 # Phase H: explicit working memory reset + plan clear.
@@ -414,7 +276,6 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 )
                 subtask_metadata['working_memory'] = working_memory
                 subtask_metadata['high_level_plan'] = None  # do NOT inherit plan
-                subtask_metadata['decision_pose_history'] = []
                 scene.image_pool = None
                 if hasattr(episode_memory, 'start_new_subtask'):
                     episode_memory.start_new_subtask(subtask_id)
@@ -427,6 +288,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
                 # run steps
                 task_success = False
+                task_check_obs = []
                 cnt_step = -1
                 his_decision = {}
                 subtask_metadata['CLR'] = his_decision
@@ -452,14 +314,6 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
                 while cnt_step < num_step - 1:
                     decision = {}
-                    navigation_intent = subtask_metadata.get("navigation_intent")
-                    navigation_mode = subtask_metadata.get("navigation_mode", NavigationMode.EXPLORE)
-                    target_type = (
-                        navigation_mode.value
-                        if navigation_intent is not None
-                        else "frontier"
-                    )
-                    max_point_choice = None
 
                     cnt_step += 1
                     global_step += 1
@@ -624,43 +478,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         else:
                             subtask_metadata['is_new_subtask'] = False
 
-                        # Direct-replacement rebuild path: GOAT evaluation always
-                        # uses the typed multi-agent flow, with no legacy feature
-                        # flag fallback.
-                        subtask_metadata['current_step'] = global_step
-                        subtask_metadata['current_yaw'] = angle
-                        decision_history = subtask_metadata.setdefault(
-                            'decision_pose_history', []
-                        )
-                        decision_history.append(np.asarray(pts).tolist())
-                        if len(decision_history) > 12:
-                            del decision_history[:-12]
-                        pending_intent = subtask_metadata.get("navigation_intent")
-                        pending_mode = subtask_metadata.get("navigation_mode")
-                        if (
-                            isinstance(
-                                pending_intent,
-                                (VisualApproachIntent, TargetViewpointIntent),
-                            )
-                            and pending_mode in (
-                                NavigationMode.VISUAL_APPROACH,
-                                NavigationMode.TARGET_APPROACH,
-                            )
-                        ):
-                            pending_goal, pending_label = _intent_goal_and_label(
-                                pending_intent
-                            )
-                            vlm_response = (
-                                pending_intent,
-                                pending_goal,
-                                0,
-                                pending_label,
-                            )
-                            logging.info(
-                                f"[navigation] reusing pending "
-                                f"{pending_mode.value} intent"
-                            )
-                        else:
+                        if cfg.get('use_multi_agent', False):
+                            # F4: set current_step so multi-agent pipeline + obs keys align
+                            subtask_metadata['current_step'] = global_step
                             vlm_response = query_vlm_multi_agent(
                                 subtask_metadata=subtask_metadata,
                                 scene=scene,
@@ -670,22 +490,32 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                 pts=pts,
                                 verbose=True,
                             )
-                        # update high-level plan in subtask_metadata + episode_memory
-                        if vlm_response is not None and hasattr(episode_memory, 'add_entry'):
-                            hlp = subtask_metadata.get('high_level_plan', None)
-                            # C4: defensive - hlp may be TextMemoryEntry, extract .content
-                            if hasattr(hlp, 'content'):
-                                hlp = hlp.content
-                            if hlp is not None:
-                                episode_memory.add_entry(
-                                    content=hlp,
-                                    entry_type='high_level_planner_output',
-                                    step=cnt_step,
-                                )
+                            # update high-level plan in subtask_metadata + episode_memory
+                            if vlm_response is not None and hasattr(episode_memory, 'add_entry'):
+                                hlp = subtask_metadata.get('high_level_plan', None)
+                                # C4: defensive - hlp may be TextMemoryEntry, extract .content
+                                if hasattr(hlp, 'content'):
+                                    hlp = hlp.content
+                                if hlp is not None:
+                                    episode_memory.add_entry(
+                                        content=hlp,
+                                        entry_type='high_level_planner_output',
+                                        step=cnt_step,
+                                    )
+                        else:
+                            vlm_response = query_vlm_for_response(
+                                subtask_metadata=subtask_metadata,
+                                scene=scene,
+                                tsdf_planner=tsdf_planner,
+                                rgb_egocentric_views=rgb_egocentric_views,
+                                cfg=cfg,
+                                pts = pts,
+                                verbose=True,
+                            )
                         if vlm_response is None:
                             n_filtered_frames = 0
                             logging.info(
-                                f"Subtask id {subtask_id} invalid: query_vlm_multi_agent failed!"
+                                f"Subtask id {subtask_id} invalid: query_vlm_for_response failed!"
                             )
                             # M5: record high-level plan before break
                             hlp_break = subtask_metadata.get('high_level_plan')
@@ -703,53 +533,17 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             break
 
                         target_type, max_point_choice, n_filtered_frames, target_index = vlm_response
-                        navigation_intent = (
-                            target_type
-                            if isinstance(
-                                target_type,
-                                (ExploreIntent, VisualApproachIntent, TargetViewpointIntent),
-                            )
-                            else None
-                        )
-                        if navigation_intent is None and target_type == "frontier":
-                            try:
-                                frontier_id = int(getattr(max_point_choice, 'frontier_id', -1))
-                            except (TypeError, ValueError):
-                                frontier_id = -1
-                            if frontier_id >= 0:
-                                wm = subtask_metadata.get("working_memory", None)
-                                branch = wm.get_branch_for_frontier(frontier_id) if wm is not None else None
-                                navigation_intent = ExploreIntent(
-                                    mode=NavigationMode.EXPLORE,
-                                    frontier_id=frontier_id,
-                                    spatial_branch_id=branch.spatial_branch_id if branch else None,
-                                    reason_code="EXECUTOR_FRONTIER",
-                                )
-                        navigation_mode = (
-                            navigation_intent.mode
-                            if navigation_intent is not None
-                            else (
-                                NavigationMode.EXPLORE
-                                if target_type == "frontier"
-                                else NavigationMode.TARGET_APPROACH
-                            )
-                        )
-                        subtask_metadata["navigation_intent"] = navigation_intent
-                        subtask_metadata["navigation_mode"] = navigation_mode
-                        decision['navigation_mode'] = navigation_mode.value
-                        decision['target_type'] = (
-                            target_type if isinstance(target_type, str)
-                            else navigation_mode.value
-                        )
+                        decision['target_type'] = target_type
                         decision['max_point_choice'] = target_index
-                        if navigation_intent is not None:
-                            decision['navigation_intent'] = navigation_intent.to_dict()
-                        # Record current frontier instance id for this decision.
-                        if isinstance(navigation_intent, ExploreIntent) and navigation_intent.frontier_id is not None:
-                            decision['frontier_id'] = int(navigation_intent.frontier_id)
+                        # Phase B: record stable frontier_id for frontier decisions
+                        if target_type == "frontier" and max_point_choice is not None:
+                            try:
+                                decision['frontier_id'] = int(getattr(max_point_choice, 'frontier_id', -1))
+                            except (TypeError, ValueError):
+                                decision['frontier_id'] = -1
                         # set the vlm choice as the navigation target
                         update_success = tsdf_planner.set_next_navigation_point(
-                            target_type = navigation_intent if navigation_intent is not None else target_type,
+                            target_type = target_type, 
                             choice=max_point_choice,
                             pts=pts,
                             objects=scene.objects,
@@ -770,13 +564,9 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     # (5) Agent navigate to the target point for one step
 
                     mpc_for_agent_step = None
-                    if isinstance(navigation_intent, (VisualApproachIntent, TargetViewpointIntent)):
-                        mpc_for_agent_step = max_point_choice
-                    elif target_type == "image" or target_type == "object":############# draw max_point_choice only when target is image or object
+                    if target_type == "image" or target_type == "object":############# draw max_point_choice only when target is image or object
                         mpc_for_agent_step = max_point_choice
 
-                    pts_before_step = np.asarray(pts).copy()
-                    explored_before_step = _explored_mask_2d(tsdf_planner)
                     return_values = tsdf_planner.agent_step(
                         pts=pts,
                         angle=angle,
@@ -796,34 +586,28 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
                     # update agent's position and rotation
                     pts, angle, pts_voxel, fig, _, target_arrived = return_values
-                    explored_after_step = _explored_mask_2d(tsdf_planner)
-                    distance_moved = float(
-                        np.linalg.norm(np.asarray(pts) - pts_before_step)
-                    )
-                    explored_area_delta = _area_delta_m2(
-                        explored_before_step,
-                        explored_after_step,
-                        getattr(tsdf_planner, "_voxel_size", 0.0),
-                    )
-                    new_free_space_delta = _new_free_space_delta_m2(
-                        explored_before_step,
-                        explored_after_step,
-                        tsdf_planner,
-                    )
-                    (
-                        branch_progress_delta,
-                        recent_region_overlap,
-                        trajectory_reversal,
-                    ) = _branch_outcome_metrics(
-                        subtask_metadata.get("working_memory", None),
-                        navigation_intent,
-                    )
 
 
                     logger.log_step(pts_voxel=pts_voxel)
                     logging.info(
                         f"Current position: {pts}, {logger.subtask_explore_dist:.3f}"
                     )
+
+                    # Phase B/F: frontier reached -> mark + feedback
+                    if target_type == "frontier" and target_arrived:
+                        fid = decision.get("frontier_id", -1)
+                        if fid is not None and fid >= 0:
+                            tsdf_planner.mark_frontier_result(fid, "NO_NEW_INFO")
+                            wm = subtask_metadata.get("working_memory", None)
+                            if wm is not None:
+                                wm.mark_frontier_reached(fid, "NO_NEW_INFO")
+                                wm.add_feedback(
+                                    step=cnt_step,
+                                    type_="FRONTIER_NO_INFO",
+                                    reason=f"Frontier F_{int(fid):03d} reached, no new target info",
+                                    frontier_id=int(fid),
+                                    suggested_fix="select a different frontier",
+                                )
 
                     # sanity check about objects, scene graph, ...
                     scene.sanity_check(cfg=cfg)
@@ -850,137 +634,77 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 
                     timer.print_summary(logging)
                     # (6) Check if the agent has arrived at the target to finish the question
-                    # Final verification: only VIEWPOINT_POSE arrival enters
-                    # Answerer VERIFY mode. Visual-approach arrivals re-observe
-                    # on the next loop iteration and never verify directly.
+                    # Final verification: use VLM to confirm the reached target
+                    # Report §AVU→VVD→task_check: only VIEWPOINT_POSE arrival
+                    # triggers task_check. Evidence-pose / visual-approach arrival
+                    # re-observes (next loop iteration re-queries VLM).
                     _wm = subtask_metadata.get("working_memory", None)
-                    _nav_candidate = None
-                    if _wm is not None and isinstance(navigation_intent, TargetViewpointIntent):
-                        _nav_candidate = _wm.target_candidates.get(
-                            navigation_intent.candidate_id
-                        )
-                    if _nav_candidate is None and _wm is not None:
-                        _nav_candidate = _wm.get_last_nav_candidate()
+                    _nav_candidate = _wm.get_last_nav_candidate() if _wm is not None else None
+                    _ntk = getattr(_nav_candidate, "nav_target_kind", None) if _nav_candidate is not None else None
                     if target_arrived and _nav_candidate is not None:
                         _nav_candidate.nav_status = NavStatus.REACHED
-                    navigation_result = NavigationResult(
-                        mode=navigation_mode,
-                        success=return_values[0] is not None,
-                        target_arrived=target_arrived,
-                        intent=navigation_intent,
-                        frontier_id=(
-                            navigation_intent.frontier_id
-                            if isinstance(navigation_intent, ExploreIntent)
-                            else None
-                        ),
-                        candidate_id=(
-                            navigation_intent.candidate_id
-                            if isinstance(navigation_intent, (VisualApproachIntent, TargetViewpointIntent))
-                            else None
-                        ),
-                        step=global_step,
-                    )
-                    subtask_metadata["last_step_outcome"] = StepOutcome(
-                        step=global_step,
-                        mode=navigation_mode,
-                        intent=navigation_intent,
-                        distance_moved=distance_moved,
-                        explored_area_delta=explored_area_delta,
-                        new_free_space_delta=new_free_space_delta,
-                        branch_progress_delta=branch_progress_delta,
-                        recent_region_overlap=recent_region_overlap,
-                        trajectory_reversal=trajectory_reversal,
-                        semantic_updates=subtask_metadata.get(
-                            "last_evidence_updates", []
-                        ),
-                        navigation_result=navigation_result,
-                    )
-                    nav_events_recorded = False
-                    should_verify = should_enter_verify(
-                        target_arrived, navigation_intent, _nav_candidate
-                    )
-                    if should_verify:
-                        subtask_metadata["navigation_mode"] = NavigationMode.VERIFY
+                    # Gate task_check: VIEWPOINT_POSE reached, OR legacy fallback
+                    # when no working_memory/candidate (target_type != frontier).
+                    if (
+                        target_arrived
+                        and (
+                            (
+                                _nav_candidate is not None
+                                and _nav_candidate.nav_status == NavStatus.REACHED
+                                and _ntk == NavTargetKind.VIEWPOINT_POSE
+                            )
+                            or (_nav_candidate is None and target_type != "frontier")
+                        )
+                    ):
                         back_frames = min(cnt_step + 1, cfg.frames_to_check)
-                        verify_obs_frames = {}
+                        task_check_obs_frames = {}
                         for back_step in range(global_step, global_step - back_frames, -1):
-                            verify_obs = []
+                            task_check_obs = []
                             for view_idx in range(7):
                                 obs_file_name = f"{back_step}-view_{view_idx}.png"
                                 if obs_file_name not in scene.all_observations.keys():
                                     break
-                                verify_obs.append(
+                                task_check_obs.append(
                                     resize_image(scene.all_observations[obs_file_name], cfg.prompt_h, cfg.prompt_w)
                                 )
-                            verify_obs_frames[global_step - back_step + 1] = verify_obs.copy()
-                        verify_status, verify_reason = query_vlm_for_verify(
+                            task_check_obs_frames[global_step - back_step + 1] = task_check_obs.copy()
+                        vlm_response, tc_reason = query_vlm_for_response_end(
                             subtask_metadata=subtask_metadata,
-                            rgb_egocentric_views=verify_obs_frames,
+                            rgb_egocentric_views=task_check_obs_frames,
                             cfg=cfg,
                             verbose=True,
                         )
-                        navigation_result.verify_status = verify_status
-                        subtask_metadata["last_step_outcome"].verification_result = verify_status
-                        if verify_status == VerifyStatus.SUCCESS:
-                            subtask_metadata["last_step_outcome"].done = True
+                        if (vlm_response == 'yes'):
+                            # Phase F: record success feedback
                             wm = subtask_metadata.get("working_memory", None)
                             if wm is not None:
                                 wm.add_feedback(
                                     step=cnt_step,
-                                    type_="VERIFY_PASS",
-                                    reason=verify_reason or "target confirmed",
+                                    type_="TASK_CHECK_PASS",
+                                    reason=tc_reason or "target confirmed",
                                     suggested_fix="",
                                 )
                                 for c in list(wm.target_candidates.values()):
                                     if c.status == "GROUNDED_3D":
                                         wm.release_after_navigation(c.candidate_id)
-                                        logging.info(f"[VERIFY] released pinned candidate {c.candidate_id} after nav success")
-                            _record_navigation_events(_wm, navigation_result)
-                            nav_events_recorded = True
-                            subtask_metadata["navigation_intent"] = None
-                            subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
+                                        logging.info(f"[Phase2] released pinned candidate {c.candidate_id} after nav success")
                             break
                         else:
-                            decision['verify_status'] = verify_status.value
+                            decision['object_judge'] = "no"
+                            # Phase F: record failure feedback with reason
                             wm = subtask_metadata.get("working_memory", None)
                             if wm is not None:
-                                if verify_status == VerifyStatus.WRONG_INSTANCE:
-                                    if _nav_candidate is not None:
-                                        wm.reject_candidate_by_vlm(
-                                            _nav_candidate.image_path,
-                                            f"VERIFY rejected at step {cnt_step}",
-                                        )
-                                        logging.info(
-                                            f"[VERIFY] rejected candidate "
-                                            f"{_nav_candidate.candidate_id} "
-                                            f"(wrong instance)"
-                                        )
+                                for c in list(wm.target_candidates.values()):
+                                    if c.status == "GROUNDED_3D":
+                                        wm.reject_candidate_by_vlm(c.image_path, f"task_check rejected at step {cnt_step}")
+                                        logging.info(f"[Phase2] rejected candidate {c.candidate_id} (wrong instance)")
+                                        break
                                 wm.add_feedback(
                                     step=cnt_step,
-                                    type_="VERIFY_FAIL",
-                                    reason=verify_reason or "VERIFY rejected",
-                                    suggested_fix=(
-                                        "rotate toward target / use VVD viewpoint"
-                                        if verify_status == VerifyStatus.POOR_VIEW
-                                        else "reject candidate, search for other instances"
-                                    ),
+                                    type_="TASK_CHECK_FAIL",
+                                    reason=tc_reason or "task_check rejected",
+                                    suggested_fix="rotate toward target / use VVD viewpoint",
                                 )
-                            _record_navigation_events(_wm, navigation_result)
-                            nav_events_recorded = True
-                            _apply_verify_failure_transition(
-                                subtask_metadata,
-                                verify_status,
-                                navigation_intent,
-                                _nav_candidate,
-                            )
-                    elif target_arrived and navigation_intent is not None:
-                        # Frontier and visual-approach arrivals re-enter
-                        # EXPLORE after the next observation; they never
-                        # trigger verification directly.
-                        subtask_metadata["navigation_intent"] = None
-                        subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
-                    if not nav_events_recorded:
-                        _record_navigation_events(_wm, navigation_result)
 
                     his_decision[cnt_step] = decision
 

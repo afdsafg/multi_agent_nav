@@ -2,7 +2,7 @@
 
 Implements the three memory layers from 诊断.md:
 - TargetCandidate: VLM-confirmed target with multi-level grounding state
-- FrontierState: current frontier bookkeeping for prompt/context signals
+- FrontierState: stable frontier identity with exploration status
 - FeedbackEvent: failure reason that closes the loop back to agents
 - SubtaskWorkingMemory: per-subtask scratch space (reset each subtask,
   long-term scene graph / all_observations live elsewhere and are NOT
@@ -10,11 +10,9 @@ Implements the three memory layers from 诊断.md:
 """
 from __future__ import annotations
 
-import json
-import re
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -50,754 +48,6 @@ class CandidateState(Enum):
     SUCCEEDED = auto()
     REJECTED = auto()
     EXPIRED = auto()
-
-
-class NavigationMode(Enum):
-    EXPLORE = "EXPLORE"
-    VISUAL_APPROACH = "VISUAL_APPROACH"
-    TARGET_APPROACH = "TARGET_APPROACH"
-    VERIFY = "VERIFY"
-    STOP = "STOP"
-
-
-class BranchTaskStatus(Enum):
-    NEW = "NEW"
-    ADVANCING = "ADVANCING"
-    STALLED = "STALLED"
-    REVISITING = "REVISITING"
-    CLOSED = "CLOSED"
-
-
-class HypothesisStatus(Enum):
-    PENDING = "PENDING"
-    ACTIVE = "ACTIVE"
-    SUPPORTED = "SUPPORTED"
-    REJECTED = "REJECTED"
-    DONE = "DONE"
-    CONFIRMED = "CONFIRMED"
-
-
-class EventType(Enum):
-    SPATIAL_BRANCH_CREATED = "SPATIAL_BRANCH_CREATED"
-    SPATIAL_BRANCH_ADVANCED = "SPATIAL_BRANCH_ADVANCED"
-    SPATIAL_BRANCH_STALLED = "SPATIAL_BRANCH_STALLED"
-    SPATIAL_BRANCH_REVISITING = "SPATIAL_BRANCH_REVISITING"
-    TRAJECTORY_LOOP = "TRAJECTORY_LOOP"
-    NEW_FRONTIER = "NEW_FRONTIER"
-    FRONTIER_REACHED = "FRONTIER_REACHED"
-    NO_ACTIVE_HYPOTHESIS = "NO_ACTIVE_HYPOTHESIS"
-    NO_VALID_FRONTIER = "NO_VALID_FRONTIER"
-    NO_ELIGIBLE_FRONTIER = "NO_ELIGIBLE_FRONTIER"
-    SEMANTIC_EVIDENCE = "SEMANTIC_EVIDENCE"
-    HYPOTHESIS_SUPPORTED = "HYPOTHESIS_SUPPORTED"
-    HYPOTHESIS_CONTRADICTED = "HYPOTHESIS_CONTRADICTED"
-    HYPOTHESIS_TEST_COMPLETED = "HYPOTHESIS_TEST_COMPLETED"
-    HYPOTHESIS_REVISED = "HYPOTHESIS_REVISED"
-    NEW_TASK_RELEVANT_ANCHOR = "NEW_TASK_RELEVANT_ANCHOR"
-    EVIDENCE_CONFLICT = "EVIDENCE_CONFLICT"
-    ANSWERER_EVIDENCE_CONFLICT = "ANSWERER_EVIDENCE_CONFLICT"
-    CANDIDATE_VISIBLE = "CANDIDATE_VISIBLE"
-    GROUNDING_FAILED = "GROUNDING_FAILED"
-    CANDIDATE_REJECTED = "CANDIDATE_REJECTED"
-    CANDIDATE_GROUNDED_3D = "CANDIDATE_GROUNDED_3D"
-    VISUAL_APPROACH_READY = "VISUAL_APPROACH_READY"
-    TARGET_VIEWPOINT_READY = "TARGET_VIEWPOINT_READY"
-    TARGET_VIEWPOINT_REACHED = "TARGET_VIEWPOINT_REACHED"
-    VERIFY_SUCCESS = "VERIFY_SUCCESS"
-    VERIFY_FAILED = "VERIFY_FAILED"
-    WRONG_INSTANCE = "WRONG_INSTANCE"
-    POOR_VIEW = "POOR_VIEW"
-    TARGET_NOT_VISIBLE = "TARGET_NOT_VISIBLE"
-    WORKING_MEMORY_OVER_BUDGET = "WORKING_MEMORY_OVER_BUDGET"
-    HYPOTHESIS_UPDATE_REQUIRED = "HYPOTHESIS_UPDATE_REQUIRED"
-    MEMORY_UPDATE_REQUIRED = "MEMORY_UPDATE_REQUIRED"
-    NAVIGATION_FAILED = "NAVIGATION_FAILED"
-
-
-class AnswererDecision(Enum):
-    NOT_FOUND = "NOT_FOUND"
-    CANDIDATE_VISIBLE = "CANDIDATE_VISIBLE"
-    TARGET_CONFIRMED = "TARGET_CONFIRMED"
-    ANSWER_READY = "ANSWER_READY"
-
-
-class ExecutorActionMode(Enum):
-    CONTINUE_SPATIAL_BRANCH = "CONTINUE_SPATIAL_BRANCH"
-    SWITCH_SPATIAL_BRANCH = "SWITCH_SPATIAL_BRANCH"
-    REVISIT_SPATIAL_BRANCH = "REVISIT_SPATIAL_BRANCH"
-    STOP = "STOP"
-
-
-class VerifyStatus(Enum):
-    SUCCESS = "SUCCESS"
-    WRONG_INSTANCE = "WRONG_INSTANCE"
-    POOR_VIEW = "POOR_VIEW"
-    TARGET_NOT_VISIBLE = "TARGET_NOT_VISIBLE"
-
-
-T = TypeVar("T", bound="JsonDataclassMixin")
-
-
-def _enum_value(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    return value
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if is_dataclass(value):
-        if hasattr(value, "to_dict"):
-            return value.to_dict()
-        return {f.name: _jsonable(getattr(value, f.name)) for f in fields(value)}
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if hasattr(value, "tolist"):
-        try:
-            return value.tolist()
-        except Exception:
-            return value
-    return value
-
-
-def _coerce_enum(enum_cls: Type[Enum], value: Any) -> Enum:
-    if isinstance(value, enum_cls):
-        return value
-    if isinstance(value, str):
-        try:
-            return enum_cls(value)
-        except ValueError:
-            return enum_cls[value]
-    return enum_cls(value)
-
-
-class JsonDataclassMixin:
-    """Small JSON bridge for typed rebuild records.
-
-    This intentionally avoids a dependency on pydantic. Runtime code can pass
-    numpy arrays, enum instances, or primitive dicts; persisted state stays JSON
-    compatible.
-    """
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {f.name: _jsonable(getattr(self, f.name)) for f in fields(self)}
-
-    @classmethod
-    def from_dict(cls: Type[T], data: Dict[str, Any]) -> T:
-        if data is None:
-            raise ValueError(f"cannot build {cls.__name__} from None")
-        return cls(**dict(data))
-
-
-@dataclass
-class FrontierAnchor(JsonDataclassMixin):
-    frontier_id: int
-    spatial_branch_id: Optional[str] = None
-
-
-@dataclass
-class SpatialBranchAnchor(JsonDataclassMixin):
-    spatial_branch_id: str
-
-
-@dataclass
-class ImageAnchor(JsonDataclassMixin):
-    image_path: str
-    candidate_id: Optional[str] = None
-
-
-@dataclass
-class ObjectAnchor(JsonDataclassMixin):
-    object_id: Union[int, str]
-    class_name: Optional[str] = None
-
-
-@dataclass
-class CandidateAnchor(JsonDataclassMixin):
-    candidate_id: str
-    image_path: Optional[str] = None
-    target_phrase: Optional[str] = None
-
-
-Anchor = Union[
-    FrontierAnchor,
-    SpatialBranchAnchor,
-    ImageAnchor,
-    ObjectAnchor,
-    CandidateAnchor,
-]
-
-
-def _coerce_frontier_id(value: Any) -> int:
-    if isinstance(value, str):
-        match = re.search(r"\d+", value)
-        if match is not None:
-            return int(match.group(0))
-    return int(value)
-
-
-def anchor_from_dict(data: Dict[str, Any]) -> Anchor:
-    kind = (data or {}).get("kind") or (data or {}).get("type")
-    if kind:
-        kind = str(kind).lower()
-    if kind == "frontier":
-        return FrontierAnchor(
-            frontier_id=_coerce_frontier_id(data.get("frontier_id", data.get("id"))),
-            spatial_branch_id=data.get("spatial_branch_id"),
-        )
-    if kind == "spatial_branch":
-        spatial_branch_id = data.get("spatial_branch_id", data.get("id"))
-        if spatial_branch_id is None:
-            raise ValueError(f"unknown anchor payload: {data}")
-        return SpatialBranchAnchor(
-            spatial_branch_id=str(spatial_branch_id)
-        )
-    if kind == "object":
-        return ObjectAnchor(
-            object_id=data["object_id"],
-            class_name=data.get("class_name"),
-        )
-    if kind == "candidate":
-        return CandidateAnchor(
-            candidate_id=str(data["candidate_id"]),
-            image_path=data.get("image_path"),
-            target_phrase=data.get("target_phrase"),
-        )
-    if kind == "image":
-        return ImageAnchor(
-            image_path=str(data["image_path"]),
-            candidate_id=data.get("candidate_id"),
-        )
-    if "frontier_id" in data:
-        return FrontierAnchor(
-            frontier_id=_coerce_frontier_id(data["frontier_id"]),
-            spatial_branch_id=data.get("spatial_branch_id"),
-        )
-    if "spatial_branch_id" in data:
-        return SpatialBranchAnchor(spatial_branch_id=str(data["spatial_branch_id"]))
-    if "object_id" in data:
-        return ObjectAnchor(
-            object_id=data["object_id"],
-            class_name=data.get("class_name"),
-        )
-    if "candidate_id" in data:
-        return CandidateAnchor(
-            candidate_id=str(data["candidate_id"]),
-            image_path=data.get("image_path"),
-            target_phrase=data.get("target_phrase"),
-        )
-    if "image_path" in data:
-        return ImageAnchor(
-            image_path=str(data["image_path"]),
-            candidate_id=data.get("candidate_id"),
-        )
-    raise ValueError(f"unknown anchor payload: {data}")
-
-
-def anchor_from_value(value: Any) -> Optional[Anchor]:
-    """Best-effort parser for HypothesisManager anchor payloads.
-
-    The prompt asks for structured anchors, but VLMs often return shorthand
-    strings such as "B001" or "F_001". Normalize those instead of letting a
-    malformed anchor discard the whole hypothesis branch.
-    """
-    if value is None:
-        return None
-    if isinstance(
-        value,
-        (FrontierAnchor, SpatialBranchAnchor, ImageAnchor, ObjectAnchor, CandidateAnchor),
-    ):
-        return value
-    if isinstance(value, dict):
-        try:
-            return anchor_from_dict(value)
-        except Exception:
-            return None
-    if isinstance(value, str):
-        token = value.strip()
-        if not token or token.lower() in {"none", "null", "unknown"}:
-            return None
-        branch_match = re.fullmatch(r"B_?(\d+)", token, flags=re.IGNORECASE)
-        if branch_match:
-            return SpatialBranchAnchor(
-                spatial_branch_id=f"B{int(branch_match.group(1)):03d}"
-            )
-        frontier_match = re.fullmatch(r"F_?(\d+)", token, flags=re.IGNORECASE)
-        if frontier_match:
-            return FrontierAnchor(frontier_id=int(frontier_match.group(1)))
-        lower_token = token.lower()
-        if lower_token.startswith("spatial_branch:"):
-            return SpatialBranchAnchor(spatial_branch_id=token.split(":", 1)[1].strip())
-        if lower_token.startswith("frontier:"):
-            try:
-                raw_id = token.split(":", 1)[1].strip()
-                match = re.search(r"\d+", raw_id)
-                if match is None:
-                    return None
-                return FrontierAnchor(frontier_id=int(match.group(0)))
-            except ValueError:
-                return None
-    return None
-
-
-def _anchor_to_dict(anchor: Anchor) -> Dict[str, Any]:
-    payload = anchor.to_dict() if hasattr(anchor, "to_dict") else _jsonable(anchor)
-    if not isinstance(payload, dict):
-        return {"kind": "unknown", "value": payload}
-    if isinstance(anchor, FrontierAnchor):
-        payload["kind"] = "frontier"
-    elif isinstance(anchor, SpatialBranchAnchor):
-        payload["kind"] = "spatial_branch"
-    elif isinstance(anchor, ImageAnchor):
-        payload["kind"] = "image"
-    elif isinstance(anchor, ObjectAnchor):
-        payload["kind"] = "object"
-    elif isinstance(anchor, CandidateAnchor):
-        payload["kind"] = "candidate"
-    return payload
-
-
-@dataclass
-class FrontierInstance(JsonDataclassMixin):
-    frontier_id: int
-    position: Any
-    orientation: Any = None
-    area: float = 0.0
-    local_index: Optional[int] = None
-    spatial_branch_id: Optional[str] = None
-    image: Optional[str] = None
-    is_selectable: bool = True
-    created_step: int = 0
-    updated_step: int = 0
-
-    def __post_init__(self) -> None:
-        self.frontier_id = int(self.frontier_id)
-        self.position = _jsonable(self.position)
-        self.orientation = _jsonable(self.orientation)
-
-    def to_prompt_str(self) -> str:
-        branch = self.spatial_branch_id or "unassigned"
-        return (
-            f"F_{self.frontier_id:03d}/{branch}: "
-            f"area={self.area:.1f}, selectable={self.is_selectable}"
-        )
-
-
-@dataclass
-class SpatialBranchRecord(JsonDataclassMixin):
-    spatial_branch_id: str
-    origin: Any = None
-    frontier_ids: List[int] = field(default_factory=list)
-    spine: List[Any] = field(default_factory=list)
-    active_tip_frontier_id: Optional[int] = None
-    active_tip_ids: List[int] = field(default_factory=list)
-    frontier_history: List[int] = field(default_factory=list)
-    tip_history: List[Any] = field(default_factory=list)
-    max_progress: float = 0.0
-    geometric_status: str = "OPEN"
-    aliases: List[str] = field(default_factory=list)
-    merged_into: Optional[str] = None
-    created_step: int = 0
-    updated_step: int = 0
-
-    def __post_init__(self) -> None:
-        if self.origin is None and self.spine:
-            self.origin = self.spine[0]
-        self.origin = _jsonable(self.origin)
-        self.frontier_ids = [int(fid) for fid in self.frontier_ids]
-        if self.active_tip_frontier_id is not None:
-            self.active_tip_frontier_id = int(self.active_tip_frontier_id)
-        self.active_tip_ids = [int(fid) for fid in self.active_tip_ids]
-        if not self.active_tip_ids and self.active_tip_frontier_id is not None:
-            self.active_tip_ids = [self.active_tip_frontier_id]
-        self.frontier_history = [int(fid) for fid in self.frontier_history]
-        if not self.frontier_history:
-            self.frontier_history = list(self.frontier_ids)
-        self.spine = [_jsonable(p) for p in self.spine]
-        self.tip_history = [_jsonable(p) for p in self.tip_history]
-        if not self.tip_history:
-            self.tip_history = list(self.spine)
-        if self.merged_into:
-            self.geometric_status = "MERGED"
-        else:
-            self.geometric_status = str(self.geometric_status or "OPEN").upper()
-
-    def to_prompt_str(self) -> str:
-        if self.active_tip_ids:
-            tip = ",".join(f"F_{fid:03d}" for fid in self.active_tip_ids)
-        elif self.active_tip_frontier_id is not None:
-            tip = f"F_{self.active_tip_frontier_id:03d}"
-        else:
-            tip = "none"
-        merged = f", merged_into={self.merged_into}" if self.merged_into else ""
-        return (
-            f"{self.spatial_branch_id}: status={self.geometric_status}, "
-            f"tips={tip}, progress={self.max_progress:.2f}m, "
-            f"frontiers={self.frontier_ids}{merged}"
-        )
-
-
-@dataclass
-class BranchTaskState(JsonDataclassMixin):
-    spatial_branch_id: str
-    subtask_id: str = ""
-    status: BranchTaskStatus = BranchTaskStatus.NEW
-    progress_score: float = 0.0
-    steps_without_progress: int = 0
-    selected_count: int = 0
-    reached_count: int = 0
-    recent_visit_count: int = 0
-    reversal_count: int = 0
-    recent_spatial_gain: float = 0.0
-    recent_region_overlap: float = 0.0
-    active_hypothesis_id: Optional[str] = None
-    linked_hypothesis_ids: List[str] = field(default_factory=list)
-    last_frontier_id: Optional[int] = None
-    last_selected_step: Optional[int] = None
-    closed_reason: Optional[str] = None
-    updated_step: int = 0
-
-    def __post_init__(self) -> None:
-        self.status = _coerce_enum(BranchTaskStatus, self.status)
-        if self.active_hypothesis_id and self.active_hypothesis_id not in self.linked_hypothesis_ids:
-            self.linked_hypothesis_ids.append(self.active_hypothesis_id)
-        if self.last_frontier_id is not None:
-            self.last_frontier_id = int(self.last_frontier_id)
-
-    def to_prompt_str(self) -> str:
-        fid = (
-            f"F_{self.last_frontier_id:03d}"
-            if self.last_frontier_id is not None
-            else "none"
-        )
-        return (
-            f"{self.spatial_branch_id}: status={self.status.value}, "
-            f"gain={self.recent_spatial_gain:.2f}m, "
-            f"overlap={self.recent_region_overlap:.2f}, "
-            f"reversal={self.reversal_count}, visits={self.recent_visit_count}, "
-            f"last={fid}"
-        )
-
-
-@dataclass
-class HypothesisBranch(JsonDataclassMixin):
-    hypothesis_id: str
-    claim: str = ""
-    expected_cues: List[str] = field(default_factory=list)
-    contradiction_cues: List[str] = field(default_factory=list)
-    anchor: Optional[Anchor] = None
-    anchors: List[Anchor] = field(default_factory=list)
-    status: HypothesisStatus = HypothesisStatus.ACTIVE
-    positive_evidence: List[str] = field(default_factory=list)
-    negative_evidence: List[str] = field(default_factory=list)
-    next_test: str = ""
-    linked_spatial_branches: List[str] = field(default_factory=list)
-    revision_reason: Optional[str] = None
-    confidence: float = 0.0
-    description: str = ""
-    evidence: List[str] = field(default_factory=list)
-    conflicts: List[str] = field(default_factory=list)
-    created_step: int = 0
-    updated_step: int = 0
-    writer: str = "HypothesisManager"
-
-    def __post_init__(self) -> None:
-        self.status = _coerce_enum(HypothesisStatus, self.status)
-        if not self.claim and self.description:
-            self.claim = self.description
-        if not self.description and self.claim:
-            self.description = self.claim
-        if not self.positive_evidence and self.evidence:
-            self.positive_evidence = list(self.evidence)
-        if not self.evidence and self.positive_evidence:
-            self.evidence = list(self.positive_evidence)
-        if not self.negative_evidence and self.conflicts:
-            self.negative_evidence = list(self.conflicts)
-        if not self.conflicts and self.negative_evidence:
-            self.conflicts = list(self.negative_evidence)
-
-        normalized_anchors = []
-        seen_anchors = set()
-
-        def _append_anchor(value) -> None:
-            anchor = anchor_from_value(value)
-            if anchor is None:
-                return
-            key = json.dumps(_anchor_to_dict(anchor), sort_keys=True)
-            if key in seen_anchors:
-                return
-            seen_anchors.add(key)
-            normalized_anchors.append(anchor)
-
-        if self.anchor is not None:
-            _append_anchor(self.anchor)
-        raw_anchors = self.anchors or []
-        if not isinstance(raw_anchors, (list, tuple, set)):
-            raw_anchors = [raw_anchors]
-        for anchor in raw_anchors:
-            _append_anchor(anchor)
-        self.anchors = normalized_anchors
-        self.anchor = self.anchors[0] if self.anchors else None
-
-        raw_linked_branches = self.linked_spatial_branches or []
-        if isinstance(raw_linked_branches, str):
-            raw_linked_branches = [raw_linked_branches]
-        linked = set(str(bid) for bid in raw_linked_branches if bid)
-        for anchor in self.anchors:
-            if isinstance(anchor, SpatialBranchAnchor):
-                linked.add(anchor.spatial_branch_id)
-            elif isinstance(anchor, FrontierAnchor) and anchor.spatial_branch_id:
-                linked.add(anchor.spatial_branch_id)
-        self.linked_spatial_branches = sorted(linked)
-
-    def to_dict(self) -> Dict[str, Any]:
-        data = super().to_dict()
-        data["anchor"] = _anchor_to_dict(self.anchor) if self.anchor is not None else None
-        data["anchors"] = [_anchor_to_dict(a) for a in self.anchors]
-        return data
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "HypothesisBranch":
-        payload = dict(data)
-        if "summary" in payload and "claim" not in payload:
-            payload["claim"] = payload.pop("summary")
-        if "description" in payload and "claim" not in payload:
-            payload["claim"] = payload["description"]
-        if "evidence" in payload and "positive_evidence" not in payload:
-            payload["positive_evidence"] = payload["evidence"]
-        if "conflicts" in payload and "negative_evidence" not in payload:
-            payload["negative_evidence"] = payload["conflicts"]
-        if "anchor" in payload:
-            payload["anchor"] = anchor_from_value(payload["anchor"])
-        raw_anchors = payload.get("anchors", [])
-        if raw_anchors is None:
-            raw_anchors = []
-        elif not isinstance(raw_anchors, list):
-            raw_anchors = [raw_anchors]
-        payload["anchors"] = [
-            anchor
-            for a in raw_anchors
-            for anchor in [anchor_from_value(a)]
-            if anchor is not None
-        ]
-        return cls(**payload)
-
-    def to_prompt_str(self) -> str:
-        anchor_str = ", ".join(
-            _anchor_to_dict(anchor).get("kind", "anchor")
-            for anchor in self.anchors
-        ) or "none"
-        cues = "; ".join(self.expected_cues[:3]) or "none"
-        contra = "; ".join(self.contradiction_cues[:2]) or "none"
-        return (
-            f"{self.hypothesis_id}: {self.claim or self.description} "
-            f"(status={self.status.value}, conf={self.confidence:.2f}, "
-            f"anchors={anchor_str}, expected={cues}, "
-            f"contradiction={contra}, next_test={self.next_test or 'none'})"
-        )
-
-
-@dataclass
-class TypedEvent(JsonDataclassMixin):
-    event_id: str
-    type: EventType
-    step: int
-    entity_id: Optional[str] = None
-    active_hypothesis_id: Optional[str] = None
-    payload: Dict[str, Any] = field(default_factory=dict)
-    severity: str = "info"
-    ttl_steps: int = 4
-    created_step: int = 0
-
-    def __post_init__(self) -> None:
-        self.type = _coerce_enum(EventType, self.type)
-        if self.created_step == 0:
-            self.created_step = self.step
-
-    def debounce_key(self) -> tuple:
-        return (self.type.value, self.entity_id, self.active_hypothesis_id)
-
-    def to_prompt_str(self) -> str:
-        entity = f" entity={self.entity_id}" if self.entity_id else ""
-        return f"- step {self.step} [{self.type.value}]{entity}: {self.payload}"
-
-
-@dataclass
-class ExploreIntent(JsonDataclassMixin):
-    mode: NavigationMode = NavigationMode.EXPLORE
-    frontier_id: Optional[int] = None
-    spatial_branch_id: Optional[str] = None
-    hypothesis_id: Optional[str] = None
-    action_mode: ExecutorActionMode = ExecutorActionMode.CONTINUE_SPATIAL_BRANCH
-    reason_code: str = ""
-    reason: str = ""
-
-    def __post_init__(self) -> None:
-        self.mode = _coerce_enum(NavigationMode, self.mode)
-        self.action_mode = _coerce_enum(ExecutorActionMode, self.action_mode)
-        if self.frontier_id is not None:
-            self.frontier_id = int(self.frontier_id)
-
-
-@dataclass
-class VisualApproachIntent(JsonDataclassMixin):
-    mode: NavigationMode = NavigationMode.VISUAL_APPROACH
-    candidate_id: str = ""
-    image_path: str = ""
-    target_phrase: str = ""
-    approach_xyz: Any = None
-    approach_yaw: Optional[float] = None
-    reason_code: str = "VISUAL_APPROACH"
-    reason: str = ""
-
-    def __post_init__(self) -> None:
-        self.mode = _coerce_enum(NavigationMode, self.mode)
-        self.approach_xyz = _jsonable(self.approach_xyz)
-
-
-@dataclass
-class TargetViewpointIntent(JsonDataclassMixin):
-    mode: NavigationMode = NavigationMode.TARGET_APPROACH
-    candidate_id: str = ""
-    image_path: str = ""
-    target_phrase: str = ""
-    target_xyz: Any = None
-    target_yaw: Optional[float] = None
-    viewpoint_id: Optional[str] = None
-    reason_code: str = "TARGET_VIEWPOINT"
-    reason: str = ""
-
-    def __post_init__(self) -> None:
-        self.mode = _coerce_enum(NavigationMode, self.mode)
-        self.target_xyz = _jsonable(self.target_xyz)
-
-
-NavigationIntent = Union[ExploreIntent, VisualApproachIntent, TargetViewpointIntent]
-
-
-def navigation_intent_from_dict(data: Dict[str, Any]) -> NavigationIntent:
-    mode = _coerce_enum(NavigationMode, data.get("mode", NavigationMode.EXPLORE))
-    if mode == NavigationMode.VISUAL_APPROACH:
-        return VisualApproachIntent.from_dict(data)
-    if mode in (NavigationMode.TARGET_APPROACH, NavigationMode.VERIFY):
-        return TargetViewpointIntent.from_dict(data)
-    return ExploreIntent.from_dict(data)
-
-
-@dataclass
-class NavigationResult(JsonDataclassMixin):
-    mode: NavigationMode
-    success: bool
-    target_arrived: bool = False
-    intent: Optional[NavigationIntent] = None
-    failure_reason: Optional[str] = None
-    verify_status: Optional[VerifyStatus] = None
-    frontier_id: Optional[int] = None
-    candidate_id: Optional[str] = None
-    step: int = 0
-
-    def __post_init__(self) -> None:
-        self.mode = _coerce_enum(NavigationMode, self.mode)
-        if self.verify_status is not None:
-            self.verify_status = _coerce_enum(VerifyStatus, self.verify_status)
-        if isinstance(self.intent, dict):
-            self.intent = navigation_intent_from_dict(self.intent)
-        if self.frontier_id is not None:
-            self.frontier_id = int(self.frontier_id)
-
-
-@dataclass
-class StepOutcome(JsonDataclassMixin):
-    step: int
-    mode: NavigationMode
-    intent: Optional[NavigationIntent] = None
-    spatial_branch_id: Optional[str] = None
-    frontier_id: Optional[int] = None
-    hypothesis_id: Optional[str] = None
-    distance_moved: float = 0.0
-    explored_area_delta: float = 0.0
-    new_free_space_delta: float = 0.0
-    branch_progress_delta: float = 0.0
-    recent_region_overlap: float = 0.0
-    trajectory_reversal: bool = False
-    semantic_updates: List[Any] = field(default_factory=list)
-    navigation_result: Optional[NavigationResult] = None
-    events: List[TypedEvent] = field(default_factory=list)
-    answerer_decision: AnswererDecision = AnswererDecision.NOT_FOUND
-    verification_result: Optional[VerifyStatus] = None
-    done: bool = False
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self.mode = _coerce_enum(NavigationMode, self.mode)
-        self.answerer_decision = _coerce_enum(
-            AnswererDecision, self.answerer_decision
-        )
-        if self.verification_result is not None:
-            self.verification_result = _coerce_enum(
-                VerifyStatus, self.verification_result
-            )
-        if isinstance(self.intent, dict):
-            self.intent = navigation_intent_from_dict(self.intent)
-        if self.frontier_id is not None:
-            self.frontier_id = int(self.frontier_id)
-        if self.intent is not None:
-            if self.spatial_branch_id is None and hasattr(self.intent, "spatial_branch_id"):
-                self.spatial_branch_id = getattr(self.intent, "spatial_branch_id")
-            if self.frontier_id is None and hasattr(self.intent, "frontier_id"):
-                fid = getattr(self.intent, "frontier_id")
-                self.frontier_id = int(fid) if fid is not None else None
-            if self.hypothesis_id is None and hasattr(self.intent, "hypothesis_id"):
-                self.hypothesis_id = getattr(self.intent, "hypothesis_id")
-        if isinstance(self.navigation_result, dict):
-            self.navigation_result = NavigationResult.from_dict(
-                self.navigation_result
-            )
-        self.events = [
-            TypedEvent.from_dict(e) if isinstance(e, dict) else e
-            for e in self.events
-        ]
-        self.semantic_updates = _jsonable(self.semantic_updates)
-
-
-def should_enter_verify(
-    target_arrived: bool,
-    navigation_intent: Optional[NavigationIntent],
-    candidate: Optional[Any],
-) -> bool:
-    """Gate task verification to reached target-viewpoint intents only."""
-    return (
-        bool(target_arrived)
-        and isinstance(navigation_intent, TargetViewpointIntent)
-        and candidate is not None
-        and getattr(candidate, "nav_status", None) == NavStatus.REACHED
-        and getattr(candidate, "nav_target_kind", None)
-        == NavTargetKind.VIEWPOINT_POSE
-    )
-
-
-def format_prompt_summary(items: Any, max_items: int = 8) -> str:
-    """Render typed rebuild state for VLM prompts without leaking raw dicts."""
-    if items is None:
-        return ""
-    if not isinstance(items, (list, tuple)):
-        items = [items]
-    lines = []
-    for item in list(items)[:max_items]:
-        if hasattr(item, "to_prompt_str"):
-            lines.append(item.to_prompt_str())
-        elif isinstance(item, dict):
-            lines.append(str(_jsonable(item)))
-        else:
-            lines.append(str(item))
-    if len(items) > max_items:
-        lines.append(f"... {len(items) - max_items} more")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -968,21 +218,7 @@ class TargetCandidate:
     nav_status: NavStatus = NavStatus.NONE
     nav_goal_xyz: Optional[Any] = None       # habitat (x,y,z)
     nav_goal_yaw: Optional[float] = None
-    bbox_xyxy: Optional[Any] = None
-    mask: Optional[Any] = None
-    target_pointcloud: Optional[Any] = None
-    grounding_source: Optional[str] = None
     updated_step: int = 0                    # last status-change step (0 → use source_step)
-
-    def __post_init__(self) -> None:
-        self.camera_pose = _jsonable(self.camera_pose)
-        self.nav_goal_xyz = _jsonable(self.nav_goal_xyz)
-        self.bbox_xyxy = _jsonable(self.bbox_xyxy)
-        self.mask = _jsonable(self.mask)
-        self.target_pointcloud = _jsonable(self.target_pointcloud)
-        self.nav_status = _coerce_enum(NavStatus, self.nav_status)
-        if self.nav_target_kind is not None:
-            self.nav_target_kind = _coerce_enum(NavTargetKind, self.nav_target_kind)
 
     def record_attempt(self, level: int, success: bool, reason: str = "") -> None:
         self.grounding_attempts.append(
@@ -1004,7 +240,6 @@ class TargetCandidate:
         return (
             f"  - candidate {self.candidate_id} (image={self.image_path}, "
             f"phrase='{self.target_phrase}', status={self.status}, "
-            f"grounding={self.grounding_source or 'none'}, "
             f"closer_views={self.closer_view_attempts}, "
             f"last_failure={self.last_failure_reason or 'none'})"
         )
@@ -1013,8 +248,7 @@ class TargetCandidate:
 # ---------------------------------------------------------------------------
 # Frontier state
 # ---------------------------------------------------------------------------
-# Status values. F_EXPLORED is retained for old serialized state only; the
-# rebuild flow does not assign it because frontiers are transient observations.
+# Status values
 F_ACTIVE = "ACTIVE"
 F_EXPLORED = "EXPLORED"
 F_BLOCKED = "BLOCKED"
@@ -1052,6 +286,8 @@ class FrontierState:
         ]
         if self.last_result:
             parts.append(f"last={self.last_result}")
+        if self.status == F_EXPLORED or self.selected_count >= 2:
+            parts.append("DO NOT SELECT")
         return " | ".join(parts)
 
 
@@ -1109,13 +345,6 @@ class SubtaskWorkingMemory:
         self.pinned_ids: set = set()             # image paths that cannot be dropped
         self.target_candidates: Dict[str, TargetCandidate] = {}
         self.frontier_registry: Dict[int, FrontierState] = {}
-        self.spatial_branches: Dict[str, SpatialBranchRecord] = {}
-        self.frontier_to_branch: Dict[int, str] = {}
-        self.branch_task_states: Dict[str, BranchTaskState] = {}
-        self.hypotheses: Dict[str, HypothesisBranch] = {}
-        self.typed_events: List[TypedEvent] = []
-        self._pending_typed_event_ids: set = set()
-        self._consumed_typed_event_ids: set = set()
         self.feedback: List[FeedbackEvent] = []
         self.plan_stale_count: int = 0
         self.high_level_plan: Optional[str] = None
@@ -1129,131 +358,30 @@ class SubtaskWorkingMemory:
         subtask_id: str,
         question: str,
     ) -> None:
-        """Reset task-local state for a new GOAT subtask.
+        """Clear working memory; keep frontier_registry geometry but mark STALE.
 
-        SpatialBranchRecord is episode-global geometry and is preserved. A
-        NEW BranchTaskState does not mean the branch was newly discovered; it
-        means the existing branch has not been evaluated under this subtask's
-        target condition yet.
-
-        Frontier geometry is still valid within the same episode, but frontier
-        task status resets because the target changed. We mark stale frontiers
-        so they can be reconsidered without being preferred as fresh evidence.
+        Frontier geometry is still valid (walls don't move between subtasks in
+        the same episode), but their exploration status resets because the
+        target changed — a frontier that gave no info for object A may still
+        be useful for object B. We mark STALE so they can be re-considered but
+        are not preferred.
         """
         self.subtask_id = subtask_id
         self.question = question
         self.pinned_ids = set()
         self.target_candidates = {}
-        self.branch_task_states = {}
-        self.hypotheses = {}
-        self.typed_events = []
-        self._pending_typed_event_ids = set()
-        self._consumed_typed_event_ids = set()
         self.feedback = []
         self.plan_stale_count = 0
         self.high_level_plan = None
         self.last_plan_normalized = None
         self.recent_frontier_ids = []
         self._last_nav_candidate_id = None
-        for bid, branch in self.spatial_branches.items():
-            if branch.merged_into:
-                continue
-            if str(branch.geometric_status).upper() != "OPEN":
-                continue
-            self.branch_task_states[bid] = BranchTaskState(
-                spatial_branch_id=bid,
-                subtask_id=subtask_id,
-                status=BranchTaskStatus.NEW,
-            )
         for fs in self.frontier_registry.values():
             fs.status = F_STALE
             fs.selected_count = 0
             fs.reached_count = 0
             fs.last_result = None
             # keep centroid/area/view_yaw/first_seen_step
-
-    # ---- typed rebuild state ----------------------------------------------
-    def upsert_spatial_branch(
-        self,
-        branch: SpatialBranchRecord,
-    ) -> SpatialBranchRecord:
-        self.spatial_branches[branch.spatial_branch_id] = branch
-        for fid in branch.frontier_ids:
-            self.frontier_to_branch[int(fid)] = branch.spatial_branch_id
-        if branch.active_tip_frontier_id is not None:
-            self.frontier_to_branch[
-                int(branch.active_tip_frontier_id)
-            ] = branch.spatial_branch_id
-        return branch
-
-    def get_branch_for_frontier(self, frontier_id: int) -> Optional[SpatialBranchRecord]:
-        bid = self.frontier_to_branch.get(int(frontier_id))
-        return self.spatial_branches.get(bid) if bid else None
-
-    def upsert_branch_task_state(
-        self,
-        state: BranchTaskState,
-    ) -> BranchTaskState:
-        self.branch_task_states[state.spatial_branch_id] = state
-        return state
-
-    def eligible_spatial_branches(self) -> List[SpatialBranchRecord]:
-        out = []
-        for bid, branch in self.spatial_branches.items():
-            if branch.merged_into:
-                continue
-            state = self.branch_task_states.get(bid)
-            if state is not None and state.status == BranchTaskStatus.CLOSED:
-                continue
-            out.append(branch)
-        return out
-
-    def set_hypotheses_from_manager(
-        self,
-        hypotheses: List[HypothesisBranch],
-        writer: str = "HypothesisManager",
-    ) -> None:
-        """Single-writer gate for HypothesisBranch updates."""
-        for hyp in hypotheses:
-            if hyp.writer != writer:
-                raise ValueError(
-                    "HypothesisBranch updates must come from HypothesisManager"
-                )
-            self.hypotheses[hyp.hypothesis_id] = hyp
-
-    def add_typed_event(self, event: TypedEvent, pending: bool = True) -> None:
-        self.typed_events.append(event)
-        if pending and event.event_id not in self._consumed_typed_event_ids:
-            self._pending_typed_event_ids.add(event.event_id)
-        if len(self.typed_events) > 32:
-            self.typed_events = self.typed_events[-32:]
-            alive_ids = {e.event_id for e in self.typed_events}
-            self._pending_typed_event_ids &= alive_ids
-            self._consumed_typed_event_ids &= alive_ids
-
-    def clear_task_scope_events(self) -> None:
-        self.typed_events = []
-        self._pending_typed_event_ids = set()
-        self._consumed_typed_event_ids = set()
-
-    def pop_pending_typed_events(self, current_step: int) -> List[TypedEvent]:
-        """Return unconsumed task events that are still within TTL."""
-        events = []
-        alive_pending = set()
-        for event in self.typed_events:
-            age = current_step - event.created_step
-            if age < 0 or age >= event.ttl_steps:
-                continue
-            if event.event_id in self._pending_typed_event_ids:
-                events.append(event)
-                alive_pending.add(event.event_id)
-        self._pending_typed_event_ids = alive_pending
-        return events
-
-    def mark_events_consumed(self, events: List[TypedEvent]) -> None:
-        for event in events:
-            self._pending_typed_event_ids.discard(event.event_id)
-            self._consumed_typed_event_ids.add(event.event_id)
 
     # ---- candidates --------------------------------------------------------
     def get_or_create_candidate(
@@ -1331,7 +459,6 @@ class SubtaskWorkingMemory:
         if c is None:
             return False
         if c.closer_view_attempts >= max_attempts:
-            c.status = S_EXPIRED
             self.release_candidate(candidate_id)
             return True
         return False
@@ -1395,11 +522,11 @@ class SubtaskWorkingMemory:
         if fs is not None:
             fs.reached_count += 1
             fs.last_result = result
-            if result == FR_BLOCKED:
-                fs.status = F_BLOCKED
+            if result == FR_NO_NEW_INFO:
+                fs.status = F_EXPLORED
             elif result == FR_FOUND_CANDIDATE:
                 fs.status = F_ACTIVE  # keep it available
-            # NO_NEW_INFO / LED_TO_ROOM remain executor context only.
+            # LED_TO_ROOM / BLOCKED: leave status as-is for now
 
     def get_valid_frontiers(
         self,
@@ -1407,18 +534,21 @@ class SubtaskWorkingMemory:
         max_reselect: int = 2,
         recent_window: int = 3,
     ) -> List[int]:
-        """Return deterministically legal frontier ids.
-
-        Frontier ids are transient observations. Recent selection and repeated
-        visits are context for Executor, not hard eligibility constraints.
-        """
+        """Return frontier_ids that are selectable right now."""
+        recent = set(self.recent_frontier_ids[-recent_window:]) if recent_window > 0 else set()
         out = []
         for fid in all_frontier_ids:
             fs = self.frontier_registry.get(fid)
             if fs is None:
                 out.append(fid)  # unknown → treat as fresh
                 continue
+            if fs.status == F_EXPLORED:
+                continue
             if fs.status == F_BLOCKED:
+                continue
+            if fs.selected_count >= max_reselect:
+                continue
+            if fid in recent:
                 continue
             out.append(fid)
         return out

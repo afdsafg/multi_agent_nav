@@ -1,33 +1,25 @@
-"""Typed multi-agent workflow for MSGNav GOAT-Bench evaluation.
+"""Coupled multi-agent workflow for MSGNav GOAT-Bench evaluation.
 
-The active rebuild path uses KSS image context, an Answerer/Evidence Assessor,
-typed events, event-triggered Memory/Hypothesis Managers, BranchTracker
-eligibility, and a JSON Executor. Frontier IDs remain transient planner
-observations; durable spatial continuity lives in SpatialBranchRecord.
+Ported from Pred-EQA's 5-agent chain (Image Manager, Frontier Manager,
+Answerer, High-Level Planner, Low-Level Executor) and adapted to MSGNav's
+M3DSG scene graph, KSS image pool, and call_openai_api VLM interface.
+
+Key adaptations vs Pred-EQA:
+- image_pool entries carry M3DSG-connected objects (id, class_name) from
+  scene.img_to_edge reverse lookup.
+- Answerer outputs "Image i, <class>" (i = pool index) for all three GOAT-Bench
+  task types (object / description / image), or "Continue Exploration".
+- High-Level Planner plan is passed via step['high_level_plan'] and persists
+  across subtasks (maintained by the main loop); this module only updates it.
+- No Forced Answerer; step exhaustion => subtask failure.
 """
 
 import logging
-import json
 import re
 from typing import List, Dict, Any, Optional, Tuple
 
 from src.explore_utils import call_openai_api, encode_tensor2base64, resize_image, format_question
 from src.plan_extraction_utils import extract_todo_list_from_text
-from src.branch_tracker import BranchTracker
-from src.candidate_controller import CandidateController
-from src.event_engine import EventEngine, EventEngineConfig
-from src.memory_structures import (
-    AnswererDecision,
-    EventType,
-    ExecutorActionMode,
-    ExploreIntent,
-    FrontierInstance,
-    HypothesisBranch,
-    NavigationMode,
-    TypedEvent,
-    format_prompt_summary,
-)
-from src.spatial_context import render_bev_context
 
 
 # ---------------------------------------------------------------------------
@@ -116,27 +108,6 @@ def add_egocentric_to_pool(
             "source": "egocentric",
             "step": step,
         })
-    deduplicate_image_pool(pool)
-
-
-def deduplicate_image_pool(pool: List[Dict[str, Any]]) -> None:
-    """Deterministically remove exact duplicate working-memory snapshots."""
-    seen_paths = set()
-    seen_images = set()
-    deduped = []
-    for snap in pool:
-        img_path = snap.get("img_path")
-        img_b64 = snap.get("img_b64")
-        if img_path and img_path in seen_paths:
-            continue
-        if img_b64 and img_b64 in seen_images:
-            continue
-        if img_path:
-            seen_paths.add(img_path)
-        if img_b64:
-            seen_images.add(img_b64)
-        deduped.append(snap)
-    pool[:] = deduped
 
 
 # ---------------------------------------------------------------------------
@@ -252,34 +223,39 @@ def format_frontier_manager_prompt(
 ) -> Tuple[str, list]:
     """Frontier Manager prompt.
 
-    Legacy prompt retained for compatibility tests. The rebuild path does not
-    call a VLM Frontier Manager.
+    Ported from Pred-EQA format_plan_manager_prompt. Outputs
+    'Retain Frontiers: {F_XXX, ...}' using stable frontier IDs.
     """
     sys_prompt = (
         "Task: You are an EXPLORATION DIRECTION MANAGEMENT AGENT responsible "
         "for STRATEGICALLY SELECTING and PRUNING potential frontiers based on "
-        "observed visual images. This legacy prompt is not used by the rebuild "
-        "path, where frontier eligibility is deterministic and limited to "
-        "hard illegal choices.\n\n"
+        "observed visual images. Your goal is to eliminate directions that "
+        "have BOTH OBVIOUSLY BEEN EXPLORED AND ARE IRRELEVANT to answering "
+        "the question.\n\n"
         "Instructions:\n"
-        "1. Treat each frontier ID as a current local instance, not a stable "
-        "long-term memory key.\n"
-        "2. Remove a frontier only when it is deterministically illegal, such "
-        "as unreachable, geometrically invalid, blocked, or tied to a closed "
-        "spatial branch.\n"
-        "3. Do not remove a frontier merely because it was recently selected "
-        "or because a previous visit did not reveal task information.\n"
+        "1. CAREFULLY analyze the provided visual images to identify areas "
+        "that have already been explored.\n"
+        "2. Determine which frontiers (exploration directions) can be safely "
+        "removed because they MEET BOTH CRITERIA:\n"
+        "- They lead to areas ALREADY CONFIRMED AS VISITED with high "
+        "certainty.\n"
+        "- The area or objects within them are CLEARLY UNRELATED TO THE "
+        "QUESTION or its context.\n"
+        "3. ONLY remove such frontiers if BOTH conditions above are MET. If "
+        "ANY DOUBT exists about either exploration status or relevance, KEEP "
+        "THE FRONTIER.\n"
         "4. Retain all other frontiers, including those where there is ANY "
-        "UNCERTAINTY regarding reachability, geometry, or relevance to the "
-        "question.\n"
+        "UNCERTAINTY regarding their exploration status or their relevance to "
+        "the question.\n"
         "5. Maintain spatial awareness: even partially visible rooms or "
         "ambiguous paths should be preserved unless you are ABSOLUTELY "
         "CERTAIN about their irrelevance.\n"
         "6. REMEMBER, the key is to avoid deleting potentially useful "
         "information. When in doubt, err on the side of caution and retain "
         "the frontier.\n"
-        "7. Each frontier has a current ID like F_023. Use this ID (not the "
-        "display index) in your output.\n"
+        "7. Each frontier has a STABLE ID like F_023. Use this ID (not the "
+        "display index) in your output. Frontiers marked DO NOT SELECT or "
+        "status=EXPLORED must be pruned.\n"
     )
     content = []
 
@@ -329,8 +305,13 @@ def format_frontier_manager_prompt(
 def _format_clr_block(history_decision: Optional[Dict[str, Any]]) -> str:
     """Build a 'History Decisions (avoid repeating)' text block from CLR data.
 
-    Only carries explicit wrong answer feedback for old image/object answer
-    paths. Frontier history is represented by typed branch state/events.
+    Mirrors the format of explore_utils.py Prompt_with_AVU_and_CLR L322-345.
+    F2: inject ALL decisions with object_judge=='no', including frontier
+    choices (previously only image/object were injected, leaving the Executor
+    without frontier anti-repeat protection).
+    F1: for image-type decisions, max_point_choice is an img_path (str), not
+    a numeric index — display the path short name so the VLM can associate it
+    with the pool entry rather than showing an opaque raw path.
     """
     if not history_decision:
         return ""
@@ -351,7 +332,21 @@ def _format_clr_block(history_decision: Optional[Dict[str, Any]]) -> str:
             continue
         target_type = decision["target_type"]
         choice = decision.get("max_point_choice", "?")
+        # F2: frontier decisions never get object_judge (no task_check for
+        # frontier), so inject them unconditionally as "already explored" to
+        # give the Executor anti-repeat context. image/object still require
+        # object_judge=='no' (confirmed wrong by task_check).
         if target_type == "frontier":
+            have_decision = True
+            fid = decision.get("frontier_id")
+            if fid is not None:
+                fid_str = f"F_{int(fid):03d}"
+            else:
+                fid_str = str(choice)
+            lines.append(
+                f"    step {s_key}: Choosing Frontier {fid_str} to explore, "
+                "already explored."
+            )
             continue
         if decision.get("object_judge") != "no":
             continue
@@ -458,11 +453,6 @@ def format_answerer_prompt(
         "   - for attribute questions, the attribute itself is visible.\n"
         "   Otherwise use CANDIDATE_VISIBLE (if something plausible is "
         "visible) or NOT_FOUND.\n"
-        "6. Also assess active hypotheses. For each active hypothesis with "
-        "new visual evidence, add an evidence_updates item with result "
-        "SUPPORT, WEAKEN, CONTRADICT, or TEST_COMPLETED. Mention observed "
-        "cues, missing expected cues, coverage, confidence, and test_status. "
-        "Do not directly edit hypotheses; only report evidence.\n"
     )
 
     content = []
@@ -505,24 +495,26 @@ def format_answerer_prompt(
     # Output format
     text = (
         "Output Format:\n"
-        "Return only JSON with this schema:\n"
-        "{\n"
-        '  "decision": "NOT_FOUND | CANDIDATE_VISIBLE | TARGET_CONFIRMED | ANSWER_READY",\n'
-        '  "candidate": {"image": <int or null>, "target_phrase": "<phrase or null>"},\n'
-        '  "evidence_updates": [\n'
-        '    {"hypothesis_id": "H001", "result": "SUPPORT|WEAKEN|CONTRADICT|TEST_COMPLETED", '
-        '"observed_cues": [], "missing_expected_cues": [], "coverage": "NONE|PARTIAL|FULL", '
-        '"confidence": 0.0, "test_status": "IN_PROGRESS|COMPLETED"}\n'
-        "  ],\n"
-        '  "evidence_conflict": false,\n'
-        '  "visibility": {\n'
-        '    "directly_visible": "yes|no",\n'
-        '    "central_enough": "yes|no",\n'
-        '    "partially_occluded": "yes|no",\n'
-        '    "confidence": <0.0-1.0>\n'
-        "  },\n"
-        '  "reason": "<one concise sentence>"\n'
-        "}\n"
+        "1. First, think step by step and explain your reasoning clearly.\n"
+        "2. Then output a structured decision block in EXACTLY this format:\n"
+        "Decision: NOT_FOUND | CANDIDATE_VISIBLE | TARGET_CONFIRMED\n"
+        "Image: <i>          (image index; omit if NOT_FOUND)\n"
+        "Target phrase: <class>   (target category; omit if NOT_FOUND)\n"
+        "Visibility:\n"
+        "  directly_visible: yes | no\n"
+        "  central_enough: yes | no\n"
+        "  partially_occluded: yes | no\n"
+        "  approximate_location: <short text, e.g. 'right side near lamp'>\n"
+        "  confidence: <0.0-1.0>\n"
+        "Need action: move closer | rotate | ground with AVU | none\n"
+        "\n"
+        "Examples:\n"
+        "Decision: TARGET_CONFIRMED\n"
+        "Image: 3\n"
+        "Target phrase: espresso machine\n"
+        "...\n"
+        "Decision: NOT_FOUND\n"
+        "(no Image / Target phrase lines)\n"
     )
     content.append((text,))
     return sys_prompt, content
@@ -749,8 +741,8 @@ def format_executor_prompt(
 ) -> Tuple[str, list]:
     """Low-Level Executor prompt.
 
-    Rebuild executor prompt. Outputs typed JSON action:
-    frontier_id, spatial_branch_id, hypothesis_id, action_mode, reason_code.
+    Ported from Pred-EQA format_explore_prompt. Outputs 'Frontier i' or
+    'Stop Exploration'.
     """
     sys_prompt = (
         "Task: You are an indoor agent that needs to PHYSICALLY NAVIGATE "
@@ -790,9 +782,9 @@ def format_executor_prompt(
     content.append((f"Task type: {task_type}\n",))
 
     if high_level_plan:
-        content.append((f"Current Hypotheses / Search State:\n{high_level_plan}\n",))
+        content.append((f"Current High-Level Plan:\n{high_level_plan}\n",))
     else:
-        content.append(("No active hypotheses yet.\n",))
+        content.append(("No high-level plan yet.\n",))
 
     # Previously observed clues
     content.append(("Previously Observed Clues:\n",))
@@ -811,19 +803,12 @@ def format_executor_prompt(
         for i, img in enumerate(frontier_imgs):
             fs = frontier_states[i] if frontier_states and i < len(frontier_states) else None
             if fs is not None:
-                try:
-                    header_str = fs.to_prompt_str(local_index=i)
-                except TypeError:
-                    header_str = fs.to_prompt_str()
-                header = f"Frontier {header_str}: "
+                header = f"Frontier {fs.to_prompt_str(local_index=i)}: "
             else:
                 header = f"Frontier {i}: "
             content.append((header, img))
             content.append(("\n",))
-        ids = [
-            fs.frontier_id for fs in frontier_states
-            if fs is not None and hasattr(fs, "frontier_id")
-        ] if frontier_states else list(range(len(frontier_imgs)))
+        ids = [fs.frontier_id for fs in frontier_states] if frontier_states else list(range(len(frontier_imgs)))
         id_strs = ", ".join(f"F_{i:03d}" for i in ids)
         content.append((f"Available Frontier IDs: {id_strs}\n",))
 
@@ -838,17 +823,11 @@ def format_executor_prompt(
 
     text = (
         "Output Format:\n"
-        "Return only JSON with this schema:\n"
-        "{\n"
-        '  "frontier_id": <int or null>,\n'
-        '  "spatial_branch_id": "<branch id or null>",\n'
-        '  "hypothesis_id": "<hypothesis id or null>",\n'
-        '  "action_mode": "CONTINUE_SPATIAL_BRANCH | SWITCH_SPATIAL_BRANCH | REVISIT_SPATIAL_BRANCH | STOP",\n'
-        '  "reason_code": "<short code>",\n'
-        '  "reason": "<one concise sentence>"\n'
-        "}\n"
-        "Choose STOP only when there is no selectable frontier. Do not select "
-        "frontiers marked unselectable."
+        "1. First, think step by step and explain your reasoning clearly.\n"
+        "2. Then, provide your final answer in the exact format: "
+        '"Next Step: Frontier F_XXX" or "Stop Exploration", where F_XXX is '
+        "the stable ID of the frontier you choose. Do NOT select frontiers "
+        "marked DO NOT SELECT or status=EXPLORED."
     )
     content.append((text,))
     return sys_prompt, content
@@ -901,39 +880,13 @@ def parse_answerer_response(
 
     Returns:
         (decision, idx_or_None, class_name_or_None) where decision is one of
-        'NOT_FOUND' | 'CANDIDATE_VISIBLE' | 'TARGET_CONFIRMED' | 'ANSWER_READY'.
+        'NOT_FOUND' | 'CANDIDATE_VISIBLE' | 'TARGET_CONFIRMED'.
         Returns ('NOT_FOUND', None, None) on parse failure / Continue.
     """
     if response is None:
         return ("NOT_FOUND", None, None)
     text = response.strip()
     lower = text.lower()
-
-    payload = _extract_json_object(text)
-    if payload:
-        decision = str(payload.get("decision", "NOT_FOUND")).strip().upper()
-        if decision not in {
-            "NOT_FOUND",
-            "CANDIDATE_VISIBLE",
-            "TARGET_CONFIRMED",
-            "ANSWER_READY",
-        }:
-            return ("NOT_FOUND", None, None)
-        if decision == "NOT_FOUND":
-            return ("NOT_FOUND", None, None)
-        candidate = payload.get("candidate") or {}
-        if not isinstance(candidate, dict):
-            return ("NOT_FOUND", None, None)
-        idx = candidate.get("image")
-        try:
-            idx = int(idx) if idx is not None else None
-        except (TypeError, ValueError):
-            idx = None
-        class_name = candidate.get("target_phrase")
-        class_name = str(class_name).strip() if class_name is not None else None
-        if idx is None or not class_name:
-            return ("NOT_FOUND", None, None)
-        return (decision, idx, class_name)
 
     # Detect decision keyword (case-insensitive). Prefer the last occurrence.
     decision = None
@@ -986,9 +939,6 @@ def parse_answerer_visibility(response: Optional[str]) -> dict:
     / confidence. Missing fields are omitted (caller applies tolerant defaults)."""
     if response is None:
         return {}
-    payload = _extract_json_object(response)
-    if payload and isinstance(payload.get("visibility"), dict):
-        return dict(payload["visibility"])
     out: dict = {}
     for key in ("directly_visible", "central_enough", "partially_occluded"):
         m = re.search(rf"{key}\s*[:：]\s*(\w+)", response, re.IGNORECASE)
@@ -1001,31 +951,6 @@ def parse_answerer_visibility(response: Optional[str]) -> dict:
         except ValueError:
             pass
     return out
-
-
-def parse_answerer_evidence(response: Optional[str]) -> Tuple[List[Any], bool]:
-    payload = _extract_json_object(response)
-    if not payload:
-        return [], False
-    updates = payload.get("evidence_updates", [])
-    if not isinstance(updates, list):
-        updates = [updates]
-    normalized = []
-    for update in updates:
-        if not isinstance(update, dict):
-            continue
-        item = dict(update)
-        if "id" in item and "hypothesis_id" not in item:
-            item["hypothesis_id"] = item.pop("id")
-        if "result" in item:
-            item["result"] = str(item["result"]).strip().upper()
-        item.setdefault("observed_cues", [])
-        item.setdefault("missing_expected_cues", [])
-        item.setdefault("coverage", "UNKNOWN")
-        item.setdefault("confidence", 0.0)
-        item.setdefault("test_status", "IN_PROGRESS")
-        normalized.append(item)
-    return normalized, bool(payload.get("evidence_conflict", False))
 
 
 def sanitize_answerer_decision(
@@ -1077,7 +1002,7 @@ def parse_executor_response(response: Optional[str]) -> int:
 
 
 def parse_executor_frontier_id(response: Optional[str]) -> int:
-    """Parse Executor response for a current frontier instance ID.
+    """Parse Executor response for a stable frontier ID.
 
     Returns:
         frontier_id (int) for 'Frontier F_XXX', or -1 for 'Stop Exploration'
@@ -1105,187 +1030,6 @@ def parse_executor_frontier_id(response: Optional[str]) -> int:
         except ValueError:
             return -1
     return -1
-
-
-def _extract_json_object(response: Optional[str]) -> Optional[Dict[str, Any]]:
-    if response is None:
-        return None
-    text = response.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end < start:
-        return None
-    try:
-        parsed = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def parse_executor_json_response(
-    response: Optional[str],
-) -> Tuple[Optional[ExploreIntent], str]:
-    """Parse Executor JSON. Malformed output maps to STOP, not random choice."""
-    payload = _extract_json_object(response)
-    if not payload:
-        legacy_id = parse_executor_frontier_id(response)
-        if legacy_id >= 0:
-            return (
-                ExploreIntent(
-                    frontier_id=legacy_id,
-                    action_mode=ExecutorActionMode.CONTINUE_SPATIAL_BRANCH,
-                    reason_code="LEGACY_FRONTIER",
-                ),
-                _extract_reason(response),
-            )
-        return (
-            ExploreIntent(
-                mode=NavigationMode.STOP,
-                action_mode=ExecutorActionMode.STOP,
-                reason_code="EXECUTOR_PARSE_FAIL",
-                reason="Executor response was not valid JSON.",
-            ),
-            _extract_reason(response),
-        )
-    action_mode = str(payload.get("action_mode") or "STOP").strip()
-    if action_mode not in ExecutorActionMode.__members__:
-        # Accept enum values as well as member names.
-        by_value = {m.value: m for m in ExecutorActionMode}
-        action = by_value.get(action_mode, ExecutorActionMode.STOP)
-    else:
-        action = ExecutorActionMode[action_mode]
-    fid = payload.get("frontier_id")
-    try:
-        fid = int(fid) if fid is not None else None
-    except (TypeError, ValueError):
-        fid = None
-    mode = NavigationMode.STOP if action == ExecutorActionMode.STOP else NavigationMode.EXPLORE
-    intent = ExploreIntent(
-        mode=mode,
-        frontier_id=fid,
-        spatial_branch_id=payload.get("spatial_branch_id"),
-        hypothesis_id=payload.get("hypothesis_id"),
-        action_mode=action,
-        reason_code=str(payload.get("reason_code") or action.value),
-        reason=str(payload.get("reason") or ""),
-    )
-    return intent, intent.reason
-
-
-def parse_hypothesis_manager_response(
-    response: Optional[str],
-    step_index: int,
-    existing_hypotheses: Optional[Dict[str, HypothesisBranch]] = None,
-) -> Tuple[List[HypothesisBranch], str]:
-    """Parse Hypothesis Manager JSON output.
-
-    Expected shape:
-      {"updates": [...], "new_hypotheses": [...]}
-    ``updates`` may be partial spec-style commands such as
-    {"hypothesis_id": "H001", "decision": "REJECT", "reason": "..."}.
-    Existing fields are preserved unless explicitly revised. New hypotheses may
-    omit IDs; this parser assigns stable H### IDs for the current response.
-    """
-    payload = _extract_json_object(response)
-    if not payload:
-        return [], _extract_reason(response)
-    existing_hypotheses = existing_hypotheses or {}
-    hypotheses: List[HypothesisBranch] = []
-    used_ids = set(existing_hypotheses.keys())
-
-    def _next_hypothesis_id() -> str:
-        idx = 1
-        while True:
-            hyp_id = f"H{idx:03d}"
-            if hyp_id not in used_ids:
-                used_ids.add(hyp_id)
-                return hyp_id
-            idx += 1
-
-    decision_status = {
-        "ACTIVE": "ACTIVE",
-        "ACTIVATE": "ACTIVE",
-        "KEEP": None,
-        "REVISE": "ACTIVE",
-        "SUPPORT": "SUPPORTED",
-        "SUPPORTED": "SUPPORTED",
-        "REJECT": "REJECTED",
-        "REJECTED": "REJECTED",
-        "DONE": "DONE",
-        "COMPLETE": "DONE",
-        "COMPLETED": "DONE",
-        "CONFIRM": "CONFIRMED",
-        "CONFIRMED": "CONFIRMED",
-    }
-
-    for section in ("updates", "new_hypotheses"):
-        items = payload.get(section, [])
-        if isinstance(items, dict):
-            items = [items]
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            item = dict(item)
-            hyp_id = item.get("hypothesis_id") or item.get("id")
-            if section == "new_hypotheses" and not hyp_id:
-                hyp_id = _next_hypothesis_id()
-            if not hyp_id:
-                continue
-            hyp_id = str(hyp_id)
-            used_ids.add(hyp_id)
-
-            base: Dict[str, Any] = {}
-            if section == "updates" and hyp_id in existing_hypotheses:
-                base = existing_hypotheses[hyp_id].to_dict()
-
-            decision = str(item.pop("decision", "") or "").strip().upper()
-            reason = str(item.pop("reason", "") or "").strip()
-            mapped_status = decision_status.get(decision)
-            if mapped_status and "status" not in item:
-                item["status"] = mapped_status
-            if reason and "revision_reason" not in item:
-                item["revision_reason"] = reason
-
-            item.pop("id", None)
-            summary = item.pop("summary", None)
-            if "claim" not in item:
-                if "description" in item:
-                    item["claim"] = item["description"]
-                elif summary is not None:
-                    item["claim"] = summary
-            if not item.get("claim") and not base.get("claim"):
-                continue
-
-            merged = dict(base)
-            for key, value in item.items():
-                if value is not None:
-                    merged[key] = value
-            if decision == "REJECT" and reason:
-                negative = list(merged.get("negative_evidence") or [])
-                if reason not in negative:
-                    negative.append(reason)
-                merged["negative_evidence"] = negative
-            elif decision in {"SUPPORT", "SUPPORTED"} and reason:
-                positive = list(merged.get("positive_evidence") or [])
-                if reason not in positive:
-                    positive.append(reason)
-                merged["positive_evidence"] = positive
-
-            merged["hypothesis_id"] = hyp_id
-            merged["claim"] = str(merged["claim"])
-            merged.setdefault("created_step", step_index)
-            merged["updated_step"] = step_index
-            merged["writer"] = "HypothesisManager"
-            try:
-                hypotheses.append(HypothesisBranch.from_dict(merged))
-            except Exception:
-                continue
-    return hypotheses, str(payload.get("reason") or "")
 
 
 def parse_retain_frontier_ids(
@@ -1366,7 +1110,7 @@ def _frontier_heuristic_score(fs, frontier_img, pool, high_level_plan, question)
         novelty = 1.0 if fs.first_seen_step == fs.last_seen_step else 0.3
         info_gain = min(getattr(fs, "area", 0.0) / 100.0, 1.0)
         repeat_penalty = getattr(fs, "selected_count", 0)
-        failed_branch_penalty = 1 if getattr(fs, "last_result", None) == "BLOCKED" else 0
+        failed_branch_penalty = 1 if getattr(fs, "last_result", None) in ("NO_NEW_INFO", "BLOCKED") else 0
     # plan_alignment: simple room-word overlap between plan and question
     plan_alignment = 0.0
     if high_level_plan and question:
@@ -1386,343 +1130,15 @@ def _frontier_heuristic_score(fs, frontier_img, pool, high_level_plan, question)
     return score
 
 
-def _get_rebuild_engines(working_memory, is_new_subtask: bool):
-    if working_memory is None:
-        return BranchTracker(), EventEngine()
-    branch_tracker = getattr(working_memory, "_branch_tracker", None)
-    if branch_tracker is None:
-        branch_tracker = BranchTracker()
-        setattr(working_memory, "_branch_tracker", branch_tracker)
-    event_engine = getattr(working_memory, "_event_engine", None)
-    if event_engine is None:
-        event_engine = EventEngine(EventEngineConfig())
-        setattr(working_memory, "_event_engine", event_engine)
-    if is_new_subtask:
-        event_engine.reset_task_scope()
-    return branch_tracker, event_engine
-
-
-def _frontier_images_for_instances(
-    frontier_imgs: List[str],
-    frontier_instances: List[FrontierInstance],
-) -> Tuple[List[str], List[FrontierInstance]]:
-    imgs: List[str] = []
-    instances: List[FrontierInstance] = []
-    for inst in frontier_instances:
-        local_index = inst.local_index
-        if local_index is None or local_index < 0 or local_index >= len(frontier_imgs):
-            continue
-        imgs.append(frontier_imgs[local_index])
-        instances.append(inst)
-    return imgs, instances
-
-
-def _events_prompt_block(events: List[TypedEvent]) -> str:
-    if not events:
-        return ""
-    return "Typed Events:\n" + "\n".join(e.to_prompt_str() for e in events) + "\n"
-
-
-def _append_events(
-    typed_events: List[TypedEvent],
-    events: List[TypedEvent],
-    working_memory,
-) -> None:
-    typed_events.extend(events)
-    if working_memory is None:
-        return
-    for event in events:
-        working_memory.add_typed_event(event)
-
-
-def _finalize_events(
-    step: Dict[str, Any],
-    working_memory,
-    typed_events: List[TypedEvent],
-) -> None:
-    step["typed_events"] = typed_events
-    if working_memory is not None:
-        working_memory.mark_events_consumed(typed_events)
-
-
-def _run_memory_manager(
-    question: str,
-    pool: List[Dict[str, Any]],
-    high_level_plan: Optional[str],
-    task_type: str,
-    image_goal: Optional[str],
-    pinned_paths: set,
-    max_pool: int,
-    should_call: bool,
-    verbose: bool,
-) -> Tuple[List[Dict[str, Any]], int]:
-    nonpinned_idx = [
-        i for i, snap in enumerate(pool)
-        if snap.get("img_path") not in pinned_paths
-    ]
-    if not should_call or len(nonpinned_idx) == 0:
-        logging.info("[Image Manager] skipped (no memory trigger)")
-        return pool, 0
-
-    sys_p, content = format_image_manager_prompt(
-        question, pool, high_level_plan, task_type, image_goal
-    )
-    if verbose:
-        logging.info("[Image Manager] calling VLM (event-triggered)")
-    raw = call_openai_api(sys_p, content)
-    retain_idx = parse_retain_response(raw, "Images")
-    pinned_idx = [
-        i for i in range(len(pool))
-        if pool[i].get("img_path") in pinned_paths
-    ]
-    if retain_idx:
-        retained_nonpinned = {
-            i for i in retain_idx
-            if i in nonpinned_idx and 0 <= i < len(pool)
-        }
-        keep_idx = sorted(set(pinned_idx) | retained_nonpinned)
-    else:
-        nonpinned_idx_cur = [
-            i for i in range(len(pool))
-            if pool[i].get("img_path") not in pinned_paths
-        ]
-        keep_nonpinned = (
-            nonpinned_idx_cur[-(max_pool - len(pinned_idx)):]
-            if max_pool > len(pinned_idx)
-            else []
-        )
-        keep_idx = sorted(set(pinned_idx) | set(keep_nonpinned))
-    if len(keep_idx) > max_pool:
-        pinned_set = set(pinned_idx)
-        nonpinned_keep = [i for i in keep_idx if i not in pinned_set]
-        nonpinned_keep = nonpinned_keep[-max(max_pool - len(pinned_set), 0):]
-        keep_idx = sorted(pinned_set | set(nonpinned_keep))
-    if len(keep_idx) >= len(pool):
-        return pool, 0
-    new_pool = [pool[i] for i in keep_idx]
-    n_filtered = len(pool) - len(new_pool)
-    logging.info(
-        f"[Image Manager] event-filtered {n_filtered} images, "
-        f"{len(new_pool)} retained"
-    )
-    return new_pool, n_filtered
-
-
-def _hypotheses_prompt_block(working_memory) -> str:
-    if working_memory is None or not getattr(working_memory, "hypotheses", None):
-        return ""
-    return (
-        "Active Hypotheses:\n"
-        + format_prompt_summary(list(working_memory.hypotheses.values()))
-        + "\n"
-    )
-
-
-def _branches_prompt_block(working_memory) -> str:
-    if working_memory is None:
-        return ""
-    branches = list(getattr(working_memory, "spatial_branches", {}).values())
-    states = list(getattr(working_memory, "branch_task_states", {}).values())
-    blocks = []
-    if branches:
-        blocks.append("Spatial Branches:\n" + format_prompt_summary(branches))
-    if states:
-        blocks.append("Branch Task State:\n" + format_prompt_summary(states))
-    return "\n".join(blocks) + ("\n" if blocks else "")
-
-
-def _has_active_hypothesis(working_memory) -> bool:
-    if working_memory is None:
-        return False
-    for hyp in getattr(working_memory, "hypotheses", {}).values():
-        status = getattr(hyp.status, "value", str(hyp.status))
-        if status not in {"REJECTED", "DONE", "CONFIRMED"}:
-            return True
-    return False
-
-
-def _safe_bev_block(
-    tsdf_planner,
-    frontier_instances,
-    current_position,
-    current_yaw=None,
-    recent_decision_poses=None,
-) -> Tuple[str, list]:
-    if tsdf_planner is None:
-        return "", []
-    try:
-        bev = render_bev_context(
-            tsdf_planner,
-            current_pose=current_position,
-            current_yaw=current_yaw,
-            frontier_instances=frontier_instances,
-            recent_decision_poses=recent_decision_poses,
-        )
-        img_b64 = encode_tensor2base64(bev.image)
-        labels = ", ".join(bev.labels)
-        return f"BEV labels: {labels}\n", [("Spatial BEV Context:\n", img_b64)]
-    except Exception as exc:
-        logging.info(f"[spatial_context] BEV render skipped: {exc}")
-        return "", []
-
-
-def format_hypothesis_manager_prompt(
-    question: str,
-    task_type: str,
-    events: List[TypedEvent],
-    working_memory,
-    bev_label_block: str = "",
-) -> Tuple[str, list]:
-    sys_prompt = (
-        "Task: You are the HYPOTHESIS MANAGER. You are the only writer of "
-        "HypothesisBranch state. Update search hypotheses from typed events, "
-        "spatial branches, and evidence. Do not choose navigation actions.\n\n"
-        "Maintain concrete, testable predictive hypotheses. Every active "
-        "hypothesis must state expected cues, contradiction cues, and the next "
-        "test that would support or reject it. Do not output a free-text TODO "
-        "list.\n\n"
-        "Return only JSON with this schema:\n"
-        "{\n"
-        '  "updates": [\n'
-        '    {"hypothesis_id": "H001", "decision": "KEEP|REVISE|REJECT|DONE", '
-        '"reason": "...", "claim": "<optional revised claim>", '
-        '"expected_cues": [], "contradiction_cues": [], '
-        '"status": "PENDING|ACTIVE|SUPPORTED|REJECTED|DONE|CONFIRMED", '
-        '"positive_evidence": [], "negative_evidence": [], "next_test": "..."}\n'
-        "  ],\n"
-        '  "new_hypotheses": [\n'
-        '    {"claim": "...", "expected_cues": [], "contradiction_cues": [], '
-        '"anchor": {"kind": "spatial_branch", "spatial_branch_id": "B001"}, '
-        '"anchors": [{"kind": "spatial_branch", "spatial_branch_id": "B001"}], '
-        '"next_test": "...", '
-        '"linked_spatial_branches": [], "confidence": 0.0}\n'
-        "  ],\n"
-        '  "reason": "<short reason>"\n'
-        "}\n"
-        'Never return anchor or anchors as plain strings like "B001"; use '
-        'the object form above, or null/[] when there is no reliable anchor.\n'
-    )
-    content = [
-        (f"Target Question: {question}\nTask type: {task_type}\n",),
-        (_events_prompt_block(events),),
-    ]
-    branches = _branches_prompt_block(working_memory)
-    if branches:
-        content.append((branches,))
-    hyps = _hypotheses_prompt_block(working_memory)
-    if hyps:
-        content.append((hyps,))
-    if bev_label_block:
-        content.append((bev_label_block,))
-    return sys_prompt, content
-
-
-def _run_hypothesis_manager(
-    question: str,
-    task_type: str,
-    typed_events: List[TypedEvent],
-    working_memory,
-    bev_label_block: str,
-    bev_content: list,
-    step_index: int,
-    step: Dict[str, Any],
-    verbose: bool,
-    event_engine: Optional[EventEngine] = None,
-) -> List[TypedEvent]:
-    sys_p, content = format_hypothesis_manager_prompt(
-        question=question,
-        task_type=task_type,
-        events=typed_events,
-        working_memory=working_memory,
-        bev_label_block=bev_label_block,
-    )
-    if bev_content:
-        content.extend(bev_content)
-    if verbose:
-        logging.info("[Hypothesis Manager] calling VLM")
-    raw = call_openai_api(sys_p, content)
-    hypotheses, hyp_reason = parse_hypothesis_manager_response(
-        raw,
-        step_index,
-        existing_hypotheses=getattr(working_memory, "hypotheses", None),
-    )
-    revised_events: List[TypedEvent] = []
-    if hypotheses and working_memory is not None:
-        working_memory.set_hypotheses_from_manager(hypotheses)
-        logging.info(
-            f"[Hypothesis Manager] applied {len(hypotheses)} updates"
-        )
-        if event_engine is not None:
-            revised_event = event_engine.emit(
-                EventType.HYPOTHESIS_REVISED,
-                step=step_index,
-                entity_id="hypothesis_store",
-                payload={
-                    "hypothesis_ids": [hyp.hypothesis_id for hyp in hypotheses],
-                    "reason": hyp_reason,
-                },
-            )
-            if revised_event is not None:
-                working_memory.add_typed_event(revised_event)
-                revised_events.append(revised_event)
-    else:
-        logging.info("[Hypothesis Manager] no valid hypothesis updates")
-    if hyp_reason:
-        _record_step_summary(step, f"Hypothesis Manager: {hyp_reason}")
-    return revised_events
-
-
-def _hypothesis_state_after_routing(
-    question: str,
-    task_type: str,
-    typed_events: List[TypedEvent],
-    working_memory,
-    event_engine: EventEngine,
-    bev_label_block: str,
-    bev_content: list,
-    step_index: int,
-    step: Dict[str, Any],
-    verbose: bool,
-) -> str:
-    routing = event_engine.route(typed_events, working_memory=working_memory)
-    if routing.call_hypothesis_manager:
-        revised_events = _run_hypothesis_manager(
-            question=question,
-            task_type=task_type,
-            typed_events=typed_events,
-            working_memory=working_memory,
-            bev_label_block=bev_label_block,
-            bev_content=bev_content,
-            step_index=step_index,
-            step=step,
-            verbose=verbose,
-            event_engine=event_engine,
-        )
-        typed_events.extend(revised_events)
-    else:
-        logging.info("[Hypothesis Manager] skipped (no trigger)")
-
-    hypothesis_state = (
-        _hypotheses_prompt_block(working_memory)
-        + _branches_prompt_block(working_memory)
-    )
-    if hypothesis_state:
-        step["high_level_plan"] = hypothesis_state
-        if working_memory is not None:
-            working_memory.update_plan(hypothesis_state)
-    return hypothesis_state
-
-
 def explore_multi_agent(
     step: Dict[str, Any],
     cfg,
     verbose: bool = False,
-) -> Tuple[Any, Any, Optional[str], int, Optional[str]]:
-    """Rebuild exploration workflow main entry.
+) -> Tuple[str, Any, Optional[str], int, Optional[str]]:
+    """Multi-agent exploration workflow main entry.
 
-    Runs the direct-replacement typed flow:
-    Answerer -> typed events -> optional Memory/Hypothesis Managers ->
-    BranchTracker eligibility -> JSON Executor.
+    Runs the 5-agent chain: Image Manager -> Frontier Manager -> Answerer
+    -> High-Level Planner -> Executor. Returns the decision for this step.
 
     Args:
         step: step dict. Expected keys:
@@ -1740,13 +1156,14 @@ def explore_multi_agent(
         verbose: enable verbose logging.
 
     Returns:
-        (target_type_or_intent, target_index_or_goal, reason, n_filtered, class_name)
-        - typed intent: target_index_or_goal = navigation goal for planner
-        - frontier: target_index_or_goal = frontier local index
+        (target_type, target_index_or_choice, reason, n_filtered, class_name)
+        - target_type: 'image' | 'frontier' | 'stop'
+        - image: target_index = pool[i].img_path (for query_vlm depth/cam_pose)
+        - frontier: target_index = frontier index
         - stop: target_index = None
         - reason: VLM reasoning string (may be "")
         - n_filtered: number of images filtered by Image Manager
-        - class_name: image path for typed candidate intents, else None
+        - class_name_if_image: target class name for image answers, else None
     """
     logging.info("[explore_multi_agent] start")
 
@@ -1773,32 +1190,7 @@ def explore_multi_agent(
     # Phase B: working memory (SubtaskWorkingMemory) if provided by main loop
     working_memory = step.get("working_memory", None)
 
-    branch_tracker, event_engine = _get_rebuild_engines(
-        working_memory, is_new_subtask
-    )
-
-    # b. image pool maintenance
-    pool = step.get("image_pool", None)
-    if is_new_subtask or pool is None:
-        pool = build_image_pool_from_kss(
-            step_index, scene, processed_images, image_map_reverse
-        )
-        deduplicate_image_pool(pool)
-        logging.info(
-            f"[explore_multi_agent] built pool from KSS: {len(pool)} images"
-        )
-    else:
-        add_egocentric_to_pool(pool, egocentric_imgs, step_index)
-        logging.info(
-            f"[explore_multi_agent] added {len(egocentric_imgs)} egocentric, "
-            f"pool size now {len(pool)}"
-        )
-    step["image_pool"] = pool
-
-    n_filtered = 0
-    max_pool = getattr(cfg, "max_pool_size", 6)
-    event_engine.config.memory_pool_budget = max_pool
-
+    # §2: prune stale candidates each step (closer-view limit)
     if working_memory is not None:
         max_attempts = getattr(cfg, "candidate_max_closer_view_attempts", 3)
         for c in list(working_memory.active_candidates()):
@@ -1808,151 +1200,171 @@ def explore_multi_agent(
                     f"(closer-view limit {max_attempts} reached)"
                 )
 
-    # BranchTracker: FrontierInstance is transient, SpatialBranchRecord is
-    # durable. The VLM Frontier Manager is not called in the rebuild path.
-    typed_events: List[TypedEvent] = (
-        working_memory.pop_pending_typed_events(step_index)
-        if working_memory is not None
-        else []
-    )
-    if tsdf_planner is not None and working_memory is not None:
-        frontier_instances, branch_events = branch_tracker.sync_frontiers(
-            tsdf_planner=tsdf_planner,
-            working_memory=working_memory,
-            step=step_index,
-            current_position=step.get("current_position"),
+    # b. image pool maintenance
+    pool = step.get("image_pool", None)
+    if is_new_subtask or pool is None:
+        # (Re)build pool from KSS processed_images
+        pool = build_image_pool_from_kss(
+            step_index, scene, processed_images, image_map_reverse
         )
-        branch_events = event_engine.debounce_events(branch_events)
-        _append_events(typed_events, branch_events, working_memory)
+        logging.info(
+            f"[explore_multi_agent] built pool from KSS: {len(pool)} images"
+        )
     else:
-        frontier_instances = []
-        if tsdf_planner is not None:
-            for local_index, frontier in enumerate(tsdf_planner.frontiers):
-                try:
-                    position = tsdf_planner.voxel2habitat(frontier.position)
-                except Exception:
-                    position = frontier.position
-                frontier_instances.append(
-                    FrontierInstance(
-                        frontier_id=int(frontier.frontier_id),
-                        position=position,
-                        orientation=getattr(frontier, "orientation", None),
-                        area=float(getattr(frontier, "region", []).sum())
-                        if hasattr(getattr(frontier, "region", None), "sum")
-                        else 0.0,
-                        local_index=local_index,
-                        image=getattr(frontier, "image", None),
-                        updated_step=step_index,
-                    )
-                )
-
-    pinned_paths = set(working_memory.pinned_ids) if working_memory is not None else set()
-    nonpinned_idx = [
-        i for i, snap in enumerate(pool)
-        if snap.get("img_path") not in pinned_paths
-    ]
-    memory_events = event_engine.detect_memory_events(
-        pool_size=len(nonpinned_idx),
-        step=step_index,
-        working_memory=working_memory,
-    )
-    typed_events.extend(memory_events)
-    if working_memory is not None and not _has_active_hypothesis(working_memory):
-        no_hypothesis_event = event_engine.emit(
-            EventType.NO_ACTIVE_HYPOTHESIS,
-            step=step_index,
-            entity_id=working_memory.subtask_id or "subtask",
-            payload={"reason": "no active hypotheses for current subtask"},
-            severity="warning",
+        # Append current-step egocentric views
+        add_egocentric_to_pool(pool, egocentric_imgs, step_index)
+        logging.info(
+            f"[explore_multi_agent] added {len(egocentric_imgs)} egocentric, "
+            f"pool size now {len(pool)}"
         )
-        if no_hypothesis_event is not None:
-            _append_events(typed_events, [no_hypothesis_event], working_memory)
-    routing = event_engine.route(typed_events, working_memory=working_memory)
 
-    pool, filtered_now = _run_memory_manager(
-        question=question,
-        pool=pool,
-        high_level_plan=high_level_plan,
-        task_type=task_type,
-        image_goal=image_goal,
-        pinned_paths=pinned_paths,
-        max_pool=max_pool,
-        should_call=routing.call_memory_manager,
-        verbose=verbose,
-    )
-    n_filtered += filtered_now
+    # Write pool back so the main loop can carry it across steps
     step["image_pool"] = pool
 
-    bev_label_block, bev_content = _safe_bev_block(
-        tsdf_planner,
-        frontier_instances,
-        step.get("current_position"),
-        current_yaw=step.get("current_yaw"),
-        recent_decision_poses=step.get("recent_decision_poses"),
-    )
+    n_filtered = 0
 
-    # Answerer / Evidence Assessor.
+    # Phase D: pinned evidence (from active candidates) is forced-kept.
+    pinned_paths = set()
+    if working_memory is not None:
+        pinned_paths = set(working_memory.pinned_ids)
+    max_pool = getattr(cfg, "max_pool_size", 6)
+
+    # c. Image Manager — only filters NON-pinned images; pinned are forced-kept.
+    # Manager only runs when non-pinned count > 3 (pinned don't need filtering).
+    nonpinned_idx = [i for i, s in enumerate(pool) if s.get("img_path") not in pinned_paths]
+    if len(nonpinned_idx) > 3:
+        sys_p, content = format_image_manager_prompt(
+            question, pool, high_level_plan, task_type, image_goal
+        )
+        if verbose:
+            logging.info("[Image Manager] calling VLM")
+        raw = call_openai_api(sys_p, content)
+        retain_idx = parse_retain_response(raw, "Images")
+        if retain_idx:
+            # retained set = pinned ∪ (retain_idx ∩ nonpinned)
+            retained_nonpinned = set(i for i in retain_idx if i in nonpinned_idx and 0 <= i < len(pool))
+            pinned_idx = [i for i in range(len(pool)) if pool[i].get("img_path") in pinned_paths]
+            keep_idx = sorted(set(pinned_idx) | retained_nonpinned)
+            # cap: if still over max_pool, drop oldest non-pinned first
+            if len(keep_idx) > max_pool:
+                pinned_set = set(pinned_idx)
+                nonpinned_keep = [i for i in keep_idx if i not in pinned_set]
+                drop_n = len(keep_idx) - max_pool
+                nonpinned_keep = nonpinned_keep[drop_n:]  # drop oldest non-pinned
+                keep_idx = sorted(set(pinned_set) | set(nonpinned_keep))
+            new_pool = [pool[i] for i in keep_idx]
+            n_filtered = len(pool) - len(new_pool)
+            if n_filtered > 0 or len(new_pool) != len(pool):
+                logging.info(
+                    f"[Image Manager] filtered {n_filtered} images, "
+                    f"{len(new_pool)} retained (pinned={len(pinned_idx)})"
+                )
+                pool = new_pool
+                step["image_pool"] = pool
+        else:
+            # Fallback: keep pinned + latest (max_pool - pinned) non-pinned
+            pinned_idx = [i for i in range(len(pool)) if pool[i].get("img_path") in pinned_paths]
+            nonpinned_idx_cur = [i for i in range(len(pool)) if pool[i].get("img_path") not in pinned_paths]
+            keep_nonpinned = nonpinned_idx_cur[-(max_pool - len(pinned_idx)):] if max_pool > len(pinned_idx) else []
+            keep_idx = sorted(set(pinned_idx) | set(keep_nonpinned))
+            if len(keep_idx) < len(pool):
+                logging.info(
+                    f"[Image Manager] no valid retain response, "
+                    f"fallback keep {len(keep_idx)} (pinned={len(pinned_idx)})"
+                )
+                pool = [pool[i] for i in keep_idx]
+                step["image_pool"] = pool
+            else:
+                logging.info(
+                    "[Image Manager] no valid retain response, keeping pool"
+                )
+    else:
+        logging.info(
+            f"[Image Manager] skipped (non-pinned pool size "
+            f"{len(nonpinned_idx)} <= 3, pinned={len(pinned_paths)})"
+        )
+
+    # d. Frontier Manager (only when frontier count > 1)
+    if len(frontier_imgs) > 1:
+        sys_p, content = format_frontier_manager_prompt(
+            question, frontier_imgs, pool, high_level_plan, task_type,
+            frontier_states=frontier_states,
+        )
+        if verbose:
+            logging.info("[Frontier Manager] calling VLM")
+        raw = call_openai_api(sys_p, content)
+        valid_ids = [fs.frontier_id for fs in frontier_states if fs is not None]
+        retain_ids = parse_retain_frontier_ids(raw, valid_ids=valid_ids)
+        if retain_ids:
+            # map retained frontier_ids back to positional indices
+            id_to_pos = {
+                fs.frontier_id: i for i, fs in enumerate(frontier_states) if fs is not None
+            }
+            new_frontier_imgs = [
+                frontier_imgs[id_to_pos[fid]]
+                for fid in retain_ids
+                if fid in id_to_pos and 0 <= id_to_pos[fid] < len(frontier_imgs)
+            ]
+            if new_frontier_imgs:
+                logging.info(
+                    f"[Frontier Manager] filtered to "
+                    f"{len(new_frontier_imgs)} frontiers (ids={retain_ids})"
+                )
+                frontier_imgs = new_frontier_imgs
+                # keep frontier_states in sync (filter to retained ids)
+                retained_set = set(retain_ids)
+                frontier_states = [
+                    fs for fs in frontier_states
+                    if fs is not None and fs.frontier_id in retained_set
+                ]
+        else:
+            scored = sorted(
+                range(len(frontier_states)),
+                key=lambda i: _frontier_heuristic_score(
+                    frontier_states[i] if i < len(frontier_states) else None,
+                    frontier_imgs[i] if i < len(frontier_imgs) else None,
+                    pool, high_level_plan, question,
+                ),
+                reverse=True,
+            )
+            top_k = min(3, len(frontier_imgs))
+            keep_pos = scored[:top_k]
+            frontier_imgs = [frontier_imgs[p] for p in keep_pos]
+            frontier_states = [frontier_states[p] for p in keep_pos]
+            logging.info(
+                f"[Frontier Manager] parse fail, heuristic top_k={top_k} kept"
+            )
+    else:
+        logging.info(
+            f"[Frontier Manager] skipped (frontier count "
+            f"{len(frontier_imgs)} <= 1)"
+        )
+
+    # e. Answerer (Phase E: tri-state)
     candidates_block = ""
-    answerer_context = ""
+    feedback_block = ""
     if working_memory is not None:
         candidates_block = working_memory.candidates_prompt_block()
-        answerer_context += working_memory.feedback_prompt_block(
-            agent_name="Answerer", current_step=step_index
+        feedback_block = working_memory.feedback_prompt_block(
+            agent_name="Answerer", current_step=step
         )
-    answerer_context += _events_prompt_block(typed_events)
-    answerer_context += _branches_prompt_block(working_memory)
-    answerer_context += _hypotheses_prompt_block(working_memory)
-    answerer_context += bev_label_block
     sys_p, content = format_answerer_prompt(
-        question,
-        pool,
-        task_type,
-        image_goal,
-        high_level_plan,
+        question, pool, task_type, image_goal, high_level_plan,
         history_decision=history_decision,
         candidates_block=candidates_block,
-        feedback_block=answerer_context,
+        feedback_block=feedback_block,
     )
-    if bev_content:
-        content[-1:-1] = bev_content
     if verbose:
         logging.info("[Answerer] calling VLM")
     raw = call_openai_api(sys_p, content)
     decision, idx, class_name = parse_answerer_response(raw)
-    visibility = parse_answerer_visibility(raw)
-    decision, idx, class_name = sanitize_answerer_decision(
-        decision, idx, class_name, visibility
-    )
-    evidence_updates, evidence_conflict = parse_answerer_evidence(raw)
-    step["evidence_updates"] = evidence_updates
-    answerer_decision = (
-        AnswererDecision[decision]
-        if decision in AnswererDecision.__members__
-        else AnswererDecision.NOT_FOUND
-    )
+    _vis = parse_answerer_visibility(raw)
+    decision, idx, class_name = sanitize_answerer_decision(decision, idx, class_name, _vis)
+    if decision == "CANDIDATE_VISIBLE" and _vis:
+        logging.info(f"[Answerer] sanitized TARGET_CONFIRMED->CANDIDATE_VISIBLE vis={_vis}")
     reason = _extract_reason(raw)
-    answerer_events_recorded = False
-    visible_candidate_handled = False
-    handled_post_memory_event_ids = set()
-
-    if (
-        decision in ("CANDIDATE_VISIBLE", "TARGET_CONFIRMED", "ANSWER_READY")
-        and idx is not None
-        and 0 <= idx < len(pool)
-    ):
-        visible_candidate_handled = True
+    if decision in ("CANDIDATE_VISIBLE", "TARGET_CONFIRMED") and idx is not None and 0 <= idx < len(pool):
         img_path = pool[idx]["img_path"]
-        answerer_events = event_engine.detect_answerer_events(
-            answerer_decision,
-            step=step_index,
-            image_path=img_path,
-            evidence_updates=evidence_updates,
-            evidence_conflict=evidence_conflict,
-            working_memory=working_memory,
-        )
-        typed_events.extend(answerer_events)
-        answerer_events_recorded = True
-        step["evidence_updates"] = evidence_updates
         _record_step_summary(
             step,
             f"Answerer {decision} Image {idx} ({img_path}), class={class_name}"
@@ -1960,247 +1372,140 @@ def explore_multi_agent(
         logging.info(
             f"[Answerer] {decision} Image {idx} ({img_path}), class={class_name}"
         )
-        controller_result = CandidateController(cfg).handle_visible_candidate(
-            scene=scene,
-            tsdf_planner=tsdf_planner,
-            working_memory=working_memory,
-            img_path=img_path,
-            target_phrase=class_name or "",
-            pts=step.get("current_position"),
-            step_index=step_index,
-        )
-        typed_events.extend(controller_result.events)
-        step["candidate_controller_events"] = controller_result.events
-        post_answer_memory_events = [
-            event for event in typed_events
-            if event.type == EventType.ANSWERER_EVIDENCE_CONFLICT
-        ]
-        if post_answer_memory_events:
-            handled_post_memory_event_ids.update(
-                event.event_id for event in post_answer_memory_events
-            )
-            post_routing = event_engine.route(
-                post_answer_memory_events, working_memory=working_memory
-            )
-            pinned_paths = (
-                set(working_memory.pinned_ids)
-                if working_memory is not None
-                else set()
-            )
-            pool, filtered_now = _run_memory_manager(
-                question=question,
-                pool=pool,
-                high_level_plan=high_level_plan,
-                task_type=task_type,
-                image_goal=image_goal,
-                pinned_paths=pinned_paths,
-                max_pool=max_pool,
-                should_call=post_routing.call_memory_manager,
-                verbose=verbose,
-            )
-            n_filtered += filtered_now
-            step["image_pool"] = pool
-        if controller_result.intent is not None:
-            step["navigation_intent"] = controller_result.intent
-            _finalize_events(step, working_memory, typed_events)
-            return (
-                controller_result.intent,
-                controller_result.navigation_goal,
-                controller_result.reason or reason,
-                n_filtered,
-                img_path,
-            )
-        logging.info(
-            f"[CandidateController] no navigation intent: "
-            f"{controller_result.reason}"
-        )
-
-    if decision != "NOT_FOUND" and not visible_candidate_handled:
+        return ("image", img_path, reason, n_filtered, class_name)
+    elif decision in ("CANDIDATE_VISIBLE", "TARGET_CONFIRMED"):
         logging.info(
             f"[Answerer] {decision} but index {idx} out of pool range "
             f"{len(pool)}, falling through to exploration"
         )
-    elif decision == "NOT_FOUND":
+    else:
         logging.info("[Answerer] NOT_FOUND, continue exploration")
 
-    if not answerer_events_recorded:
-        answerer_events = event_engine.detect_answerer_events(
-            answerer_decision,
-            step=step_index,
-            evidence_updates=evidence_updates,
-            evidence_conflict=evidence_conflict,
-            working_memory=working_memory,
+    # f. High-Level Planner (Phase G: stale detection)
+    stale_threshold = getattr(cfg, "planner_stale_threshold", 2)
+    stale_warning = ""
+    if working_memory is not None and working_memory.plan_is_stale(stale_threshold):
+        stale_warning = (
+            "WARNING: Your previous plan has not changed for "
+            f"{working_memory.plan_stale_count} steps. You MUST either "
+            "(1) mark at least one branch completed/failed with a reason, "
+            "or (2) create a new branch grounded in newly observed evidence. "
+            "Do NOT repeat the same todo list unchanged.\n"
         )
-        typed_events.extend(answerer_events)
-    hypothesis_state = _hypothesis_state_after_routing(
-        question=question,
-        task_type=task_type,
-        typed_events=typed_events,
-        working_memory=working_memory,
-        event_engine=event_engine,
-        bev_label_block=bev_label_block,
-        bev_content=bev_content,
-        step_index=step_index,
-        step=step,
-        verbose=verbose,
-    )
-    post_memory_events = [
-        event for event in typed_events
-        if event.type in (
-            EventType.ANSWERER_EVIDENCE_CONFLICT,
-            EventType.HYPOTHESIS_REVISED,
+        logging.info(
+            f"[High-Level Planner] stale detected (count="
+            f"{working_memory.plan_stale_count}), forcing replan"
         )
-        and event.event_id not in handled_post_memory_event_ids
-    ]
-    if post_memory_events:
-        post_routing = event_engine.route(
-            post_memory_events, working_memory=working_memory
-        )
-        pinned_paths = (
-            set(working_memory.pinned_ids)
-            if working_memory is not None
-            else set()
-        )
-        pool, filtered_now = _run_memory_manager(
-            question=question,
-            pool=pool,
-            high_level_plan=hypothesis_state or high_level_plan,
-            task_type=task_type,
-            image_goal=image_goal,
-            pinned_paths=pinned_paths,
-            max_pool=max_pool,
-            should_call=post_routing.call_memory_manager,
-            verbose=verbose,
-        )
-        n_filtered += filtered_now
-        step["image_pool"] = pool
-
-    # Eligibility filter.
+    # §8: inject Progress Signals block into Planner prompt each step
     if working_memory is not None:
-        eligible_instances = branch_tracker.eligible_frontier_instances(
-            frontier_instances,
-            working_memory=working_memory,
-            recent_ids=working_memory.recent_frontier_ids,
-            recent_window=getattr(cfg, "frontier_recent_window", 3),
-            max_reselect=getattr(cfg, "max_frontier_reselect", 2),
+        clr = step.get("CLR", {}) or {}
+        last_fid = clr.get("last_frontier_id")
+        last_fres = clr.get("last_frontier_result")
+        progress_block = working_memory.progress_signals_block(
+            current_pose=step.get("current_position"),
+            last_frontier_id=last_fid,
+            last_frontier_result=last_fres,
+            stale_plan_count=working_memory.plan_stale_count,
         )
-    else:
-        eligible_instances = frontier_instances
-    if not eligible_instances:
-        no_frontier_event = event_engine.emit(
-            EventType.NO_ELIGIBLE_FRONTIER,
-            step=step_index,
-            entity_id="frontier",
-            payload={"reason": "eligibility filter removed all frontiers"},
-            severity="warning",
-        )
-        if no_frontier_event is not None:
-            _append_events(typed_events, [no_frontier_event], working_memory)
-            _hypothesis_state_after_routing(
-                question=question,
-                task_type=task_type,
-                typed_events=typed_events,
-                working_memory=working_memory,
-                event_engine=event_engine,
-                bev_label_block=bev_label_block,
-                bev_content=bev_content,
-                step_index=step_index,
-                step=step,
-                verbose=verbose,
-            )
-        _finalize_events(step, working_memory, typed_events)
-        logging.info("[Executor] no valid frontiers after eligibility filter")
-        return ("stop", None, "no valid frontier", n_filtered, None)
-
-    frontier_imgs_exec, frontier_instances_exec = _frontier_images_for_instances(
-        frontier_imgs, eligible_instances
-    )
-    if not frontier_imgs_exec:
-        no_valid_event = event_engine.emit(
-            EventType.NO_VALID_FRONTIER,
-            step=step_index,
-            entity_id="frontier_image",
-            payload={"reason": "no valid frontier image after filtering"},
-            severity="warning",
-        )
-        if no_valid_event is not None:
-            _append_events(typed_events, [no_valid_event], working_memory)
-            _hypothesis_state_after_routing(
-                question=question,
-                task_type=task_type,
-                typed_events=typed_events,
-                working_memory=working_memory,
-                event_engine=event_engine,
-                bev_label_block=bev_label_block,
-                bev_content=bev_content,
-                step_index=step_index,
-                step=step,
-                verbose=verbose,
-            )
-        _finalize_events(step, working_memory, typed_events)
-        logging.info("[Executor] no frontier images available after filtering")
-        return ("stop", None, "no valid frontier image", n_filtered, None)
-
-    executor_feedback = ""
-    if working_memory is not None:
-        executor_feedback = working_memory.feedback_prompt_block(
-            agent_name="Executor", current_step=step_index
-        )
-    executor_feedback += _events_prompt_block(typed_events)
-    executor_feedback += bev_label_block
-    sys_p, content = format_executor_prompt(
+        feedback_block = progress_block + feedback_block
+    sys_p, content = format_high_level_planner_prompt(
         question,
-        frontier_imgs_exec,
-        pool,
-        hypothesis_state or high_level_plan,
         task_type,
-        history_decision=history_decision,
-        frontier_states=frontier_instances_exec,
-        feedback_block=executor_feedback,
+        pool,
+        frontier_imgs,
+        high_level_plan,
+        is_new_subtask,
+        image_goal=image_goal,
+        memory=step.get("episode_memory"),
+        feedback_block=(stale_warning + feedback_block),
     )
-    if bev_content:
-        content[-1:-1] = bev_content
+    if verbose:
+        logging.info("[High-Level Planner] calling VLM")
+    raw = call_openai_api(sys_p, content)
+    new_plan = _parse_high_level_plan_response(raw)
+    if new_plan:
+        high_level_plan = new_plan
+        step["high_level_plan"] = high_level_plan
+        if working_memory is not None:
+            working_memory.update_plan(new_plan)
+        logging.info("[High-Level Planner] plan updated")
+    else:
+        if working_memory is not None:
+            working_memory.update_plan(high_level_plan)
+        logging.info("[High-Level Planner] no valid plan block, keeping old")
+
+    # g. Executor
+    # Executor-specific feedback (FRONTIER_NO_INFO only)
+    _executor_fb = ""
+    if working_memory is not None:
+        _executor_fb = working_memory.feedback_prompt_block(
+            agent_name="Executor", current_step=step
+        )
+    # §4: hard constraint — only offer valid frontiers (active, under reselect
+    # cap, not in recent window)
+    if tsdf_planner is not None and working_memory is not None:
+        valid_ids = set(tsdf_planner.get_valid_frontier_ids(
+            max_reselect=getattr(cfg, "max_frontier_reselect", 2),
+            recent_window=getattr(cfg, "frontier_recent_window", 3),
+            recent_ids=working_memory.recent_frontier_ids,
+        ))
+    elif tsdf_planner is not None:
+        valid_ids = set(tsdf_planner.get_valid_frontier_ids(
+            max_reselect=getattr(cfg, "max_frontier_reselect", 2),
+            recent_window=getattr(cfg, "frontier_recent_window", 3),
+        ))
+    else:
+        valid_ids = None
+    if valid_ids is not None:
+        keep_idx = [
+            i for i, fs in enumerate(frontier_states)
+            if fs is not None and fs.frontier_id in valid_ids
+        ]
+        if not keep_idx:
+            logging.info("[Executor] no valid frontiers, stop")
+            _record_step_summary(step, "Executor stop (no valid frontiers)")
+            return ("stop", None, "", n_filtered, None)
+        frontier_imgs = [frontier_imgs[i] for i in keep_idx]
+        frontier_states = [frontier_states[i] for i in keep_idx]
+    else:
+        valid_ids = None
+    sys_p, content = format_executor_prompt(
+        question, frontier_imgs, pool, high_level_plan, task_type,
+        history_decision=history_decision,
+        frontier_states=frontier_states,
+        feedback_block=_executor_fb,
+    )
     if verbose:
         logging.info("[Executor] calling VLM")
     raw = call_openai_api(sys_p, content)
-    intent, reason = parse_executor_json_response(raw)
-    if intent is None or intent.mode == NavigationMode.STOP:
-        _finalize_events(step, working_memory, typed_events)
+    frontier_id = parse_executor_frontier_id(raw)
+    reason = _extract_reason(raw)
+    # map frontier_id -> positional index in the (possibly filtered) list
+    id_to_pos = {
+        fs.frontier_id: i for i, fs in enumerate(frontier_states) if fs is not None
+    }
+    if frontier_id >= 0 and frontier_id in id_to_pos:
+        # §4 defensive: double-check frontier_id is in the valid set
+        if valid_ids is not None and frontier_id not in valid_ids:
+            logging.info(
+                f"[Executor] Frontier F_{frontier_id:03d} not in valid set, stop"
+            )
+            _record_step_summary(step, "Executor stop (frontier not valid)")
+            return ("stop", None, reason, n_filtered, None)
+        pos = id_to_pos[frontier_id]
+        logging.info(f"[Executor] Frontier F_{frontier_id:03d} (pos {pos})")
+        _record_step_summary(step, f"Executor chose Frontier F_{frontier_id:03d}")
+        # Phase B: mark selected in registry + working memory
+        if tsdf_planner is not None:
+            tsdf_planner.mark_frontier_selected(frontier_id)
+        if working_memory is not None:
+            working_memory.mark_frontier_selected(frontier_id)
+        return ("frontier", pos, reason, n_filtered, None)
+    else:
+        # 'Stop Exploration' or parse failure
         logging.info("[Executor] Stop Exploration")
         _record_step_summary(step, "Executor Stop Exploration")
         return ("stop", None, reason, n_filtered, None)
-
-    by_id = {inst.frontier_id: inst for inst in frontier_instances_exec}
-    if intent.frontier_id not in by_id:
-        _finalize_events(step, working_memory, typed_events)
-        logging.info(
-            f"[Executor] Frontier F_{intent.frontier_id:03d} not eligible, stop"
-            if intent.frontier_id is not None
-            else "[Executor] no frontier_id in intent, stop"
-        )
-        _record_step_summary(step, "Executor stop (frontier not eligible)")
-        return ("stop", None, reason, n_filtered, None)
-
-    selected = by_id[int(intent.frontier_id)]
-    if not intent.spatial_branch_id:
-        intent.spatial_branch_id = selected.spatial_branch_id
-    if working_memory is not None:
-        branch_tracker.mark_selected(intent.frontier_id, working_memory, step_index)
-        working_memory.mark_frontier_selected(intent.frontier_id)
-    if tsdf_planner is not None:
-        tsdf_planner.mark_frontier_selected(intent.frontier_id)
-    step["navigation_intent"] = intent
-    _finalize_events(step, working_memory, typed_events)
-    _record_step_summary(
-        step,
-        f"Executor chose Frontier F_{intent.frontier_id:03d} "
-        f"mode={intent.action_mode.value}",
-    )
-    logging.info(
-        f"[Executor] Frontier F_{intent.frontier_id:03d} "
-        f"branch={intent.spatial_branch_id}"
-    )
-    return ("frontier", selected.local_index, reason, n_filtered, None)
 
 
 def _extract_reason(response: Optional[str]) -> str:

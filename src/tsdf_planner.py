@@ -19,19 +19,7 @@ from src.habitat import pos_normal_to_habitat, pos_habitat_to_normal
 from src.tsdf_base import TSDFPlannerBase
 from src.conceptgraph.slam.slam_classes import MapObjectDict
 from src.utils import resize_image
-from src.memory_structures import (
-    ExploreIntent,
-    FrontierState,
-    F_ACTIVE,
-    F_BLOCKED,
-    F_STALE,
-    FR_BLOCKED,
-    FR_FOUND_CANDIDATE,
-    FR_NO_NEW_INFO,
-    NavigationMode,
-    TargetViewpointIntent,
-    VisualApproachIntent,
-)
+from src.memory_structures import FrontierState, F_ACTIVE, F_EXPLORED, F_STALE, FR_NO_NEW_INFO, FR_FOUND_CANDIDATE
 
 
 @dataclass
@@ -110,14 +98,12 @@ class TSDFPlanner(TSDFPlannerBase):
             None  # the corresponding navigable location of max_point. The agent goes to this point to observe the max_point
         )
         self.target_type = None
-        self.navigation_intent = None
         self.frontiers: List[Frontier] = []
 
         # about frontier allocation
         self.frontier_map = np.zeros(self._vol_dim[:2], dtype=int)
         self.frontier_counter = 1
-        # Current-frontier registry. Frontier ids are prompt/context handles,
-        # not episode-long semantic identities.
+        # Phase B: stable frontier registry. Maps frontier_id -> FrontierState.
         # Populated by update_frontier_map, read by agent_step + multi-agent.
         self.frontier_registry: Dict[int, "FrontierState"] = {}
 
@@ -384,6 +370,7 @@ class TSDFPlanner(TSDFPlannerBase):
         self.frontiers = filtered_frontiers
 
         # create new frontiers and add to frontier list
+        counter_at_start = self.frontier_counter
         for ft_data in valid_ft_angles:
             # exclude the new frontier's region that is already covered by the existing frontiers
             ft_data["region"] = ft_data["region"] & np.logical_not(kept_frontier_area)
@@ -396,10 +383,14 @@ class TSDFPlanner(TSDFPlannerBase):
                     )
                 )
 
-        # Rebuild path: frontier IDs are current TSDF observations only.
-        # Durable spatial continuity is maintained by BranchTracker /
-        # SpatialBranchRecord, so the old stale-frontier ID reassociation is
-        # intentionally not used as a semantic identity mechanism.
+        # §4: geometric re-association. New frontiers (fresh counter id) may
+        # match a STALE registry entry from a frontier that disappeared ≥1
+        # step ago. Reclaim the old stable id so identity survives reappear.
+        new_frontiers = [
+            f for f in self.frontiers if f.frontier_id >= counter_at_start
+        ]
+        if new_frontiers:
+            self._reassociate_stale_frontiers(new_frontiers)
 
         # Turn to face each frontier point and get rgb image
         for i, frontier in enumerate(self.frontiers):
@@ -481,18 +472,6 @@ class TSDFPlanner(TSDFPlannerBase):
         random_position=False,
         observe_snapshot=True,
     ) -> bool:
-        if isinstance(
-            target_type,
-            (ExploreIntent, VisualApproachIntent, TargetViewpointIntent),
-        ):
-            return self.set_next_navigation_intent(
-                intent=target_type,
-                pts=pts,
-                objects=objects,
-                obs_points=obs_points,
-                cfg=cfg,
-                pathfinder=pathfinder,
-            )
         if self.max_point is not None or self.target_point is not None:
             # if the next point is already set
             logging.error(
@@ -503,7 +482,7 @@ class TSDFPlanner(TSDFPlannerBase):
         cur_point = self.normal2voxel(pts)
         self.max_point = choice
         self.target_type = target_type
-        if target_type in ("image", "visual_approach", "target_viewpoint"):
+        if target_type == "image":
             target_point = self.habitat2voxel(choice)[:2]
             self.max_point = self.habitat2voxel(choice)[:2]
             self.target_point = get_nearest_true_point(target_point, self.unoccupied)
@@ -810,16 +789,18 @@ class TSDFPlanner(TSDFPlannerBase):
         self._explore_vol_cpu[near_coords[:, 0], near_coords[:, 1], :] = 1
 
         if target_arrived:
-            # FrontierInstance is transient; reaching one is navigation
-            # feedback, not proof that the spatial branch is irrelevant.
+            # Phase B: mark the frontier as reached in the registry.
             if isinstance(self.max_point, Frontier):
                 fid = self.max_point.frontier_id
                 fs = self.frontier_registry.get(fid)
                 if fs is not None:
                     fs.reached_count += 1
+                    if fs.status != F_EXPLORED:
+                        fs.status = F_EXPLORED
+                    if fs.last_result is None:
+                        fs.last_result = FR_NO_NEW_INFO
             self.max_point = None
             self.target_point = None
-            self.navigation_intent = None
 
         return (
             self.normal2habitat(next_point_normal),
@@ -829,70 +810,6 @@ class TSDFPlanner(TSDFPlannerBase):
             updated_path_points,
             target_arrived,
         )
-
-    def set_next_navigation_intent(
-        self,
-        intent,
-        pts,
-        objects: MapObjectDict[int, Dict],
-        obs_points,
-        cfg,
-        pathfinder,
-    ) -> bool:
-        """Adapter from typed rebuild intents to the existing TSDF target API."""
-        self.navigation_intent = intent
-        if isinstance(intent, ExploreIntent):
-            if intent.mode == NavigationMode.STOP:
-                logging.info("set_next_navigation_intent: STOP intent")
-                return False
-            frontier = self.get_frontier_by_id(intent.frontier_id)
-            if frontier is None:
-                logging.error(
-                    f"set_next_navigation_intent: missing frontier "
-                    f"F_{intent.frontier_id:03d}"
-                    if intent.frontier_id is not None
-                    else "set_next_navigation_intent: missing frontier id"
-                )
-                return False
-            return self.set_next_navigation_point(
-                target_type="frontier",
-                choice=frontier,
-                pts=pts,
-                objects=objects,
-                obs_points=obs_points,
-                cfg=cfg,
-                pathfinder=pathfinder,
-            )
-        if isinstance(intent, VisualApproachIntent):
-            return self.set_next_navigation_point(
-                target_type="visual_approach",
-                choice=intent.approach_xyz,
-                pts=pts,
-                objects=objects,
-                obs_points=obs_points,
-                cfg=cfg,
-                pathfinder=pathfinder,
-            )
-        if isinstance(intent, TargetViewpointIntent):
-            return self.set_next_navigation_point(
-                target_type="target_viewpoint",
-                choice=intent.target_xyz,
-                pts=pts,
-                objects=objects,
-                obs_points=obs_points,
-                cfg=cfg,
-                pathfinder=pathfinder,
-            )
-        logging.error(f"set_next_navigation_intent: unsupported intent {intent}")
-        return False
-
-    def get_frontier_by_id(self, frontier_id: Optional[int]) -> Optional[Frontier]:
-        if frontier_id is None:
-            return None
-        for frontier in self.frontiers:
-            if int(frontier.frontier_id) == int(frontier_id):
-                return frontier
-        return None
 
     def get_island_around_pts(self, pts, fill_dim=0.4, height=0.4):
         """Find the empty space around the point (x,y,z) in the world frame"""
@@ -1072,8 +989,45 @@ class TSDFPlanner(TSDFPlannerBase):
     def free_frontier(self, frontier: Frontier):
         self.frontier_map[self.frontier_map == frontier.frontier_id] = 0
 
-    # Frontier selection bookkeeping is prompt context only. It must not turn a
-    # transient FrontierInstance into a hard eligibility decision.
+    def _reassociate_stale_frontiers(self, new_frontiers: List[Frontier]) -> None:
+        """§4: match newly-created frontiers to STALE registry entries by
+        centroid distance (<1.0m) and yaw similarity (<30deg). First-match-
+        wins; reassign the stable old id so identity survives reappear."""
+        if not self.frontier_registry:
+            return
+        stale_items = [
+            (fid, fs) for fid, fs in self.frontier_registry.items()
+            if fs.status == F_STALE
+        ]
+        if not stale_items:
+            return
+        for nf in new_frontiers:
+            pos_world = self.voxel2habitat(nf.position)
+            n_centroid = np.array([pos_world[0], 0.0, pos_world[2]])
+            n_yaw = float(np.arctan2(nf.orientation[1], nf.orientation[0]))
+            for old_id, fs in stale_items:
+                if fs.status != F_STALE:
+                    continue  # claimed by an earlier new frontier
+                d = float(np.linalg.norm(n_centroid - fs.centroid))
+                if d >= 1.0:
+                    continue
+                dyaw = abs(n_yaw - fs.view_yaw)
+                dyaw = (dyaw + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi,pi]
+                if abs(dyaw) >= (30.0 * np.pi / 180.0):
+                    continue
+                # match: reclaim old id
+                logging.info(
+                    f"§4 reassociate: frontier {nf.frontier_id} -> {old_id} "
+                    f"(d={d:.3f}m, dyaw={np.degrees(abs(dyaw)):.1f}deg)"
+                )
+                self.frontier_map[nf.region] = old_id
+                nf.frontier_id = old_id
+                fs.status = F_ACTIVE  # so upsert below treats as existing-active
+                break
+
+    # Phase B: frontier selection bookkeeping (called by main loop after
+    # Executor picks a frontier). selected_count suppresses reselection;
+    # recent list enforces a window. Returns the FrontierState or None.
     def mark_frontier_selected(self, frontier_id: int) -> Optional[FrontierState]:
         fs = self.frontier_registry.get(frontier_id)
         if fs is not None:
@@ -1088,8 +1042,8 @@ class TSDFPlanner(TSDFPlannerBase):
             return
         fs.reached_count += 1
         fs.last_result = result
-        if result == FR_BLOCKED:
-            fs.status = F_BLOCKED
+        if result == FR_NO_NEW_INFO:
+            fs.status = F_EXPLORED
         elif result == FR_FOUND_CANDIDATE:
             fs.status = F_ACTIVE
 
@@ -1099,14 +1053,20 @@ class TSDFPlanner(TSDFPlannerBase):
         recent_window: int = 3,
         recent_ids: Optional[List[int]] = None,
     ) -> List[int]:
-        """Return deterministically legal current frontier ids."""
+        """Return frontier_ids currently selectable (active, under reselect cap,
+        not in recent window)."""
+        recent = set(recent_ids[-recent_window:]) if recent_ids and recent_window > 0 else set()
         out = []
         for f in self.frontiers:
             fs = self.frontier_registry.get(f.frontier_id)
             if fs is None:
                 out.append(f.frontier_id)
                 continue
-            if fs.status == F_BLOCKED:
+            if fs.status in (F_EXPLORED,):
+                continue
+            if fs.selected_count >= max_reselect:
+                continue
+            if f.frontier_id in recent:
                 continue
             out.append(f.frontier_id)
         return out
