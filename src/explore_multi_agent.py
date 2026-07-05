@@ -1592,11 +1592,15 @@ def format_hypothesis_manager_prompt(
         "  ],\n"
         '  "new_hypotheses": [\n'
         '    {"claim": "...", "expected_cues": [], "contradiction_cues": [], '
-        '"anchor": null, "anchors": [], "next_test": "...", '
+        '"anchor": {"kind": "spatial_branch", "spatial_branch_id": "B001"}, '
+        '"anchors": [{"kind": "spatial_branch", "spatial_branch_id": "B001"}], '
+        '"next_test": "...", '
         '"linked_spatial_branches": [], "confidence": 0.0}\n'
         "  ],\n"
         '  "reason": "<short reason>"\n'
         "}\n"
+        'Never return anchor or anchors as plain strings like "B001"; use '
+        'the object form above, or null/[] when there is no reliable anchor.\n'
     )
     content = [
         (f"Target Question: {question}\nTask type: {task_type}\n",),

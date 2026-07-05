@@ -21,6 +21,7 @@ from src.memory_structures import (
     ExecutorActionMode,
     ExploreIntent,
     F_ACTIVE,
+    FrontierAnchor,
     FrontierInstance,
     FrontierState,
     Grounding2D,
@@ -33,6 +34,7 @@ from src.memory_structures import (
     NavigationResult,
     S_GROUNDED_3D,
     S_NEED_CLOSER_VIEW,
+    SpatialBranchAnchor,
     SpatialBranchRecord,
     StepOutcome,
     SubtaskWorkingMemory,
@@ -42,6 +44,7 @@ from src.memory_structures import (
     VerifyStatus,
     VisualApproachIntent,
     anchor_from_dict,
+    anchor_from_value,
     should_enter_verify,
 )
 
@@ -188,6 +191,36 @@ def test_dataclass_json_roundtrip_anchor_intents_and_step_outcome():
     assert restored_outcome.intent.frontier_id == 7
     assert restored_outcome.events[0].type is EventType.FRONTIER_REACHED
     assert restored_outcome.verification_result is VerifyStatus.POOR_VIEW
+
+
+def test_anchor_parser_accepts_hypothesis_manager_shorthand_strings():
+    branch_anchor = anchor_from_value("B001")
+    assert isinstance(branch_anchor, SpatialBranchAnchor)
+    assert branch_anchor.spatial_branch_id == "B001"
+
+    branch_anchor_with_prefix = anchor_from_value("spatial_branch:B002")
+    assert isinstance(branch_anchor_with_prefix, SpatialBranchAnchor)
+    assert branch_anchor_with_prefix.spatial_branch_id == "B002"
+
+    frontier_anchor = anchor_from_value("F_001")
+    assert isinstance(frontier_anchor, FrontierAnchor)
+    assert frontier_anchor.frontier_id == 1
+
+    frontier_anchor_from_dict = anchor_from_value(
+        {"kind": "frontier", "frontier_id": "F_003", "spatial_branch_id": "B001"}
+    )
+    assert isinstance(frontier_anchor_from_dict, FrontierAnchor)
+    assert frontier_anchor_from_dict.frontier_id == 3
+    assert frontier_anchor_from_dict.spatial_branch_id == "B001"
+
+    hypothesis = HypothesisBranch(
+        hypothesis_id="H001",
+        claim="Check branch B001.",
+        anchor="B001",
+        anchors="B001",
+    )
+    assert isinstance(hypothesis.anchor, SpatialBranchAnchor)
+    assert hypothesis.linked_spatial_branches == ["B001"]
 
 
 def test_subtask_reset_clears_task_scope_but_preserves_spatial_branches():
@@ -1010,6 +1043,59 @@ def test_hypothesis_parser_accepts_spec_partial_updates_and_auto_ids():
         assert "Covered the branch with no microwave." in rejected.negative_evidence
         assert created.hypothesis_id == "H002"
         assert created.claim == "Try the open branch toward the kitchen."
+    finally:
+        if old_explore_multi_agent is None:
+            sys.modules.pop("src.explore_multi_agent", None)
+        else:
+            sys.modules["src.explore_multi_agent"] = old_explore_multi_agent
+        if old_explore_utils is None:
+            sys.modules.pop("src.explore_utils", None)
+        else:
+            sys.modules["src.explore_utils"] = old_explore_utils
+
+
+def test_hypothesis_parser_accepts_server_shorthand_anchor_response():
+    old_explore_utils = _install_explore_utils_stub()
+    old_explore_multi_agent = sys.modules.get("src.explore_multi_agent")
+    sys.modules.pop("src.explore_multi_agent", None)
+    try:
+        import src.explore_multi_agent as explore_multi_agent
+
+        hypotheses, reason = explore_multi_agent.parse_hypothesis_manager_response(
+            json.dumps(
+                {
+                    "updates": [],
+                    "new_hypotheses": [
+                        {
+                            "claim": (
+                                "The refrigerator is located in the area indicated by "
+                                "frontier F_001 of spatial branch B001."
+                            ),
+                            "expected_cues": [
+                                "large rectangular appliance with vertical doors"
+                            ],
+                            "contradiction_cues": ["non-kitchen environment"],
+                            "anchor": "B001",
+                            "anchors": ["B001"],
+                            "next_test": "Advance along frontier F_001.",
+                            "linked_spatial_branches": ["B001"],
+                            "confidence": 0.5,
+                        }
+                    ],
+                    "reason": "No active hypotheses exist.",
+                }
+            ),
+            step_index=79,
+        )
+
+        assert reason == "No active hypotheses exist."
+        assert len(hypotheses) == 1
+        hypothesis = hypotheses[0]
+        assert hypothesis.hypothesis_id == "H001"
+        assert isinstance(hypothesis.anchor, SpatialBranchAnchor)
+        assert hypothesis.anchor.spatial_branch_id == "B001"
+        assert hypothesis.linked_spatial_branches == ["B001"]
+        assert hypothesis.writer == "HypothesisManager"
     finally:
         if old_explore_multi_agent is None:
             sys.modules.pop("src.explore_multi_agent", None)

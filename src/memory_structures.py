@@ -11,6 +11,7 @@ Implements the three memory layers from 诊断.md:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Type, TypeVar, Union
@@ -232,17 +233,30 @@ Anchor = Union[
 ]
 
 
+def _coerce_frontier_id(value: Any) -> int:
+    if isinstance(value, str):
+        match = re.search(r"\d+", value)
+        if match is not None:
+            return int(match.group(0))
+    return int(value)
+
+
 def anchor_from_dict(data: Dict[str, Any]) -> Anchor:
     kind = (data or {}).get("kind") or (data or {}).get("type")
     if kind:
         kind = str(kind).lower()
     if kind == "frontier":
         return FrontierAnchor(
-            frontier_id=int(data["frontier_id"]),
+            frontier_id=_coerce_frontier_id(data.get("frontier_id", data.get("id"))),
             spatial_branch_id=data.get("spatial_branch_id"),
         )
     if kind == "spatial_branch":
-        return SpatialBranchAnchor(spatial_branch_id=str(data["spatial_branch_id"]))
+        spatial_branch_id = data.get("spatial_branch_id", data.get("id"))
+        if spatial_branch_id is None:
+            raise ValueError(f"unknown anchor payload: {data}")
+        return SpatialBranchAnchor(
+            spatial_branch_id=str(spatial_branch_id)
+        )
     if kind == "object":
         return ObjectAnchor(
             object_id=data["object_id"],
@@ -261,7 +275,7 @@ def anchor_from_dict(data: Dict[str, Any]) -> Anchor:
         )
     if "frontier_id" in data:
         return FrontierAnchor(
-            frontier_id=int(data["frontier_id"]),
+            frontier_id=_coerce_frontier_id(data["frontier_id"]),
             spatial_branch_id=data.get("spatial_branch_id"),
         )
     if "spatial_branch_id" in data:
@@ -285,8 +299,56 @@ def anchor_from_dict(data: Dict[str, Any]) -> Anchor:
     raise ValueError(f"unknown anchor payload: {data}")
 
 
+def anchor_from_value(value: Any) -> Optional[Anchor]:
+    """Best-effort parser for HypothesisManager anchor payloads.
+
+    The prompt asks for structured anchors, but VLMs often return shorthand
+    strings such as "B001" or "F_001". Normalize those instead of letting a
+    malformed anchor discard the whole hypothesis branch.
+    """
+    if value is None:
+        return None
+    if isinstance(
+        value,
+        (FrontierAnchor, SpatialBranchAnchor, ImageAnchor, ObjectAnchor, CandidateAnchor),
+    ):
+        return value
+    if isinstance(value, dict):
+        try:
+            return anchor_from_dict(value)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        token = value.strip()
+        if not token or token.lower() in {"none", "null", "unknown"}:
+            return None
+        branch_match = re.fullmatch(r"B_?(\d+)", token, flags=re.IGNORECASE)
+        if branch_match:
+            return SpatialBranchAnchor(
+                spatial_branch_id=f"B{int(branch_match.group(1)):03d}"
+            )
+        frontier_match = re.fullmatch(r"F_?(\d+)", token, flags=re.IGNORECASE)
+        if frontier_match:
+            return FrontierAnchor(frontier_id=int(frontier_match.group(1)))
+        lower_token = token.lower()
+        if lower_token.startswith("spatial_branch:"):
+            return SpatialBranchAnchor(spatial_branch_id=token.split(":", 1)[1].strip())
+        if lower_token.startswith("frontier:"):
+            try:
+                raw_id = token.split(":", 1)[1].strip()
+                match = re.search(r"\d+", raw_id)
+                if match is None:
+                    return None
+                return FrontierAnchor(frontier_id=int(match.group(0)))
+            except ValueError:
+                return None
+    return None
+
+
 def _anchor_to_dict(anchor: Anchor) -> Dict[str, Any]:
     payload = anchor.to_dict() if hasattr(anchor, "to_dict") else _jsonable(anchor)
+    if not isinstance(payload, dict):
+        return {"kind": "unknown", "value": payload}
     if isinstance(anchor, FrontierAnchor):
         payload["kind"] = "frontier"
     elif isinstance(anchor, SpatialBranchAnchor):
@@ -463,7 +525,9 @@ class HypothesisBranch(JsonDataclassMixin):
         seen_anchors = set()
 
         def _append_anchor(value) -> None:
-            anchor = anchor_from_dict(value) if isinstance(value, dict) else value
+            anchor = anchor_from_value(value)
+            if anchor is None:
+                return
             key = json.dumps(_anchor_to_dict(anchor), sort_keys=True)
             if key in seen_anchors:
                 return
@@ -472,12 +536,18 @@ class HypothesisBranch(JsonDataclassMixin):
 
         if self.anchor is not None:
             _append_anchor(self.anchor)
-        for anchor in self.anchors:
+        raw_anchors = self.anchors or []
+        if not isinstance(raw_anchors, (list, tuple, set)):
+            raw_anchors = [raw_anchors]
+        for anchor in raw_anchors:
             _append_anchor(anchor)
         self.anchors = normalized_anchors
         self.anchor = self.anchors[0] if self.anchors else None
 
-        linked = set(str(bid) for bid in self.linked_spatial_branches if bid)
+        raw_linked_branches = self.linked_spatial_branches or []
+        if isinstance(raw_linked_branches, str):
+            raw_linked_branches = [raw_linked_branches]
+        linked = set(str(bid) for bid in raw_linked_branches if bid)
         for anchor in self.anchors:
             if isinstance(anchor, SpatialBranchAnchor):
                 linked.add(anchor.spatial_branch_id)
@@ -502,11 +572,18 @@ class HypothesisBranch(JsonDataclassMixin):
             payload["positive_evidence"] = payload["evidence"]
         if "conflicts" in payload and "negative_evidence" not in payload:
             payload["negative_evidence"] = payload["conflicts"]
-        if "anchor" in payload and isinstance(payload["anchor"], dict):
-            payload["anchor"] = anchor_from_dict(payload["anchor"])
+        if "anchor" in payload:
+            payload["anchor"] = anchor_from_value(payload["anchor"])
+        raw_anchors = payload.get("anchors", [])
+        if raw_anchors is None:
+            raw_anchors = []
+        elif not isinstance(raw_anchors, list):
+            raw_anchors = [raw_anchors]
         payload["anchors"] = [
-            anchor_from_dict(a) if isinstance(a, dict) else a
-            for a in payload.get("anchors", [])
+            anchor
+            for a in raw_anchors
+            for anchor in [anchor_from_value(a)]
+            if anchor is not None
         ]
         return cls(**payload)
 
