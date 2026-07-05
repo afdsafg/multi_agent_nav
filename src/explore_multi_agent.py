@@ -1178,20 +1178,49 @@ def parse_executor_json_response(
 def parse_hypothesis_manager_response(
     response: Optional[str],
     step_index: int,
+    existing_hypotheses: Optional[Dict[str, HypothesisBranch]] = None,
 ) -> Tuple[List[HypothesisBranch], str]:
     """Parse Hypothesis Manager JSON output.
 
     Expected shape:
       {"updates": [...], "new_hypotheses": [...]}
-    Each item should contain the new rebuild fields: claim, expected_cues,
-    contradiction_cues, anchor/anchors, status, evidence lists, next_test,
-    linked_spatial_branches, and revision_reason. Legacy description/summary
-    payloads are still accepted.
+    ``updates`` may be partial spec-style commands such as
+    {"hypothesis_id": "H001", "decision": "REJECT", "reason": "..."}.
+    Existing fields are preserved unless explicitly revised. New hypotheses may
+    omit IDs; this parser assigns stable H### IDs for the current response.
     """
     payload = _extract_json_object(response)
     if not payload:
         return [], _extract_reason(response)
-    hypotheses = []
+    existing_hypotheses = existing_hypotheses or {}
+    hypotheses: List[HypothesisBranch] = []
+    used_ids = set(existing_hypotheses.keys())
+
+    def _next_hypothesis_id() -> str:
+        idx = 1
+        while True:
+            hyp_id = f"H{idx:03d}"
+            if hyp_id not in used_ids:
+                used_ids.add(hyp_id)
+                return hyp_id
+            idx += 1
+
+    decision_status = {
+        "ACTIVE": "ACTIVE",
+        "ACTIVATE": "ACTIVE",
+        "KEEP": None,
+        "REVISE": "ACTIVE",
+        "SUPPORT": "SUPPORTED",
+        "SUPPORTED": "SUPPORTED",
+        "REJECT": "REJECTED",
+        "REJECTED": "REJECTED",
+        "DONE": "DONE",
+        "COMPLETE": "DONE",
+        "COMPLETED": "DONE",
+        "CONFIRM": "CONFIRMED",
+        "CONFIRMED": "CONFIRMED",
+    }
+
     for section in ("updates", "new_hypotheses"):
         items = payload.get(section, [])
         if isinstance(items, dict):
@@ -1201,20 +1230,59 @@ def parse_hypothesis_manager_response(
         for item in items:
             if not isinstance(item, dict):
                 continue
-            hyp_id = item.get("hypothesis_id") or item.get("id")
-            claim = item.get("claim") or item.get("description") or item.get("summary")
-            if not hyp_id or not claim:
-                continue
             item = dict(item)
+            hyp_id = item.get("hypothesis_id") or item.get("id")
+            if section == "new_hypotheses" and not hyp_id:
+                hyp_id = _next_hypothesis_id()
+            if not hyp_id:
+                continue
+            hyp_id = str(hyp_id)
+            used_ids.add(hyp_id)
+
+            base: Dict[str, Any] = {}
+            if section == "updates" and hyp_id in existing_hypotheses:
+                base = existing_hypotheses[hyp_id].to_dict()
+
+            decision = str(item.pop("decision", "") or "").strip().upper()
+            reason = str(item.pop("reason", "") or "").strip()
+            mapped_status = decision_status.get(decision)
+            if mapped_status and "status" not in item:
+                item["status"] = mapped_status
+            if reason and "revision_reason" not in item:
+                item["revision_reason"] = reason
+
             item.pop("id", None)
-            item.pop("summary", None)
-            item["hypothesis_id"] = str(hyp_id)
-            item["claim"] = str(claim)
-            item.setdefault("created_step", step_index)
-            item["updated_step"] = step_index
-            item["writer"] = "HypothesisManager"
+            summary = item.pop("summary", None)
+            if "claim" not in item:
+                if "description" in item:
+                    item["claim"] = item["description"]
+                elif summary is not None:
+                    item["claim"] = summary
+            if not item.get("claim") and not base.get("claim"):
+                continue
+
+            merged = dict(base)
+            for key, value in item.items():
+                if value is not None:
+                    merged[key] = value
+            if decision == "REJECT" and reason:
+                negative = list(merged.get("negative_evidence") or [])
+                if reason not in negative:
+                    negative.append(reason)
+                merged["negative_evidence"] = negative
+            elif decision in {"SUPPORT", "SUPPORTED"} and reason:
+                positive = list(merged.get("positive_evidence") or [])
+                if reason not in positive:
+                    positive.append(reason)
+                merged["positive_evidence"] = positive
+
+            merged["hypothesis_id"] = hyp_id
+            merged["claim"] = str(merged["claim"])
+            merged.setdefault("created_step", step_index)
+            merged["updated_step"] = step_index
+            merged["writer"] = "HypothesisManager"
             try:
-                hypotheses.append(HypothesisBranch.from_dict(item))
+                hypotheses.append(HypothesisBranch.from_dict(merged))
             except Exception:
                 continue
     return hypotheses, str(payload.get("reason") or "")
@@ -1377,6 +1445,69 @@ def _finalize_events(
         working_memory.mark_events_consumed(typed_events)
 
 
+def _run_memory_manager(
+    question: str,
+    pool: List[Dict[str, Any]],
+    high_level_plan: Optional[str],
+    task_type: str,
+    image_goal: Optional[str],
+    pinned_paths: set,
+    max_pool: int,
+    should_call: bool,
+    verbose: bool,
+) -> Tuple[List[Dict[str, Any]], int]:
+    nonpinned_idx = [
+        i for i, snap in enumerate(pool)
+        if snap.get("img_path") not in pinned_paths
+    ]
+    if not should_call or len(nonpinned_idx) == 0:
+        logging.info("[Image Manager] skipped (no memory trigger)")
+        return pool, 0
+
+    sys_p, content = format_image_manager_prompt(
+        question, pool, high_level_plan, task_type, image_goal
+    )
+    if verbose:
+        logging.info("[Image Manager] calling VLM (event-triggered)")
+    raw = call_openai_api(sys_p, content)
+    retain_idx = parse_retain_response(raw, "Images")
+    pinned_idx = [
+        i for i in range(len(pool))
+        if pool[i].get("img_path") in pinned_paths
+    ]
+    if retain_idx:
+        retained_nonpinned = {
+            i for i in retain_idx
+            if i in nonpinned_idx and 0 <= i < len(pool)
+        }
+        keep_idx = sorted(set(pinned_idx) | retained_nonpinned)
+    else:
+        nonpinned_idx_cur = [
+            i for i in range(len(pool))
+            if pool[i].get("img_path") not in pinned_paths
+        ]
+        keep_nonpinned = (
+            nonpinned_idx_cur[-(max_pool - len(pinned_idx)):]
+            if max_pool > len(pinned_idx)
+            else []
+        )
+        keep_idx = sorted(set(pinned_idx) | set(keep_nonpinned))
+    if len(keep_idx) > max_pool:
+        pinned_set = set(pinned_idx)
+        nonpinned_keep = [i for i in keep_idx if i not in pinned_set]
+        nonpinned_keep = nonpinned_keep[-max(max_pool - len(pinned_set), 0):]
+        keep_idx = sorted(pinned_set | set(nonpinned_keep))
+    if len(keep_idx) >= len(pool):
+        return pool, 0
+    new_pool = [pool[i] for i in keep_idx]
+    n_filtered = len(pool) - len(new_pool)
+    logging.info(
+        f"[Image Manager] event-filtered {n_filtered} images, "
+        f"{len(new_pool)} retained"
+    )
+    return new_pool, n_filtered
+
+
 def _hypotheses_prompt_block(working_memory) -> str:
     if working_memory is None or not getattr(working_memory, "hypotheses", None):
         return ""
@@ -1453,15 +1584,17 @@ def format_hypothesis_manager_prompt(
         "Return only JSON with this schema:\n"
         "{\n"
         '  "updates": [\n'
-        '    {"hypothesis_id": "H001", "claim": "...", '
+        '    {"hypothesis_id": "H001", "decision": "KEEP|REVISE|REJECT|DONE", '
+        '"reason": "...", "claim": "<optional revised claim>", '
         '"expected_cues": [], "contradiction_cues": [], '
-        '"anchor": null, "anchors": [], '
         '"status": "PENDING|ACTIVE|SUPPORTED|REJECTED|DONE|CONFIRMED", '
-        '"positive_evidence": [], "negative_evidence": [], '
-        '"next_test": "...", "linked_spatial_branches": [], '
-        '"revision_reason": null, "confidence": 0.0}\n'
+        '"positive_evidence": [], "negative_evidence": [], "next_test": "..."}\n'
         "  ],\n"
-        '  "new_hypotheses": [],\n'
+        '  "new_hypotheses": [\n'
+        '    {"claim": "...", "expected_cues": [], "contradiction_cues": [], '
+        '"anchor": null, "anchors": [], "next_test": "...", '
+        '"linked_spatial_branches": [], "confidence": 0.0}\n'
+        "  ],\n"
         '  "reason": "<short reason>"\n'
         "}\n"
     )
@@ -1490,7 +1623,8 @@ def _run_hypothesis_manager(
     step_index: int,
     step: Dict[str, Any],
     verbose: bool,
-) -> None:
+    event_engine: Optional[EventEngine] = None,
+) -> List[TypedEvent]:
     sys_p, content = format_hypothesis_manager_prompt(
         question=question,
         task_type=task_type,
@@ -1504,17 +1638,34 @@ def _run_hypothesis_manager(
         logging.info("[Hypothesis Manager] calling VLM")
     raw = call_openai_api(sys_p, content)
     hypotheses, hyp_reason = parse_hypothesis_manager_response(
-        raw, step_index
+        raw,
+        step_index,
+        existing_hypotheses=getattr(working_memory, "hypotheses", None),
     )
+    revised_events: List[TypedEvent] = []
     if hypotheses and working_memory is not None:
         working_memory.set_hypotheses_from_manager(hypotheses)
         logging.info(
             f"[Hypothesis Manager] applied {len(hypotheses)} updates"
         )
+        if event_engine is not None:
+            revised_event = event_engine.emit(
+                EventType.HYPOTHESIS_REVISED,
+                step=step_index,
+                entity_id="hypothesis_store",
+                payload={
+                    "hypothesis_ids": [hyp.hypothesis_id for hyp in hypotheses],
+                    "reason": hyp_reason,
+                },
+            )
+            if revised_event is not None:
+                working_memory.add_typed_event(revised_event)
+                revised_events.append(revised_event)
     else:
         logging.info("[Hypothesis Manager] no valid hypothesis updates")
     if hyp_reason:
         _record_step_summary(step, f"Hypothesis Manager: {hyp_reason}")
+    return revised_events
 
 
 def _hypothesis_state_after_routing(
@@ -1531,7 +1682,7 @@ def _hypothesis_state_after_routing(
 ) -> str:
     routing = event_engine.route(typed_events, working_memory=working_memory)
     if routing.call_hypothesis_manager:
-        _run_hypothesis_manager(
+        revised_events = _run_hypothesis_manager(
             question=question,
             task_type=task_type,
             typed_events=typed_events,
@@ -1541,7 +1692,9 @@ def _hypothesis_state_after_routing(
             step_index=step_index,
             step=step,
             verbose=verbose,
+            event_engine=event_engine,
         )
+        typed_events.extend(revised_events)
     else:
         logging.info("[Hypothesis Manager] skipped (no trigger)")
 
@@ -1712,51 +1865,19 @@ def explore_multi_agent(
             _append_events(typed_events, [no_hypothesis_event], working_memory)
     routing = event_engine.route(typed_events, working_memory=working_memory)
 
-    if routing.call_memory_manager and len(nonpinned_idx) > 0:
-        sys_p, content = format_image_manager_prompt(
-            question, pool, high_level_plan, task_type, image_goal
-        )
-        if verbose:
-            logging.info("[Image Manager] calling VLM (event-triggered)")
-        raw = call_openai_api(sys_p, content)
-        retain_idx = parse_retain_response(raw, "Images")
-        pinned_idx = [
-            i for i in range(len(pool))
-            if pool[i].get("img_path") in pinned_paths
-        ]
-        if retain_idx:
-            retained_nonpinned = {
-                i for i in retain_idx
-                if i in nonpinned_idx and 0 <= i < len(pool)
-            }
-            keep_idx = sorted(set(pinned_idx) | retained_nonpinned)
-        else:
-            nonpinned_idx_cur = [
-                i for i in range(len(pool))
-                if pool[i].get("img_path") not in pinned_paths
-            ]
-            keep_nonpinned = (
-                nonpinned_idx_cur[-(max_pool - len(pinned_idx)):]
-                if max_pool > len(pinned_idx)
-                else []
-            )
-            keep_idx = sorted(set(pinned_idx) | set(keep_nonpinned))
-        if len(keep_idx) > max_pool:
-            pinned_set = set(pinned_idx)
-            nonpinned_keep = [i for i in keep_idx if i not in pinned_set]
-            nonpinned_keep = nonpinned_keep[-max(max_pool - len(pinned_set), 0):]
-            keep_idx = sorted(pinned_set | set(nonpinned_keep))
-        if len(keep_idx) < len(pool):
-            new_pool = [pool[i] for i in keep_idx]
-            n_filtered = len(pool) - len(new_pool)
-            pool = new_pool
-            step["image_pool"] = pool
-            logging.info(
-                f"[Image Manager] event-filtered {n_filtered} images, "
-                f"{len(pool)} retained"
-            )
-    else:
-        logging.info("[Image Manager] skipped (no memory trigger)")
+    pool, filtered_now = _run_memory_manager(
+        question=question,
+        pool=pool,
+        high_level_plan=high_level_plan,
+        task_type=task_type,
+        image_goal=image_goal,
+        pinned_paths=pinned_paths,
+        max_pool=max_pool,
+        should_call=routing.call_memory_manager,
+        verbose=verbose,
+    )
+    n_filtered += filtered_now
+    step["image_pool"] = pool
 
     bev_label_block, bev_content = _safe_bev_block(
         tsdf_planner,
@@ -1808,6 +1929,7 @@ def explore_multi_agent(
     reason = _extract_reason(raw)
     answerer_events_recorded = False
     visible_candidate_handled = False
+    handled_post_memory_event_ids = set()
 
     if (
         decision in ("CANDIDATE_VISIBLE", "TARGET_CONFIRMED", "ANSWER_READY")
@@ -1845,6 +1967,35 @@ def explore_multi_agent(
         )
         typed_events.extend(controller_result.events)
         step["candidate_controller_events"] = controller_result.events
+        post_answer_memory_events = [
+            event for event in typed_events
+            if event.type == EventType.ANSWERER_EVIDENCE_CONFLICT
+        ]
+        if post_answer_memory_events:
+            handled_post_memory_event_ids.update(
+                event.event_id for event in post_answer_memory_events
+            )
+            post_routing = event_engine.route(
+                post_answer_memory_events, working_memory=working_memory
+            )
+            pinned_paths = (
+                set(working_memory.pinned_ids)
+                if working_memory is not None
+                else set()
+            )
+            pool, filtered_now = _run_memory_manager(
+                question=question,
+                pool=pool,
+                high_level_plan=high_level_plan,
+                task_type=task_type,
+                image_goal=image_goal,
+                pinned_paths=pinned_paths,
+                max_pool=max_pool,
+                should_call=post_routing.call_memory_manager,
+                verbose=verbose,
+            )
+            n_filtered += filtered_now
+            step["image_pool"] = pool
         if controller_result.intent is not None:
             step["navigation_intent"] = controller_result.intent
             _finalize_events(step, working_memory, typed_events)
@@ -1889,6 +2040,36 @@ def explore_multi_agent(
         step=step,
         verbose=verbose,
     )
+    post_memory_events = [
+        event for event in typed_events
+        if event.type in (
+            EventType.ANSWERER_EVIDENCE_CONFLICT,
+            EventType.HYPOTHESIS_REVISED,
+        )
+        and event.event_id not in handled_post_memory_event_ids
+    ]
+    if post_memory_events:
+        post_routing = event_engine.route(
+            post_memory_events, working_memory=working_memory
+        )
+        pinned_paths = (
+            set(working_memory.pinned_ids)
+            if working_memory is not None
+            else set()
+        )
+        pool, filtered_now = _run_memory_manager(
+            question=question,
+            pool=pool,
+            high_level_plan=hypothesis_state or high_level_plan,
+            task_type=task_type,
+            image_goal=image_goal,
+            pinned_paths=pinned_paths,
+            max_pool=max_pool,
+            should_call=post_routing.call_memory_manager,
+            verbose=verbose,
+        )
+        n_filtered += filtered_now
+        step["image_pool"] = pool
 
     # Eligibility filter.
     if working_memory is not None:

@@ -91,6 +91,7 @@ class EventType(Enum):
     HYPOTHESIS_SUPPORTED = "HYPOTHESIS_SUPPORTED"
     HYPOTHESIS_CONTRADICTED = "HYPOTHESIS_CONTRADICTED"
     HYPOTHESIS_TEST_COMPLETED = "HYPOTHESIS_TEST_COMPLETED"
+    HYPOTHESIS_REVISED = "HYPOTHESIS_REVISED"
     NEW_TASK_RELEVANT_ANCHOR = "NEW_TASK_RELEVANT_ANCHOR"
     EVIDENCE_CONFLICT = "EVIDENCE_CONFLICT"
     ANSWERER_EVIDENCE_CONFLICT = "ANSWERER_EVIDENCE_CONFLICT"
@@ -890,7 +891,21 @@ class TargetCandidate:
     nav_status: NavStatus = NavStatus.NONE
     nav_goal_xyz: Optional[Any] = None       # habitat (x,y,z)
     nav_goal_yaw: Optional[float] = None
+    bbox_xyxy: Optional[Any] = None
+    mask: Optional[Any] = None
+    target_pointcloud: Optional[Any] = None
+    grounding_source: Optional[str] = None
     updated_step: int = 0                    # last status-change step (0 → use source_step)
+
+    def __post_init__(self) -> None:
+        self.camera_pose = _jsonable(self.camera_pose)
+        self.nav_goal_xyz = _jsonable(self.nav_goal_xyz)
+        self.bbox_xyxy = _jsonable(self.bbox_xyxy)
+        self.mask = _jsonable(self.mask)
+        self.target_pointcloud = _jsonable(self.target_pointcloud)
+        self.nav_status = _coerce_enum(NavStatus, self.nav_status)
+        if self.nav_target_kind is not None:
+            self.nav_target_kind = _coerce_enum(NavTargetKind, self.nav_target_kind)
 
     def record_attempt(self, level: int, success: bool, reason: str = "") -> None:
         self.grounding_attempts.append(
@@ -912,6 +927,7 @@ class TargetCandidate:
         return (
             f"  - candidate {self.candidate_id} (image={self.image_path}, "
             f"phrase='{self.target_phrase}', status={self.status}, "
+            f"grounding={self.grounding_source or 'none'}, "
             f"closer_views={self.closer_view_attempts}, "
             f"last_failure={self.last_failure_reason or 'none'})"
         )
@@ -1036,13 +1052,16 @@ class SubtaskWorkingMemory:
         subtask_id: str,
         question: str,
     ) -> None:
-        """Clear working memory; keep frontier_registry geometry but mark STALE.
+        """Reset task-local state for a new GOAT subtask.
 
-        Frontier geometry is still valid (walls don't move between subtasks in
-        the same episode), but their exploration status resets because the
-        target changed — a frontier that gave no info for object A may still
-        be useful for object B. We mark STALE so they can be re-considered but
-        are not preferred.
+        SpatialBranchRecord is episode-global geometry and is preserved. A
+        NEW BranchTaskState does not mean the branch was newly discovered; it
+        means the existing branch has not been evaluated under this subtask's
+        target condition yet.
+
+        Frontier geometry is still valid within the same episode, but frontier
+        task status resets because the target changed. We mark stale frontiers
+        so they can be reconsidered without being preferred as fresh evidence.
         """
         self.subtask_id = subtask_id
         self.question = question
@@ -1059,6 +1078,16 @@ class SubtaskWorkingMemory:
         self.last_plan_normalized = None
         self.recent_frontier_ids = []
         self._last_nav_candidate_id = None
+        for bid, branch in self.spatial_branches.items():
+            if branch.merged_into:
+                continue
+            if str(branch.geometric_status).upper() != "OPEN":
+                continue
+            self.branch_task_states[bid] = BranchTaskState(
+                spatial_branch_id=bid,
+                subtask_id=subtask_id,
+                status=BranchTaskStatus.NEW,
+            )
         for fs in self.frontier_registry.values():
             fs.status = F_STALE
             fs.selected_count = 0

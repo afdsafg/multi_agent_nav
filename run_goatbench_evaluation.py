@@ -46,6 +46,8 @@ from src.memory_structures import (
     NavigationMode,
     NavigationResult,
     NavStatus,
+    S_GROUNDED_3D,
+    S_NEED_CLOSER_VIEW,
     StepOutcome,
     SubtaskWorkingMemory,
     TargetViewpointIntent,
@@ -129,6 +131,54 @@ def _branch_outcome_metrics(working_memory, navigation_intent):
         float(getattr(state, "recent_region_overlap", 0.0) or 0.0),
         bool(getattr(state, "reversal_count", 0) > 0),
     )
+
+
+def _intent_goal_and_label(navigation_intent):
+    if isinstance(navigation_intent, VisualApproachIntent):
+        return navigation_intent.approach_xyz, navigation_intent.image_path
+    if isinstance(navigation_intent, TargetViewpointIntent):
+        return navigation_intent.target_xyz, navigation_intent.image_path
+    return None, None
+
+
+def _apply_verify_failure_transition(
+    subtask_metadata,
+    verify_status,
+    navigation_intent,
+    candidate,
+):
+    if (
+        verify_status == VerifyStatus.POOR_VIEW
+        and isinstance(navigation_intent, TargetViewpointIntent)
+        and candidate is not None
+        and candidate.status == S_GROUNDED_3D
+    ):
+        target_xyz = (
+            candidate.nav_goal_xyz
+            if candidate.nav_goal_xyz is not None
+            else navigation_intent.target_xyz
+        )
+        retry_intent = TargetViewpointIntent(
+            candidate_id=candidate.candidate_id,
+            image_path=candidate.image_path,
+            target_phrase=candidate.target_phrase,
+            target_xyz=target_xyz,
+            target_yaw=candidate.nav_goal_yaw,
+            viewpoint_id=navigation_intent.viewpoint_id,
+            reason_code="VERIFY_POOR_VIEW_RETRY",
+            reason="VERIFY returned POOR_VIEW; retry target viewpoint approach.",
+        )
+        candidate.nav_status = NavStatus.PLANNED
+        subtask_metadata["navigation_intent"] = retry_intent
+        subtask_metadata["navigation_mode"] = NavigationMode.TARGET_APPROACH
+        return
+
+    if verify_status == VerifyStatus.TARGET_NOT_VISIBLE and candidate is not None:
+        candidate.status = S_NEED_CLOSER_VIEW
+        candidate.nav_status = NavStatus.FAILED
+
+    subtask_metadata["navigation_intent"] = None
+    subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
 
 
 class Timer:
@@ -585,15 +635,41 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         decision_history.append(np.asarray(pts).tolist())
                         if len(decision_history) > 12:
                             del decision_history[:-12]
-                        vlm_response = query_vlm_multi_agent(
-                            subtask_metadata=subtask_metadata,
-                            scene=scene,
-                            tsdf_planner=tsdf_planner,
-                            rgb_egocentric_views=rgb_egocentric_views,
-                            cfg=cfg,
-                            pts=pts,
-                            verbose=True,
-                        )
+                        pending_intent = subtask_metadata.get("navigation_intent")
+                        pending_mode = subtask_metadata.get("navigation_mode")
+                        if (
+                            isinstance(
+                                pending_intent,
+                                (VisualApproachIntent, TargetViewpointIntent),
+                            )
+                            and pending_mode in (
+                                NavigationMode.VISUAL_APPROACH,
+                                NavigationMode.TARGET_APPROACH,
+                            )
+                        ):
+                            pending_goal, pending_label = _intent_goal_and_label(
+                                pending_intent
+                            )
+                            vlm_response = (
+                                pending_intent,
+                                pending_goal,
+                                0,
+                                pending_label,
+                            )
+                            logging.info(
+                                f"[navigation] reusing pending "
+                                f"{pending_mode.value} intent"
+                            )
+                        else:
+                            vlm_response = query_vlm_multi_agent(
+                                subtask_metadata=subtask_metadata,
+                                scene=scene,
+                                tsdf_planner=tsdf_planner,
+                                rgb_egocentric_views=rgb_egocentric_views,
+                                cfg=cfg,
+                                pts=pts,
+                                verbose=True,
+                            )
                         # update high-level plan in subtask_metadata + episode_memory
                         if vlm_response is not None and hasattr(episode_memory, 'add_entry'):
                             hlp = subtask_metadata.get('high_level_plan', None)
@@ -869,11 +945,16 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             wm = subtask_metadata.get("working_memory", None)
                             if wm is not None:
                                 if verify_status == VerifyStatus.WRONG_INSTANCE:
-                                    for c in list(wm.target_candidates.values()):
-                                        if c.status == "GROUNDED_3D":
-                                            wm.reject_candidate_by_vlm(c.image_path, f"VERIFY rejected at step {cnt_step}")
-                                            logging.info(f"[VERIFY] rejected candidate {c.candidate_id} (wrong instance)")
-                                            break
+                                    if _nav_candidate is not None:
+                                        wm.reject_candidate_by_vlm(
+                                            _nav_candidate.image_path,
+                                            f"VERIFY rejected at step {cnt_step}",
+                                        )
+                                        logging.info(
+                                            f"[VERIFY] rejected candidate "
+                                            f"{_nav_candidate.candidate_id} "
+                                            f"(wrong instance)"
+                                        )
                                 wm.add_feedback(
                                     step=cnt_step,
                                     type_="VERIFY_FAIL",
@@ -886,8 +967,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                 )
                             _record_navigation_events(_wm, navigation_result)
                             nav_events_recorded = True
-                            subtask_metadata["navigation_intent"] = None
-                            subtask_metadata["navigation_mode"] = NavigationMode.EXPLORE
+                            _apply_verify_failure_transition(
+                                subtask_metadata,
+                                verify_status,
+                                navigation_intent,
+                                _nav_candidate,
+                            )
                     elif target_arrived and navigation_intent is not None:
                         # Frontier and visual-approach arrivals re-enter
                         # EXPLORE after the next observation; they never

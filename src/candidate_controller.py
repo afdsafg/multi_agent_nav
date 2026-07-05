@@ -495,11 +495,6 @@ class CandidateController:
             )
 
         target_obj = valid_objs[0]
-        if working_memory is not None:
-            working_memory.grounded_candidate(candidate.candidate_id)
-        else:
-            candidate.status = S_GROUNDED_3D
-
         scene_points = []
         for obj in scene.objects.values():
             try:
@@ -507,6 +502,15 @@ class CandidateController:
             except Exception:
                 continue
         target_points = np.asarray(target_obj["pcd"].points)
+        candidate.bbox_xyxy = np.asarray(ground2d.bbox_xyxy).astype(int).tolist()
+        candidate.mask = masks_np[0].astype(bool).tolist() if len(masks_np) > 0 else None
+        candidate.target_pointcloud = target_points.tolist()
+        candidate.grounding_source = ground2d.source
+        if working_memory is not None:
+            working_memory.grounded_candidate(candidate.candidate_id)
+        else:
+            candidate.status = S_GROUNDED_3D
+
         if scene_points:
             all_scene_points = np.concatenate(scene_points, axis=0)
         else:

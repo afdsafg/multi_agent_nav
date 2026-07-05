@@ -51,10 +51,13 @@ class EventEngine:
         EventType.NO_VALID_FRONTIER,
         EventType.WRONG_INSTANCE,
         EventType.ANSWERER_EVIDENCE_CONFLICT,
+        EventType.HYPOTHESIS_REVISED,
         EventType.HYPOTHESIS_UPDATE_REQUIRED,
     }
     MEMORY_TRIGGERS = {
         EventType.WORKING_MEMORY_OVER_BUDGET,
+        EventType.HYPOTHESIS_REVISED,
+        EventType.ANSWERER_EVIDENCE_CONFLICT,
         EventType.MEMORY_UPDATE_REQUIRED,
     }
 

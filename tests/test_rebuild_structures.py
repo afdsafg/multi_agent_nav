@@ -23,6 +23,7 @@ from src.memory_structures import (
     F_ACTIVE,
     FrontierInstance,
     FrontierState,
+    Grounding2D,
     HypothesisBranch,
     HypothesisStatus,
     ImageAnchor,
@@ -30,6 +31,7 @@ from src.memory_structures import (
     NavTargetKind,
     NavigationMode,
     NavigationResult,
+    S_GROUNDED_3D,
     S_NEED_CLOSER_VIEW,
     SpatialBranchRecord,
     StepOutcome,
@@ -191,7 +193,18 @@ def test_dataclass_json_roundtrip_anchor_intents_and_step_outcome():
 def test_subtask_reset_clears_task_scope_but_preserves_spatial_branches():
     memory = SubtaskWorkingMemory()
     memory.upsert_spatial_branch(
-        SpatialBranchRecord(spatial_branch_id="B001", frontier_ids=[1])
+        SpatialBranchRecord(spatial_branch_id="B001", frontier_ids=[1], geometric_status="OPEN")
+    )
+    memory.upsert_spatial_branch(
+        SpatialBranchRecord(spatial_branch_id="B002", frontier_ids=[2], geometric_status="CLOSED")
+    )
+    memory.upsert_spatial_branch(
+        SpatialBranchRecord(
+            spatial_branch_id="B003",
+            frontier_ids=[3],
+            geometric_status="OPEN",
+            merged_into="B001",
+        )
     )
     memory.upsert_branch_task_state(
         BranchTaskState(
@@ -228,7 +241,10 @@ def test_subtask_reset_clears_task_scope_but_preserves_spatial_branches():
     memory.reset_for_new_subtask("task-2", "Find the table")
 
     assert "B001" in memory.spatial_branches
-    assert memory.branch_task_states == {}
+    assert memory.branch_task_states["B001"].status is BranchTaskStatus.NEW
+    assert memory.branch_task_states["B001"].subtask_id == "task-2"
+    assert "B002" not in memory.branch_task_states
+    assert "B003" not in memory.branch_task_states
     assert memory.hypotheses == {}
     assert memory.target_candidates == {}
     assert memory.typed_events == []
@@ -425,6 +441,28 @@ def test_answerer_evidence_updates_route_to_hypothesis_manager():
     ]
     assert engine.route(events).call_hypothesis_manager is True
     assert [event.type for event in memory.typed_events] == [event.type for event in events]
+
+
+def test_memory_manager_routes_on_answerer_conflict_and_hypothesis_revised():
+    engine = EventEngine(EventEngineConfig())
+    conflict = TypedEvent(
+        event_id="conflict",
+        type=EventType.ANSWERER_EVIDENCE_CONFLICT,
+        step=1,
+    )
+    revised = TypedEvent(
+        event_id="revised",
+        type=EventType.HYPOTHESIS_REVISED,
+        step=1,
+        entity_id="hypothesis_store",
+    )
+
+    routing = engine.route([conflict, revised])
+
+    assert routing.call_memory_manager is True
+    assert routing.call_hypothesis_manager is True
+    assert EventType.ANSWERER_EVIDENCE_CONFLICT.value in routing.reasons
+    assert EventType.HYPOTHESIS_REVISED.value in routing.reasons
 
 
 def test_branch_tracker_sync_and_eligibility_filter():
@@ -660,6 +698,107 @@ def test_candidate_controller_keeps_candidate_on_grounding_failure():
     assert [event.type for event in result.events] == [EventType.GROUNDING_FAILED]
 
 
+def test_candidate_controller_stores_grounded_artifacts():
+    import torch
+    import src.candidate_controller as controller_module
+    from src.candidate_controller import CandidateController
+
+    class FakeCfg(dict):
+        def __getattr__(self, name):
+            return self[name]
+
+    class FakePcd:
+        def __init__(self, points):
+            self.points = np.asarray(points, dtype=float)
+
+    class FakeMasks:
+        def __init__(self):
+            self.data = torch.ones((1, 3, 3), dtype=torch.bool)
+
+    class FakeSamResult:
+        masks = FakeMasks()
+
+    class FakeSamPredictor:
+        def predict(self, *args, **kwargs):
+            return [FakeSamResult()]
+
+    memory = SubtaskWorkingMemory()
+    candidate = memory.get_or_create_candidate(
+        image_path="1-view_0.png",
+        target_phrase="chair",
+        source_step=1,
+        camera_pose=np.eye(4),
+        view_yaw=0.0,
+    )
+    scene = SimpleNamespace(
+        device="cpu",
+        sam_predictor=FakeSamPredictor(),
+        all_depths={"1-view_0.png": np.ones((3, 3), dtype=float)},
+        intrinsics=np.eye(4),
+        cfg_cg=FakeCfg(
+            min_points_threshold=1,
+            spatial_sim_type="bbox",
+            obj_pcd_max_points=10,
+            downsample_voxel_size=0.01,
+            dbscan_remove_noise=False,
+            dbscan_eps=0.1,
+            dbscan_min_points=1,
+        ),
+        objects={1: {"pcd": FakePcd([[0.0, 0.0, 0.0], [1.0, 0.0, 1.0]])}},
+    )
+
+    def fake_detect_to_obj(**kwargs):
+        return [{"pcd": FakePcd([[2.0, 0.0, 2.0], [2.5, 0.0, 2.0]])}]
+
+    old_concept = controller_module._conceptgraph_slam_utils
+    old_utils = sys.modules.get("src.utils")
+    fake_utils = types.ModuleType("src.utils")
+    fake_utils.Visibility_based_Viewpoint_Decision = (
+        lambda *args, **kwargs: np.array([3.0, 0.0, 3.0])
+    )
+    controller_module._conceptgraph_slam_utils = lambda: (
+        lambda spatial_sim_type, pcd: SimpleNamespace(),
+        lambda pcd, **kwargs: pcd,
+        fake_detect_to_obj,
+    )
+    sys.modules["src.utils"] = fake_utils
+    try:
+        controller = CandidateController(
+            SimpleNamespace(AVU_conf_threshold=0.1, dicision_radius=1.0)
+        )
+        result = controller._build_target_viewpoint_result(
+            scene=scene,
+            tsdf_planner=SimpleNamespace(),
+            working_memory=memory,
+            candidate=candidate,
+            img_path="1-view_0.png",
+            target_phrase="chair",
+            target_image=np.zeros((3, 3, 3), dtype=np.uint8),
+            cam_pose=np.eye(4),
+            ground2d=Grounding2D(
+                source="class_agnostic_clip",
+                phrase="chair",
+                bbox_xyxy=np.array([0, 0, 2, 2]),
+            ),
+            pts=np.array([0.0, 0.0, 0.0]),
+            step_index=1,
+        )
+    finally:
+        controller_module._conceptgraph_slam_utils = old_concept
+        if old_utils is None:
+            sys.modules.pop("src.utils", None)
+        else:
+            sys.modules["src.utils"] = old_utils
+
+    stored = memory.target_candidates[candidate.candidate_id]
+    assert result.intent is not None
+    assert stored.status == S_GROUNDED_3D
+    assert stored.bbox_xyxy == [0, 0, 2, 2]
+    assert stored.mask is not None
+    assert stored.target_pointcloud == [[2.0, 0.0, 2.0], [2.5, 0.0, 2.0]]
+    assert stored.grounding_source == "class_agnostic_clip"
+
+
 def test_candidate_clip_gate_uses_raw_margin_depth_and_does_not_mutate_boxes():
     import torch
     import src.candidate_controller as controller_module
@@ -808,6 +947,69 @@ def test_agent_json_parsers_fail_safe_without_random_frontier():
         assert len(hypotheses) == 1
         assert hypotheses[0].hypothesis_id == "H003"
         assert hypotheses[0].writer == "HypothesisManager"
+    finally:
+        if old_explore_multi_agent is None:
+            sys.modules.pop("src.explore_multi_agent", None)
+        else:
+            sys.modules["src.explore_multi_agent"] = old_explore_multi_agent
+        if old_explore_utils is None:
+            sys.modules.pop("src.explore_utils", None)
+        else:
+            sys.modules["src.explore_utils"] = old_explore_utils
+
+
+def test_hypothesis_parser_accepts_spec_partial_updates_and_auto_ids():
+    old_explore_utils = _install_explore_utils_stub()
+    old_explore_multi_agent = sys.modules.get("src.explore_multi_agent")
+    sys.modules.pop("src.explore_multi_agent", None)
+    try:
+        import src.explore_multi_agent as explore_multi_agent
+
+        existing = {
+            "H001": HypothesisBranch(
+                hypothesis_id="H001",
+                claim="The target may be past branch B001.",
+                expected_cues=["microwave"],
+                contradiction_cues=["branch is unrelated"],
+                linked_spatial_branches=["B001"],
+                status=HypothesisStatus.ACTIVE,
+                created_step=3,
+            )
+        }
+        hypotheses, reason = explore_multi_agent.parse_hypothesis_manager_response(
+            json.dumps(
+                {
+                    "updates": [
+                        {
+                            "hypothesis_id": "H001",
+                            "decision": "REJECT",
+                            "reason": "Covered the branch with no microwave.",
+                        }
+                    ],
+                    "new_hypotheses": [
+                        {
+                            "claim": "Try the open branch toward the kitchen.",
+                            "expected_cues": ["appliances"],
+                            "next_test": "advance until a new room is exposed",
+                        }
+                    ],
+                    "reason": "branch evidence changed",
+                }
+            ),
+            step_index=9,
+            existing_hypotheses=existing,
+        )
+
+        assert reason == "branch evidence changed"
+        assert len(hypotheses) == 2
+        rejected = next(h for h in hypotheses if h.hypothesis_id == "H001")
+        created = next(h for h in hypotheses if h.hypothesis_id != "H001")
+        assert rejected.status is HypothesisStatus.REJECTED
+        assert rejected.claim == existing["H001"].claim
+        assert rejected.created_step == 3
+        assert "Covered the branch with no microwave." in rejected.negative_evidence
+        assert created.hypothesis_id == "H002"
+        assert created.claim == "Try the open branch toward the kitchen."
     finally:
         if old_explore_multi_agent is None:
             sys.modules.pop("src.explore_multi_agent", None)
@@ -974,6 +1176,135 @@ def test_grounding_failure_falls_through_without_hypothesis_replan():
             for event in step["typed_events"]
         )
         assert not any("HYPOTHESIS MANAGER" in sys_prompt for sys_prompt, _ in calls)
+    finally:
+        if old_explore_multi_agent is None:
+            sys.modules.pop("src.explore_multi_agent", None)
+        else:
+            sys.modules["src.explore_multi_agent"] = old_explore_multi_agent
+        if old_explore_utils is None:
+            sys.modules.pop("src.explore_utils", None)
+        else:
+            sys.modules["src.explore_utils"] = old_explore_utils
+
+
+def test_answerer_conflict_triggers_memory_manager_in_rebuild_flow():
+    old_explore_utils = _install_explore_utils_stub()
+    old_explore_multi_agent = sys.modules.get("src.explore_multi_agent")
+    sys.modules.pop("src.explore_multi_agent", None)
+    try:
+        import src.explore_multi_agent as explore_multi_agent
+
+        memory = SubtaskWorkingMemory()
+        memory.set_hypotheses_from_manager(
+            [
+                HypothesisBranch(
+                    hypothesis_id="H001",
+                    claim="Check the open branch.",
+                    status=HypothesisStatus.ACTIVE,
+                )
+            ]
+        )
+        planner = FakeTSDFPlanner([FakeFrontier(10, [1.0, 0.0, 2.0])])
+        step = {
+            "question": "Find the microwave",
+            "task_type": "object",
+            "image": None,
+            "CLR": {},
+            "scene": SimpleNamespace(objects={}, img_to_edge={}),
+            "tsdf_planner": planner,
+            "working_memory": memory,
+            "image_pool": [
+                {
+                    "img_path": "keep.png",
+                    "img_b64": "keep-img",
+                    "connected_objects": [],
+                    "source": "kss",
+                    "step": 1,
+                },
+                {
+                    "img_path": "drop.png",
+                    "img_b64": "drop-img",
+                    "connected_objects": [],
+                    "source": "kss",
+                    "step": 1,
+                },
+            ],
+            "frontier_imgs": ["frontier-img"],
+            "processed_images": {},
+            "image_map_reverse": {},
+            "step_index": 5,
+            "current_position": np.array([0.0, 0.0, 0.0]),
+        }
+        calls = []
+
+        def fake_call(sys_prompt, content):
+            joined = "\n".join(
+                part[0] if isinstance(part, tuple) else str(part)
+                for part in content
+            )
+            calls.append((sys_prompt, joined))
+            if "MEMORY MANAGEMENT AGENT" in sys_prompt:
+                return "Retain Images: {0}"
+            if "HYPOTHESIS MANAGER" in sys_prompt:
+                return json.dumps(
+                    {
+                        "updates": [
+                            {
+                                "hypothesis_id": "H001",
+                                "decision": "KEEP",
+                                "reason": "conflict noted",
+                            }
+                        ],
+                        "new_hypotheses": [],
+                        "reason": "conflict routed",
+                    }
+                )
+            if "frontier_id" in joined and "Available Frontier IDs" in joined:
+                return json.dumps(
+                    {
+                        "frontier_id": 10,
+                        "spatial_branch_id": None,
+                        "hypothesis_id": "H001",
+                        "action_mode": "CONTINUE_SPATIAL_BRANCH",
+                        "reason_code": "TEST",
+                        "reason": "continue",
+                    }
+                )
+            return json.dumps(
+                {
+                    "decision": "NOT_FOUND",
+                    "candidate": {"image": None, "target_phrase": None},
+                    "evidence_updates": [],
+                    "evidence_conflict": True,
+                    "reason": "conflicting visual evidence",
+                }
+            )
+
+        old_call = explore_multi_agent.call_openai_api
+        explore_multi_agent.call_openai_api = fake_call
+        try:
+            result = explore_multi_agent.explore_multi_agent(
+                step,
+                SimpleNamespace(max_pool_size=6),
+                verbose=False,
+            )
+        finally:
+            explore_multi_agent.call_openai_api = old_call
+
+        assert result[0] == "frontier"
+        assert result[3] == 1
+        assert [snap["img_path"] for snap in step["image_pool"]] == ["keep.png"]
+        assert any(
+            "MEMORY MANAGEMENT AGENT" in sys_prompt for sys_prompt, _ in calls
+        )
+        assert any(
+            event.type is EventType.ANSWERER_EVIDENCE_CONFLICT
+            for event in step["typed_events"]
+        )
+        assert any(
+            event.type is EventType.HYPOTHESIS_REVISED
+            for event in step["typed_events"]
+        )
     finally:
         if old_explore_multi_agent is None:
             sys.modules.pop("src.explore_multi_agent", None)
@@ -1269,6 +1600,106 @@ def test_query_vlm_multi_agent_preserves_typed_intent_and_spatial_metadata():
             sys.modules["src.explore_utils"] = old_explore_utils
 
 
+def test_verify_failure_transition_helper_modes():
+    import importlib
+
+    stubbed = {}
+
+    def install_stub(name, module):
+        stubbed[name] = sys.modules.get(name)
+        sys.modules[name] = module
+
+    omega = types.ModuleType("omegaconf")
+    omega.OmegaConf = SimpleNamespace()
+    install_stub("omegaconf", omega)
+    install_stub("open_clip", types.ModuleType("open_clip"))
+    ultralytics = types.ModuleType("ultralytics")
+    ultralytics.SAM = object
+    ultralytics.YOLOWorld = object
+    install_stub("ultralytics", ultralytics)
+
+    habitat = types.ModuleType("src.habitat")
+    habitat.pose_habitat_to_tsdf = lambda *args, **kwargs: None
+    install_stub("src.habitat", habitat)
+    geom = types.ModuleType("src.geom")
+    geom.get_cam_intr = lambda *args, **kwargs: None
+    geom.get_scene_bnds = lambda *args, **kwargs: None
+    install_stub("src.geom", geom)
+    tsdf = types.ModuleType("src.tsdf_planner")
+    tsdf.TSDFPlanner = object
+    tsdf.Frontier = type("Frontier", (), {})
+    install_stub("src.tsdf_planner", tsdf)
+    scene_graph = types.ModuleType("src.multimodal_3d_scene_graph")
+    scene_graph.Scene = object
+    install_stub("src.multimodal_3d_scene_graph", scene_graph)
+    utils = types.ModuleType("src.utils")
+    utils.resize_image = lambda image, *args, **kwargs: image
+    utils.calc_agent_subtask_distance = lambda *args, **kwargs: 999.0
+    utils.get_pts_angle_goatbench = lambda *args, **kwargs: (None, None)
+    install_stub("src.utils", utils)
+    dataset = types.ModuleType("src.dataset_utils")
+    dataset.prepare_goatbench_navigation_goals = lambda *args, **kwargs: None
+    install_stub("src.dataset_utils", dataset)
+    query = types.ModuleType("src.query_vlm")
+    query.query_vlm_for_verify = lambda *args, **kwargs: (VerifyStatus.SUCCESS, "")
+    query.query_vlm_multi_agent = lambda *args, **kwargs: None
+    install_stub("src.query_vlm", query)
+    ltm = types.ModuleType("src.long_term_memory")
+    ltm.TextLongTermMemory = object
+    install_stub("src.long_term_memory", ltm)
+    logger = types.ModuleType("src.logger_goatbench")
+    logger.Logger = object
+    install_stub("src.logger_goatbench", logger)
+    old_runner = sys.modules.get("run_goatbench_evaluation")
+    sys.modules.pop("run_goatbench_evaluation", None)
+
+    try:
+        runner = importlib.import_module("run_goatbench_evaluation")
+        candidate = TargetCandidate(
+            candidate_id="C001",
+            subtask_id="task",
+            image_path="1-view_0.png",
+            source_step=1,
+            camera_pose=np.eye(4),
+            view_yaw=0.0,
+            target_phrase="chair",
+            status=S_GROUNDED_3D,
+            nav_goal_xyz=[2.0, 0.0, 3.0],
+        )
+        intent = TargetViewpointIntent(
+            candidate_id="C001",
+            image_path="1-view_0.png",
+            target_phrase="chair",
+            target_xyz=[2.0, 0.0, 3.0],
+        )
+        metadata = {}
+
+        runner._apply_verify_failure_transition(
+            metadata, VerifyStatus.POOR_VIEW, intent, candidate
+        )
+        assert metadata["navigation_mode"] is NavigationMode.TARGET_APPROACH
+        assert isinstance(metadata["navigation_intent"], TargetViewpointIntent)
+        assert metadata["navigation_intent"].reason_code == "VERIFY_POOR_VIEW_RETRY"
+        assert candidate.nav_status is NavStatus.PLANNED
+
+        runner._apply_verify_failure_transition(
+            metadata, VerifyStatus.TARGET_NOT_VISIBLE, intent, candidate
+        )
+        assert metadata["navigation_mode"] is NavigationMode.EXPLORE
+        assert metadata["navigation_intent"] is None
+        assert candidate.status == S_NEED_CLOSER_VIEW
+        assert candidate.nav_status is NavStatus.FAILED
+    finally:
+        sys.modules.pop("run_goatbench_evaluation", None)
+        if old_runner is not None:
+            sys.modules["run_goatbench_evaluation"] = old_runner
+        for name, old_module in stubbed.items():
+            if old_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old_module
+
+
 def test_goat_runner_uses_rebuild_path_without_legacy_flag_fallback():
     runner = (ROOT / "run_goatbench_evaluation.py").read_text()
 
@@ -1279,6 +1710,10 @@ def test_goat_runner_uses_rebuild_path_without_legacy_flag_fallback():
     assert "current_yaw" in runner
     assert "_record_navigation_events" in runner
     assert "detect_navigation_events" in runner
+    assert "_apply_verify_failure_transition" in runner
+    assert "VERIFY_POOR_VIEW_RETRY" in runner
+    assert "NavigationMode.TARGET_APPROACH" in runner
+    assert "VerifyStatus.TARGET_NOT_VISIBLE" in runner
 
 
 
