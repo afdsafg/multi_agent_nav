@@ -49,6 +49,13 @@ def _cam_pose_to_yaw(cam_pose: np.ndarray) -> float:
         return 0.0
 
 
+def _cam_pose_position(cam_pose: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        return np.asarray(cam_pose, dtype=float)[:3, 3].copy()
+    except Exception:
+        return None
+
+
 def _yolo_detect(scene: Scene, classes: List[str], image_rgb, conf: float):
     """Run YOLOWorld with a temporary class list, then restore scene classes."""
     scene.detection_model.set_classes(classes)
@@ -269,7 +276,7 @@ def query_vlm_for_response(
 
     if target_type == "image":
         #Implementation of AVU.
-        #We update only the words we consider to be the target, 
+        #We update only the words we consider to be the target,
         #so we perform re-perception directly and select it as the answer.
         if int(target_index) >= 0 and int(target_index) < len(image_map_reverse):
             target_index = image_map_reverse[int(target_index)]
@@ -278,6 +285,7 @@ def query_vlm_for_response(
             global_step = scene.global_step_cnt
             target_index = f"{global_step}-view_{view_idx}.png"
         target_image = scene.all_observations[target_index]
+        evidence_position = _cam_pose_position(scene.all_cam_poses[target_index])
         try:
             object_class = outputs.split(",")[1].strip()
         except:
@@ -331,25 +339,53 @@ def query_vlm_for_response(
                     spatial_sim_type=scene.cfg_cg["spatial_sim_type"],
                     pcd=obj["pcd"],
                 )
+        valid_objs = [obj for obj in obj_pcds_and_bboxes if obj is not None]
+        if not valid_objs:
+            if evidence_position is not None:
+                logging.info(
+                    f"The index of target Image {target_index} : {evidence_position} "
+                    f"(Evidence Pose, Confidence : {max_confidence})"
+                )
+                return target_type, evidence_position, n_filtered_snapshots, target_index
+            logging.info(
+                f"No Object Point Cloud in the predicted image: {target_index}, Choose a random frontier instead!"
+            )
+            return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+        target_obj = valid_objs[0]
         try:
-            a = []
-            for idx in scene.objects.keys():
-                a.append(scene.objects[idx]["pcd"].points)
+            scene_point_parts = [
+                np.asarray(scene.objects[idx]["pcd"].points)
+                for idx in scene.objects.keys()
+                if len(scene.objects[idx]["pcd"].points) > 0
+            ]
+            target_points = np.asarray(target_obj["pcd"].points)
+            scene_points = (
+                np.concatenate(scene_point_parts, axis=0)
+                if scene_point_parts
+                else target_points
+            )
             obj_pos = Visibility_based_Viewpoint_Decision(
-                np.array(obj["pcd"].points),
-                np.concatenate(a, axis=0),
+                target_points,
+                scene_points,
                 pts,
                 tsdf_planner,
                 cfg.dicision_radius,
+                evidence_position=evidence_position,
             )
             if obj_pos is None:
-                obj_pos = select_navigation_corner(aabb = obj["bbox"], robot_position = pts)
-                logging.info(f"The index of target Image {target_index} : {obj_pos} (Closed Box Center, Confidence : {max_confidence})")
+                if evidence_position is None:
+                    logging.info(
+                        f"No safe viewpoint or evidence pose for predicted image: {target_index}, Choose a random frontier instead!"
+                    )
+                    return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
+                obj_pos = evidence_position
+                logging.info(f"The index of target Image {target_index} : {obj_pos} (Evidence Pose, Confidence : {max_confidence})")
             else:
                 logging.info(f"The index of target Image {target_index} : {obj_pos} (Visible Center, Confidence : {max_confidence})")
-        except:
+        except Exception as e:
             logging.info(
-                f"No Object Point Cloud in the predicted image: {target_index}, Choose a random frontier instead!"
+                f"AVU/VVD failed for predicted image {target_index}: {e}, "
+                f"Choose a random frontier instead!"
             )
             return random_frontier_choice(tsdf_planner, n_filtered_snapshots)
         # logging.info(f"The index of target Image {target_index} : {obj_pos} (Mask Center, Confidence : {max_confidence})")
@@ -729,10 +765,7 @@ def query_vlm_multi_agent(
                 # inverse. scene stores cam_poses consistent with tsdf usage.
                 # We return it as the navigation target; set_next_navigation_point
                 # treats 'image' choice as a habitat position.
-                try:
-                    cam_pos_habitat = cam_pose[:3, 3]
-                except Exception:
-                    cam_pos_habitat = None
+                cam_pos_habitat = _cam_pose_position(cam_pose)
                 if cam_pos_habitat is None:
                     logging.info(
                         f"[AVU] L4 evidence-pose unavailable, stop (no random frontier)"
@@ -805,10 +838,7 @@ def query_vlm_multi_agent(
                         suggested_fix=_fix_sam,
                         target_candidate_id=candidate.candidate_id if candidate else None,
                     )
-                try:
-                    cam_pos_habitat = cam_pose[:3, 3]
-                except Exception:
-                    cam_pos_habitat = None
+                cam_pos_habitat = _cam_pose_position(cam_pose)
                 if cam_pos_habitat is None:
                     return None
                 if candidate is not None:
@@ -819,25 +849,41 @@ def query_vlm_multi_agent(
                         working_memory.set_last_nav_candidate(candidate.candidate_id)
                 return target_type, cam_pos_habitat, n_filtered_snapshots, target_index
             target_obj = valid_objs[0]
-            if candidate is not None:
+            if candidate is not None and working_memory is not None:
                 working_memory.grounded_candidate(candidate.candidate_id)
-            a = []
-            for idx in scene.objects.keys():
-                a.append(scene.objects[idx]["pcd"].points)
+            scene_point_parts = [
+                np.asarray(scene.objects[idx]["pcd"].points)
+                for idx in scene.objects.keys()
+                if len(scene.objects[idx]["pcd"].points) > 0
+            ]
+            target_points = np.asarray(target_obj["pcd"].points)
+            scene_points = (
+                np.concatenate(scene_point_parts, axis=0)
+                if scene_point_parts
+                else target_points
+            )
+            evidence_position = _cam_pose_position(cam_pose)
             obj_pos = Visibility_based_Viewpoint_Decision(
-                np.array(target_obj["pcd"].points),
-                np.concatenate(a, axis=0),
+                target_points,
+                scene_points,
                 pts,
                 tsdf_planner,
                 cfg.dicision_radius,
+                evidence_position=evidence_position,
             )
+            nav_target_kind = NavTargetKind.VIEWPOINT_POSE
             if obj_pos is None:
-                obj_pos = select_navigation_corner(
-                    aabb=target_obj["bbox"], robot_position=pts
-                )
+                if evidence_position is None:
+                    logging.info(
+                        f"multi_agent target Image {img_path}: no safe VVD viewpoint "
+                        f"and evidence-pose unavailable, stop"
+                    )
+                    return None
+                obj_pos = evidence_position
+                nav_target_kind = NavTargetKind.EVIDENCE_POSE
                 logging.info(
                     f"multi_agent target Image {img_path}: {obj_pos} "
-                    f"(Closed Box Center, conf={max_confidence})"
+                    f"(Evidence Pose, conf={max_confidence})"
                 )
             else:
                 logging.info(
@@ -845,7 +891,7 @@ def query_vlm_multi_agent(
                     f"(Visible Center, conf={max_confidence})"
                 )
             if candidate is not None:
-                candidate.nav_target_kind = NavTargetKind.VIEWPOINT_POSE
+                candidate.nav_target_kind = nav_target_kind
                 candidate.nav_goal_xyz = obj_pos
                 candidate.nav_status = NavStatus.PLANNED
                 if working_memory is not None:
@@ -867,10 +913,7 @@ def query_vlm_multi_agent(
                     suggested_fix=_fix_exc,
                     target_candidate_id=candidate.candidate_id if candidate else None,
                 )
-            try:
-                cam_pos_habitat = cam_pose[:3, 3]
-            except Exception:
-                cam_pos_habitat = None
+            cam_pos_habitat = _cam_pose_position(cam_pose)
             if cam_pos_habitat is None:
                 return None
             if candidate is not None:

@@ -110,11 +110,131 @@ def generate_candidate_viewpoints(bbox_center, radius, pts, num_points=20):
     return np.array(viewpoints)
 
 
+def _unit_xz(vec):
+    arr = np.asarray(vec, dtype=float).copy()
+    arr[1] = 0.0
+    norm = np.linalg.norm(arr[[0, 2]])
+    if norm < 1e-6:
+        return None
+    return arr / norm
+
+
+def _rotate_xz(unit_vec, angle_rad):
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    return np.array(
+        [
+            c * unit_vec[0] - s * unit_vec[2],
+            0.0,
+            s * unit_vec[0] + c * unit_vec[2],
+        ],
+        dtype=float,
+    )
+
+
+def _is_navigable_habitat(tsdf_planner, point):
+    if getattr(tsdf_planner, "unoccupied", None) is None:
+        return True
+    pos = tsdf_planner.habitat2voxel(point)[:2]
+    x, y = int(pos[0]), int(pos[1])
+    H, W = tsdf_planner.unoccupied.shape
+    if x < 0 or x >= H or y < 0 or y >= W:
+        return False
+    if not bool(tsdf_planner.unoccupied[x, y]):
+        return False
+    island = getattr(tsdf_planner, "island", None)
+    if island is not None and island.shape == tsdf_planner.unoccupied.shape:
+        return bool(island[x, y])
+    return True
+
+
+def _snap_local_navigable(tsdf_planner, raw_point, max_snap_dist=0.45):
+    raw_point = np.asarray(raw_point, dtype=float)
+    if _is_navigable_habitat(tsdf_planner, raw_point):
+        return raw_point, 0.0
+    if not hasattr(tsdf_planner, "get_near_true_point"):
+        return None, None
+    snapped = tsdf_planner.get_near_true_point(np.array([raw_point]))
+    if snapped is None or len(snapped) == 0:
+        return None, None
+    snapped = np.asarray(snapped[0], dtype=float)
+    snap_dist = float(np.linalg.norm(snapped[[0, 2]] - raw_point[[0, 2]]))
+    if snap_dist > max_snap_dist:
+        return None, None
+    if not _is_navigable_habitat(tsdf_planner, snapped):
+        return None, None
+    return snapped, snap_dist
+
+
+def _target_surface_point(target_points, bbox_center, viewpoint, min_offset=0.12):
+    """Approximate the visible target surface instead of aiming LOS at the
+    bbox center, which is often inside an occupied object voxel."""
+    direction = _unit_xz(np.asarray(viewpoint, dtype=float) - bbox_center)
+    if direction is None:
+        return bbox_center
+    offsets = target_points - bbox_center
+    projections = offsets[:, 0] * direction[0] + offsets[:, 2] * direction[2]
+    if projections.size == 0:
+        offset = min_offset
+    else:
+        offset = max(float(np.percentile(projections, 90)), min_offset)
+    surface = np.asarray(bbox_center, dtype=float).copy()
+    surface[0] += direction[0] * offset
+    surface[2] += direction[2] * offset
+    return surface
+
+
+def _is_los_clear_to_target_surface(tsdf_planner, viewpoint, target_points, bbox_center):
+    if not hasattr(tsdf_planner, "is_line_of_sight_clear"):
+        return True
+    surface = _target_surface_point(target_points, bbox_center, viewpoint)
+    return bool(tsdf_planner.is_line_of_sight_clear(viewpoint, surface))
+
+
+def _generate_evidence_side_viewpoints(
+    bbox_center,
+    pts,
+    radius,
+    evidence_position=None,
+):
+    center = np.asarray(bbox_center, dtype=float)
+    floor_y = float(pts[1])
+    if evidence_position is not None:
+        side_dir = _unit_xz(np.asarray(evidence_position, dtype=float) - center)
+    else:
+        side_dir = _unit_xz(np.asarray(pts, dtype=float) - center)
+    if side_dir is None:
+        return None, generate_candidate_viewpoints(center, radius, pts)
+
+    radii = sorted(set(float(r) for r in [
+        max(0.55, radius * 0.75),
+        max(0.70, radius),
+        max(0.90, radius * 1.25),
+        max(1.10, radius * 1.55),
+    ]))
+    angles_deg = [0, -15, 15, -30, 30, -45, 45, -60, 60]
+    viewpoints = []
+
+    if evidence_position is not None:
+        evidence_ground = np.asarray(evidence_position, dtype=float).copy()
+        evidence_ground[1] = floor_y
+        viewpoints.append(evidence_ground)
+
+    for r in radii:
+        for angle_deg in angles_deg:
+            direction = _rotate_xz(side_dir, math.radians(angle_deg))
+            viewpoints.append(center + direction * r)
+            viewpoints[-1][1] = floor_y
+
+    return side_dir, np.asarray(viewpoints, dtype=float)
+
 
 def is_point_visible(viewpoint, target_point, scene_points_tree, threshold=0.05):
     """Check if a target point is visible from a viewpoint considering scene occlusion."""
     direction = target_point - viewpoint
     view_distance = np.linalg.norm(direction)
+    if view_distance < 1e-6:
+        return True
     direction /= view_distance
 
     num_samples = min(1000, int(view_distance / threshold) + 1)
@@ -140,51 +260,111 @@ def compute_visibility(viewpoint, target_points, scene_points_tree):
     return visible_count / target_points.shape[0]
 
 
-def Visibility_based_Viewpoint_Decision(target_points, scene_points, pts, tsdf_planner, radius_factor):
-    target_points = target_points[np.random.choice(target_points.shape[0], min(1000, target_points.shape[0]), replace=False)]
+def Visibility_based_Viewpoint_Decision(
+    target_points,
+    scene_points,
+    pts,
+    tsdf_planner,
+    radius_factor,
+    evidence_position=None,
+):
+    target_points = np.asarray(target_points, dtype=float)
+    scene_points = np.asarray(scene_points, dtype=float)
+    if target_points.shape[0] == 0:
+        return None
+    if scene_points.shape[0] == 0:
+        scene_points = target_points
+    if target_points.shape[0] > 1000:
+        sample_idx = np.linspace(
+            0,
+            target_points.shape[0] - 1,
+            num=1000,
+            dtype=int,
+        )
+        target_points = target_points[sample_idx]
     scene_points_tree = KDTree(scene_points)
     bbox_center = target_points.mean(axis=0)
     best_visibility = 0
     best_viewpoint = None
-    candidate_viewpoints = generate_candidate_viewpoints(bbox_center, radius_factor, pts)
-    filtered_viewpoints = tsdf_planner.mask_true_point(candidate_viewpoints)
-    # bbox_center habitat 2D for LOS check: (x, z) = (bbox_center[0], bbox_center[2])
-    # vp format is [habitat_x, ground_height, habitat_z]
-    logging.info(f"[VVD] bbox_center={bbox_center}, n_candidates={len(candidate_viewpoints)}, n_filtered={len(filtered_viewpoints)}")
-    los_passed = []
-    for vp in filtered_viewpoints:
-        vp_habitat = np.array([vp[0], pts[1], vp[2]])
-        bc_habitat = np.array([bbox_center[0], pts[1], bbox_center[2]])
-        if tsdf_planner.is_line_of_sight_clear(vp_habitat, bc_habitat):
-            los_passed.append(vp)
-    logging.info(f"[VVD] LOS check: {len(los_passed)}/{len(filtered_viewpoints)} passed")
-    if los_passed:
-        search_pool = los_passed
-        logging.info("[VVD] using LOS-passed candidates")
-    else:
-        search_pool = []
-        logging.info("[VVD] LOS all blocked, fallback to get_near_true_point")
-    for vp in search_pool:### filtered_viewpoints: candidates of best_viewpoint
-        vp[1] += 1.5 #camera height
-        visibility_score = compute_visibility(vp, target_points, scene_points_tree)
-        vp[1] -= 1.5
-        if visibility_score > best_visibility:
-            best_visibility = visibility_score
-            best_viewpoint = vp
-    if best_viewpoint is None:
-        # LOS all blocked or no reachable candidates: snap to nearest reachable
-        near_viewpoints = tsdf_planner.get_near_true_point(candidate_viewpoints)
-        for vp in near_viewpoints:
-            vp[1] += 1.5
-            visibility_score = compute_visibility(vp, target_points, scene_points_tree)
-            vp[1] -= 1.5
-            if visibility_score > best_visibility: ###update: vp is best view point
-                best_visibility = visibility_score
-                best_viewpoint = vp
+    side_dir, candidate_viewpoints = _generate_evidence_side_viewpoints(
+        bbox_center,
+        pts,
+        radius_factor,
+        evidence_position=evidence_position,
+    )
+    logging.info(
+        f"[VVD] bbox_center={bbox_center}, n_candidates={len(candidate_viewpoints)}, "
+        f"evidence_side={None if side_dir is None else side_dir[[0, 2]]}"
+    )
+
+    scored_candidates = []
+    for raw_vp in candidate_viewpoints:
+        snapped_vp, snap_dist = _snap_local_navigable(tsdf_planner, raw_vp)
+        if snapped_vp is None:
+            continue
+        if side_dir is not None:
+            cand_dir = _unit_xz(snapped_vp - bbox_center)
+            if cand_dir is None:
+                continue
+            # Keep viewpoints on the same visible side as the evidence camera.
+            if float(np.dot(cand_dir[[0, 2]], side_dir[[0, 2]])) < 0.25:
+                continue
+        if not _is_los_clear_to_target_surface(
+            tsdf_planner,
+            snapped_vp,
+            target_points,
+            bbox_center,
+        ):
+            continue
+        vp_for_visibility = snapped_vp.copy()
+        vp_for_visibility[1] += 1.5
+        visibility_score = compute_visibility(
+            vp_for_visibility,
+            target_points,
+            scene_points_tree,
+        )
+        dist_to_target = float(
+            np.linalg.norm(snapped_vp[[0, 2]] - bbox_center[[0, 2]])
+        )
+        desired_dist = max(float(radius_factor), 0.75)
+        distance_penalty = abs(dist_to_target - desired_dist)
+        travel_penalty = 0.05 * float(
+            np.linalg.norm(snapped_vp[[0, 2]] - np.asarray(pts)[[0, 2]])
+        )
+        snap_penalty = 0.5 * float(snap_dist or 0.0)
+        side_bonus = 0.0
+        if side_dir is not None:
+            cand_dir = _unit_xz(snapped_vp - bbox_center)
+            side_bonus = 0.15 * float(np.dot(cand_dir[[0, 2]], side_dir[[0, 2]]))
+        score = visibility_score + side_bonus - 0.25 * distance_penalty - travel_penalty - snap_penalty
+        scored_candidates.append((score, visibility_score, snapped_vp))
+
+    logging.info(
+        f"[VVD] stable candidates after nav/side/LOS filters: {len(scored_candidates)}"
+    )
+    if scored_candidates:
+        scored_candidates.sort(key=lambda item: item[0], reverse=True)
+        _, best_visibility, best_viewpoint = scored_candidates[0]
+
+    if best_viewpoint is None and evidence_position is not None:
+        # Last safe fallback: return the evidence camera floor position if it
+        # is navigable and still has LOS to the target surface. This avoids
+        # snapping to the opposite side of a wall.
+        evidence_ground = np.asarray(evidence_position, dtype=float).copy()
+        evidence_ground[1] = float(pts[1])
+        snapped_vp, _ = _snap_local_navigable(tsdf_planner, evidence_ground)
+        if snapped_vp is not None and _is_los_clear_to_target_surface(
+            tsdf_planner,
+            snapped_vp,
+            target_points,
+            bbox_center,
+        ):
+            best_viewpoint = snapped_vp
+            best_visibility = 0.0
+            logging.info("[VVD] fallback to evidence camera pose")
+
     logging.info(f"[VVD] best_viewpoint={best_viewpoint}, visibility={best_visibility:.3f}")
     return best_viewpoint
-    """Calculate the best viewpoint from a set of candidate viewpoints."""
-    # Prepare data
 
 def resize_image(image, target_h, target_w):
     # image: np.array, h, w, c
