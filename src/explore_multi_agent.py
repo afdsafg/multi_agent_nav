@@ -1,8 +1,8 @@
 """Coupled multi-agent workflow for MSGNav GOAT-Bench evaluation.
 
-Ported from Pred-EQA's 5-agent chain (Image Manager, Frontier Manager,
-Answerer, High-Level Planner, Low-Level Executor) and adapted to MSGNav's
-M3DSG scene graph, KSS image pool, and call_openai_api VLM interface.
+Ported from Pred-EQA's agent chain and adapted to MSGNav's M3DSG scene
+graph, KSS image pool, current frontier options, and call_openai_api VLM
+interface.
 
 Key adaptations vs Pred-EQA:
 - image_pool entries carry M3DSG-connected objects (id, class_name) from
@@ -32,6 +32,58 @@ from src.plan_extraction_utils import extract_todo_list_from_text
 #     "source": str,                        # "kss_edge" | "egocentric"
 #     "step": int,                          # step at which it was added
 # }
+#
+# frontier_options: list of dict {
+#     "display_index": int,      # position in current tsdf_planner.frontiers
+#     "frontier_id": int,        # stable Frontier.frontier_id
+#     "image_b64": str,          # current frontier view
+# }
+
+
+def build_frontier_options(
+    frontier_imgs: List[str],
+    tsdf_planner=None,
+) -> List[Dict[str, Any]]:
+    """Build the complete current frontier option list without pruning."""
+    options: List[Dict[str, Any]] = []
+    frontiers = getattr(tsdf_planner, "frontiers", []) if tsdf_planner else []
+    for i, img_b64 in enumerate(frontier_imgs):
+        frontier_id = i
+        if i < len(frontiers):
+            frontier_id = int(getattr(frontiers[i], "frontier_id", i))
+        options.append(
+            {
+                "display_index": i,
+                "frontier_id": frontier_id,
+                "image_b64": img_b64,
+            }
+        )
+    return options
+
+
+def _append_frontier_options(
+    content: list,
+    frontier_options: List[Dict[str, Any]],
+) -> None:
+    content.append((
+        "\nCurrent Selectable Frontiers "
+        "(complete current set; no pruning or hidden invalid status):\n",
+    ))
+    if not frontier_options:
+        content.append(("No current selectable frontiers available\n",))
+        return
+    for option in frontier_options:
+        frontier_id = int(option["frontier_id"])
+        display_index = int(option["display_index"])
+        content.append((
+            f"Frontier F_{frontier_id:03d} (display {display_index}): ",
+            option["image_b64"],
+        ))
+        content.append(("\n",))
+    id_strs = ", ".join(
+        f"F_{int(option['frontier_id']):03d}" for option in frontier_options
+    )
+    content.append((f"Current Frontier IDs: {id_strs}\n",))
 
 
 def build_image_pool_from_kss(
@@ -208,95 +260,6 @@ def format_image_manager_prompt(
         "1. First, think step by step and explain your reasoning clearly.\n"
         '2. Then, provide your final answer in the exact format: '
         '"Retain Images: {i, ...}".'
-    )
-    content.append((text,))
-    return sys_prompt, content
-
-
-def format_frontier_manager_prompt(
-    question: str,
-    frontier_imgs: List[str],
-    pool: List[Dict[str, Any]],
-    high_level_plan: Optional[str],
-    task_type: str,
-    frontier_states: Optional[List[Any]] = None,
-) -> Tuple[str, list]:
-    """Frontier Manager prompt.
-
-    Ported from Pred-EQA format_plan_manager_prompt. Outputs
-    'Retain Frontiers: {F_XXX, ...}' using stable frontier IDs.
-    """
-    sys_prompt = (
-        "Task: You are an EXPLORATION DIRECTION MANAGEMENT AGENT responsible "
-        "for STRATEGICALLY SELECTING and PRUNING potential frontiers based on "
-        "observed visual images. Your goal is to eliminate directions that "
-        "have BOTH OBVIOUSLY BEEN EXPLORED AND ARE IRRELEVANT to answering "
-        "the question.\n\n"
-        "Instructions:\n"
-        "1. CAREFULLY analyze the provided visual images to identify areas "
-        "that have already been explored.\n"
-        "2. Determine which frontiers (exploration directions) can be safely "
-        "removed because they MEET BOTH CRITERIA:\n"
-        "- They lead to areas ALREADY CONFIRMED AS VISITED with high "
-        "certainty.\n"
-        "- The area or objects within them are CLEARLY UNRELATED TO THE "
-        "QUESTION or its context.\n"
-        "3. ONLY remove such frontiers if BOTH conditions above are MET. If "
-        "ANY DOUBT exists about either exploration status or relevance, KEEP "
-        "THE FRONTIER.\n"
-        "4. Retain all other frontiers, including those where there is ANY "
-        "UNCERTAINTY regarding their exploration status or their relevance to "
-        "the question.\n"
-        "5. Maintain spatial awareness: even partially visible rooms or "
-        "ambiguous paths should be preserved unless you are ABSOLUTELY "
-        "CERTAIN about their irrelevance.\n"
-        "6. REMEMBER, the key is to avoid deleting potentially useful "
-        "information. When in doubt, err on the side of caution and retain "
-        "the frontier.\n"
-        "7. Each frontier has a STABLE ID like F_023. Use this ID (not the "
-        "display index) in your output. Frontiers marked DO NOT SELECT or "
-        "status=EXPLORED must be pruned.\n"
-    )
-    content = []
-
-    content.append((f"Target Question: {question}\n",))
-
-    if high_level_plan:
-        content.append((f"Current High-Level Plan:\n{high_level_plan}\n",))
-    else:
-        content.append(("No high-level plan yet.\n",))
-
-    # Previously observed clues (images)
-    content.append(("Previously Observed Clues:\n",))
-    if not pool:
-        content.append(("No images available\n",))
-    else:
-        for snap in pool:
-            content.append(("\n", snap["img_b64"]))
-        content.append(("\n",))
-
-    # Frontiers
-    content.append(("\nAvailable Exploration Directions:\n",))
-    if not frontier_imgs:
-        content.append(("No frontiers available\n",))
-    else:
-        for i, img in enumerate(frontier_imgs):
-            fs = frontier_states[i] if frontier_states and i < len(frontier_states) else None
-            if fs is not None:
-                header = f"Frontier {fs.to_prompt_str(local_index=i)}: "
-            else:
-                header = f"Frontier {i}: "
-            content.append((header, img))
-            content.append(("\n",))
-        ids = [fs.frontier_id for fs in frontier_states] if frontier_states else list(range(len(frontier_imgs)))
-        id_strs = ", ".join(f"F_{i:03d}" for i in ids)
-        content.append((f"Available Frontier IDs: {id_strs}\n",))
-
-    text = (
-        "Output Format:\n"
-        "1. First, think step by step and explain your reasoning clearly.\n"
-        '2. Then, provide your final answer in the exact format: '
-        '"Retain Frontiers: {F_XXX, F_YYY}" (retain at least 1 frontier).'
     )
     content.append((text,))
     return sys_prompt, content
@@ -524,7 +487,7 @@ def format_high_level_planner_prompt(
     question: str,
     task_type: str,
     pool: List[Dict[str, Any]],
-    frontier_imgs: List[str],
+    frontier_options: List[Dict[str, Any]],
     high_level_plan_prev: Optional[str],
     is_new_subtask: bool,
     image_goal: Optional[str] = None,
@@ -583,13 +546,15 @@ def format_high_level_planner_prompt(
         "status\").\n"
         "4. Create Parallel Prediction-Based Branches for the immediate next "
         "step. For the most immediate unresolved navigation or search task, "
-        "generate multiple parallel prediction-based exploration branches as "
-        "testable hypotheses based on current observations and world "
-        "knowledge.\n"
+        "generate multiple parallel prediction-based exploration branches "
+        "grounded in the CURRENT SELECTABLE FRONTIERS listed in this prompt. "
+        "The listed frontiers are already the complete current selectable set; "
+        "do not prune, blacklist, down-rank, or infer hidden invalid frontier "
+        "status.\n"
         "Example: instead of [ ] Find the kitchen, create:\n"
-        "[ ] Explore the frontier leading to the hallway since it may lead "
+        "[ ] Explore F_001 because it appears to lead toward the hallway and may lead "
         "to the kitchen\n"
-        "[ ] Explore the frontier leading to the living area since it may "
+        "[ ] Explore F_002 because it appears to lead toward the living area and may "
         "also lead to the kitchen\n"
         "5. Combine these immediate predictive branches and the remaining "
         "downstream high-level tasks into a single, cohesive, ordered to-do "
@@ -624,10 +589,9 @@ def format_high_level_planner_prompt(
         "strategy, only mark them as completed [x] when fully accomplished "
         "successfully.\n"
         "Content Constraints:\n"
-        "STRICTLY NEVER mention ANY image or frontier identifiers (e.g., "
-        "\"Image 2\", \"Frontier 0\") - these labels are step-specific and "
-        "will cause confusion in later steps when the current image is no "
-        "longer available.\n"
+        "Do not mention image indices. You MAY mention stable frontier IDs "
+        "like F_001 because they identify the current selectable frontier "
+        "branches for the Executor.\n"
         "AVOID relative directional references tied to transient views. "
         "Instead, describe spatial relationships using observable objects.\n"
     )
@@ -698,14 +662,7 @@ def format_high_level_planner_prompt(
             content.append(("\n", snap["img_b64"]))
         content.append(("\n",))
 
-    # Frontiers
-    content.append(("\nAvailable Exploration Directions:\n",))
-    if not frontier_imgs:
-        content.append(("No frontiers available\n",))
-    else:
-        for i, img in enumerate(frontier_imgs):
-            content.append((f"Frontier {i}: ", img))
-            content.append(("\n",))
+    _append_frontier_options(content, frontier_options)
 
     # Output format
     text = (
@@ -716,7 +673,7 @@ def format_high_level_planner_prompt(
         "<todos>\n"
         "[ ] Pending task description\n"
         "[-] In progress task description <!-- status; rationale -->\n"
-        "[x] Completed or pruned task description <!-- status; rationale -->\n"
+        "[x] Completed or invalidated task description <!-- status; rationale -->\n"
         "</todos>\n"
         "</update_todo_list>\n"
     )
@@ -731,12 +688,11 @@ def format_high_level_planner_prompt(
 
 def format_executor_prompt(
     question: str,
-    frontier_imgs: List[str],
+    frontier_options: List[Dict[str, Any]],
     pool: List[Dict[str, Any]],
     high_level_plan: Optional[str],
     task_type: str,
     history_decision: Optional[Dict[str, Any]] = None,
-    frontier_states: Optional[List[Any]] = None,
     feedback_block: str = "",
 ) -> Tuple[str, list]:
     """Low-Level Executor prompt.
@@ -754,8 +710,10 @@ def format_executor_prompt(
         "target objects and their typical locations based on common sense.\n"
         "2. Assess the previously observed clues to determine already "
         "explored areas and objects.\n"
-        "3. Given question needs and current exploration progress, choose a "
-        "frontier based on the following Core Principles and constraints:\n"
+        "3. Given question needs and current exploration progress, choose one "
+        "frontier from the CURRENT SELECTABLE FRONTIERS listed in this prompt. "
+        "This is the complete current selectable set. Do not prune, blacklist, "
+        "down-rank, or infer hidden invalid frontier status.\n"
         "principle 1: Use common room-object relationships to infer possible "
         "locations of the target object (e.g., \"refrigerator\" in kitchen, "
         "\"bed\" in bedroom). Use typical room connections to prioritize "
@@ -775,6 +733,9 @@ def format_executor_prompt(
         "constraint 3: Keep selecting a frontier for moving until you find "
         "conclusive evidence enough to answer the question. Note that the "
         "objects mentioned in all questions are definitely available.\n"
+        "constraint 4: If at least one current selectable frontier is listed, "
+        "choose exactly one of its stable IDs. Use Stop Exploration only when "
+        "no current selectable frontier is listed.\n"
     )
     content = []
 
@@ -795,22 +756,7 @@ def format_executor_prompt(
             content.append(("\n", snap["img_b64"]))
         content.append(("\n",))
 
-    # Frontiers
-    content.append(("\nAvailable Exploration Directions:\n",))
-    if not frontier_imgs:
-        content.append(("No frontiers available\n",))
-    else:
-        for i, img in enumerate(frontier_imgs):
-            fs = frontier_states[i] if frontier_states and i < len(frontier_states) else None
-            if fs is not None:
-                header = f"Frontier {fs.to_prompt_str(local_index=i)}: "
-            else:
-                header = f"Frontier {i}: "
-            content.append((header, img))
-            content.append(("\n",))
-        ids = [fs.frontier_id for fs in frontier_states] if frontier_states else list(range(len(frontier_imgs)))
-        id_strs = ", ".join(f"F_{i:03d}" for i in ids)
-        content.append((f"Available Frontier IDs: {id_strs}\n",))
+    _append_frontier_options(content, frontier_options)
 
     # F7: CLR - inject history of wrong decisions so Executor avoids them
     clr_text = _format_clr_block(history_decision)
@@ -825,9 +771,8 @@ def format_executor_prompt(
         "Output Format:\n"
         "1. First, think step by step and explain your reasoning clearly.\n"
         "2. Then, provide your final answer in the exact format: "
-        '"Next Step: Frontier F_XXX" or "Stop Exploration", where F_XXX is '
-        "the stable ID of the frontier you choose. Do NOT select frontiers "
-        "marked DO NOT SELECT or status=EXPLORED."
+        '"Next Step: Frontier F_XXX" using one listed stable frontier ID, '
+        'or "Stop Exploration" only if no current selectable frontier is listed.'
     )
     content.append((text,))
     return sys_prompt, content
@@ -841,11 +786,11 @@ def parse_retain_response(
     response: Optional[str],
     keyword: str,
 ) -> List[int]:
-    """Parse 'Retain Images: {i,...}' or 'Retain Frontiers: {i,...}'.
+    """Parse retain responses such as 'Retain Images: {i,...}'.
 
     Args:
         response: raw VLM response.
-        keyword: "Images" or "Frontiers".
+        keyword: response keyword, e.g. "Images".
 
     Returns:
         Sorted list of retained indices. Empty list on failure.
@@ -1032,39 +977,6 @@ def parse_executor_frontier_id(response: Optional[str]) -> int:
     return -1
 
 
-def parse_retain_frontier_ids(
-    response: Optional[str],
-    valid_ids: Optional[List[int]] = None,
-) -> List[int]:
-    """Parse 'Retain Frontiers: {F_XXX, F_YYY}' into a list of frontier IDs.
-
-    Args:
-        valid_ids: if provided, filter parsed IDs to this set (defensive).
-    """
-    if response is None:
-        return []
-    pattern = (
-        rf"Retain\s+{re.escape('Frontiers')}\s*[:：]\s*\{{?\s*"
-        r"(F_?\d+(?:\s*,\s*F_?\d+|\s*,\s*\d+)*)"
-        r"\s*\}?"
-    )
-    match = re.search(pattern, response, re.IGNORECASE)
-    ids: List[int] = []
-    if match:
-        for tok in re.findall(r"F_?(\d+)|\b(\d+)\b", match.group(1)):
-            val = tok[0] or tok[1]
-            if val.isdigit():
-                ids.append(int(val))
-    if not ids:
-        # legacy: plain indices 'Retain Frontiers: 0, 2'
-        legacy = parse_retain_response(response, "Frontiers")
-        ids = legacy
-    if valid_ids is not None:
-        valid = set(valid_ids)
-        ids = [i for i in ids if i in valid]
-    return sorted(set(ids))
-
-
 def _parse_high_level_plan_response(response: Optional[str]) -> Optional[str]:
     """Extract the <update_todo_list>...</update_todo_list> block (or
     <todos>...</todos>) from the planner response. Returns the raw XML
@@ -1098,38 +1010,6 @@ def _parse_high_level_plan_response(response: Optional[str]) -> Optional[str]:
 # Main entry
 # ---------------------------------------------------------------------------
 
-def _frontier_heuristic_score(fs, frontier_img, pool, high_level_plan, question) -> float:
-    """§5 deterministic scorer for Frontier Manager parse-fail fallback.
-    Pure-Python, no new deps."""
-    if fs is None:
-        novelty = 1.0
-        info_gain = 0.0
-        repeat_penalty = 0
-        failed_branch_penalty = 0
-    else:
-        novelty = 1.0 if fs.first_seen_step == fs.last_seen_step else 0.3
-        info_gain = min(getattr(fs, "area", 0.0) / 100.0, 1.0)
-        repeat_penalty = getattr(fs, "selected_count", 0)
-        failed_branch_penalty = 1 if getattr(fs, "last_result", None) in ("NO_NEW_INFO", "BLOCKED") else 0
-    # plan_alignment: simple room-word overlap between plan and question
-    plan_alignment = 0.0
-    if high_level_plan and question:
-        qlow = str(question).lower()
-        for word in str(high_level_plan).lower().split():
-            w = word.strip(".,;:()[]")
-            if len(w) > 3 and w in qlow:
-                plan_alignment = 1.2
-                break
-    score = (
-        1.5 * novelty
-        + 1.0 * info_gain
-        + plan_alignment
-        - 2.0 * repeat_penalty
-        - 3.0 * failed_branch_penalty
-    )
-    return score
-
-
 def explore_multi_agent(
     step: Dict[str, Any],
     cfg,
@@ -1137,8 +1017,8 @@ def explore_multi_agent(
 ) -> Tuple[str, Any, Optional[str], int, Optional[str]]:
     """Multi-agent exploration workflow main entry.
 
-    Runs the 5-agent chain: Image Manager -> Frontier Manager -> Answerer
-    -> High-Level Planner -> Executor. Returns the decision for this step.
+    Runs the chain: Image Manager -> Answerer -> High-Level Planner ->
+    Executor. Current frontier options pass directly to Planner and Executor.
 
     Args:
         step: step dict. Expected keys:
@@ -1180,13 +1060,7 @@ def explore_multi_agent(
     high_level_plan = step.get("high_level_plan", None)
     history_decision = step.get("CLR", {})
     tsdf_planner = step.get("tsdf_planner", None)
-    # Phase B: build frontier_states list aligned with frontier_imgs.
-    # frontier_imgs are encoded from tsdf_planner.frontiers in order.
-    frontier_states = []
-    if tsdf_planner is not None:
-        for f in tsdf_planner.frontiers:
-            fs = tsdf_planner.frontier_registry.get(f.frontier_id)
-            frontier_states.append(fs)
+    frontier_options = build_frontier_options(frontier_imgs, tsdf_planner)
     # Phase B: working memory (SubtaskWorkingMemory) if provided by main loop
     working_memory = step.get("working_memory", None)
 
@@ -1284,10 +1158,9 @@ def explore_multi_agent(
             f"{len(nonpinned_idx)} <= 3, pinned={len(pinned_paths)})"
         )
 
-    # d. Frontier Manager temporarily disabled: pass all currently alive
-    # frontiers through to Planner and Executor without semantic pruning.
     logging.info(
-        f"[Frontier Manager] disabled, passing through {len(frontier_imgs)} frontiers"
+        f"[Frontier Options] passing all current frontier options: "
+        f"{len(frontier_options)}"
     )
 
     # e. Answerer (Phase E: tri-state)
@@ -1362,7 +1235,7 @@ def explore_multi_agent(
         question,
         task_type,
         pool,
-        frontier_imgs,
+        frontier_options,
         high_level_plan,
         is_new_subtask,
         image_goal=image_goal,
@@ -1391,16 +1264,12 @@ def explore_multi_agent(
         _executor_fb = working_memory.feedback_prompt_block(
             agent_name="Executor", current_step=step_index
         )
-    # Executor frontier filtering is also temporarily disabled so the Executor
-    # sees the same currently alive frontier set as the Planner.
-    valid_ids = None
     logging.info(
-        f"[Executor] frontier filter disabled, offering {len(frontier_imgs)} frontiers"
+        f"[Executor] offering {len(frontier_options)} current frontier options"
     )
     sys_p, content = format_executor_prompt(
-        question, frontier_imgs, pool, high_level_plan, task_type,
+        question, frontier_options, pool, high_level_plan, task_type,
         history_decision=history_decision,
-        frontier_states=frontier_states,
         feedback_block=_executor_fb,
     )
     if verbose:
@@ -1408,18 +1277,12 @@ def explore_multi_agent(
     raw = call_openai_api(sys_p, content)
     frontier_id = parse_executor_frontier_id(raw)
     reason = _extract_reason(raw)
-    # map frontier_id -> positional index in the (possibly filtered) list
+    # map frontier_id -> positional index in the current complete option list
     id_to_pos = {
-        fs.frontier_id: i for i, fs in enumerate(frontier_states) if fs is not None
+        int(option["frontier_id"]): int(option["display_index"])
+        for option in frontier_options
     }
     if frontier_id >= 0 and frontier_id in id_to_pos:
-        # §4 defensive: double-check frontier_id is in the valid set
-        if valid_ids is not None and frontier_id not in valid_ids:
-            logging.info(
-                f"[Executor] Frontier F_{frontier_id:03d} not in valid set, stop"
-            )
-            _record_step_summary(step, "Executor stop (frontier not valid)")
-            return ("stop", None, reason, n_filtered, None)
         pos = id_to_pos[frontier_id]
         logging.info(f"[Executor] Frontier F_{frontier_id:03d} (pos {pos})")
         _record_step_summary(step, f"Executor chose Frontier F_{frontier_id:03d}")
