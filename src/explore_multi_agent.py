@@ -1346,7 +1346,7 @@ def explore_multi_agent(
     if working_memory is not None:
         candidates_block = working_memory.candidates_prompt_block()
         feedback_block = working_memory.feedback_prompt_block(
-            agent_name="Answerer", current_step=step
+            agent_name="Answerer", current_step=step_index
         )
     sys_p, content = format_answerer_prompt(
         question, pool, task_type, image_goal, high_level_plan,
@@ -1439,7 +1439,7 @@ def explore_multi_agent(
     _executor_fb = ""
     if working_memory is not None:
         _executor_fb = working_memory.feedback_prompt_block(
-            agent_name="Executor", current_step=step
+            agent_name="Executor", current_step=step_index
         )
     # §4: hard constraint — only offer valid frontiers (active, under reselect
     # cap, not in recent window)
