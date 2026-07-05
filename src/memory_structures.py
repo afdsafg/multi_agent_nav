@@ -2,7 +2,7 @@
 
 Implements the three memory layers from 诊断.md:
 - TargetCandidate: VLM-confirmed target with multi-level grounding state
-- FrontierState: stable frontier identity with exploration status
+- FrontierState: current frontier bookkeeping for prompt/context signals
 - FeedbackEvent: failure reason that closes the loop back to agents
 - SubtaskWorkingMemory: per-subtask scratch space (reset each subtask,
   long-term scene graph / all_observations live elsewhere and are NOT
@@ -920,7 +920,8 @@ class TargetCandidate:
 # ---------------------------------------------------------------------------
 # Frontier state
 # ---------------------------------------------------------------------------
-# Status values
+# Status values. F_EXPLORED is retained for old serialized state only; the
+# rebuild flow does not assign it because frontiers are transient observations.
 F_ACTIVE = "ACTIVE"
 F_EXPLORED = "EXPLORED"
 F_BLOCKED = "BLOCKED"
@@ -958,8 +959,6 @@ class FrontierState:
         ]
         if self.last_result:
             parts.append(f"last={self.last_result}")
-        if self.status == F_EXPLORED or self.selected_count >= 2:
-            parts.append("DO NOT SELECT")
         return " | ".join(parts)
 
 
@@ -1226,6 +1225,7 @@ class SubtaskWorkingMemory:
         if c is None:
             return False
         if c.closer_view_attempts >= max_attempts:
+            c.status = S_EXPIRED
             self.release_candidate(candidate_id)
             return True
         return False
@@ -1289,11 +1289,11 @@ class SubtaskWorkingMemory:
         if fs is not None:
             fs.reached_count += 1
             fs.last_result = result
-            if result == FR_NO_NEW_INFO:
-                fs.status = F_EXPLORED
+            if result == FR_BLOCKED:
+                fs.status = F_BLOCKED
             elif result == FR_FOUND_CANDIDATE:
                 fs.status = F_ACTIVE  # keep it available
-            # LED_TO_ROOM / BLOCKED: leave status as-is for now
+            # NO_NEW_INFO / LED_TO_ROOM remain executor context only.
 
     def get_valid_frontiers(
         self,
@@ -1301,21 +1301,18 @@ class SubtaskWorkingMemory:
         max_reselect: int = 2,
         recent_window: int = 3,
     ) -> List[int]:
-        """Return frontier_ids that are selectable right now."""
-        recent = set(self.recent_frontier_ids[-recent_window:]) if recent_window > 0 else set()
+        """Return deterministically legal frontier ids.
+
+        Frontier ids are transient observations. Recent selection and repeated
+        visits are context for Executor, not hard eligibility constraints.
+        """
         out = []
         for fid in all_frontier_ids:
             fs = self.frontier_registry.get(fid)
             if fs is None:
                 out.append(fid)  # unknown → treat as fresh
                 continue
-            if fs.status == F_EXPLORED:
-                continue
             if fs.status == F_BLOCKED:
-                continue
-            if fs.selected_count >= max_reselect:
-                continue
-            if fid in recent:
                 continue
             out.append(fid)
         return out

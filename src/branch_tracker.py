@@ -161,21 +161,23 @@ class BranchTracker:
         recent_window: int = 3,
         max_reselect: int = 2,
     ) -> List[FrontierInstance]:
-        recent = set(recent_ids[-recent_window:]) if recent_ids and recent_window > 0 else set()
+        """Return deterministically legal current frontier instances.
+
+        FrontierInstance is a transient TSDF observation. Task-local novelty,
+        revisit, and repeat signals belong in BranchTaskState/Executor context,
+        not in this hard eligibility gate.
+        """
         eligible = []
         for inst in instances:
             branch = working_memory.spatial_branches.get(inst.spatial_branch_id or "")
             state = working_memory.branch_task_states.get(inst.spatial_branch_id or "")
+            if not getattr(inst, "is_selectable", True):
+                continue
             if branch is not None and branch.merged_into:
                 continue
             if branch is not None and branch.geometric_status == "CLOSED":
                 continue
             if state is not None and state.status == BranchTaskStatus.CLOSED:
-                continue
-            if inst.frontier_id in recent:
-                continue
-            fs = working_memory.frontier_registry.get(inst.frontier_id)
-            if fs is not None and getattr(fs, "selected_count", 0) >= max_reselect:
                 continue
             inst.is_selectable = True
             eligible.append(inst)

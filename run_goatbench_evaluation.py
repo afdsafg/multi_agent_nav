@@ -76,6 +76,61 @@ def _record_navigation_events(working_memory, navigation_result):
     )
 
 
+def _explored_mask_2d(tsdf_planner):
+    vol = getattr(tsdf_planner, "_explore_vol_cpu", None)
+    if vol is None:
+        return None
+    arr = np.asarray(vol)
+    if arr.ndim == 3:
+        return np.any(arr > 0, axis=-1)
+    if arr.ndim == 2:
+        return arr > 0
+    return None
+
+
+def _area_delta_m2(before_mask, after_mask, voxel_size) -> float:
+    if before_mask is None or after_mask is None:
+        return 0.0
+    before = np.asarray(before_mask).astype(bool)
+    after = np.asarray(after_mask).astype(bool)
+    if before.shape != after.shape:
+        return 0.0
+    new_cells = np.logical_and(after, np.logical_not(before))
+    return float(np.count_nonzero(new_cells) * (float(voxel_size) ** 2))
+
+
+def _new_free_space_delta_m2(before_mask, after_mask, tsdf_planner) -> float:
+    if before_mask is None or after_mask is None:
+        return 0.0
+    free = getattr(tsdf_planner, "unoccupied", None)
+    if free is None:
+        return 0.0
+    before = np.asarray(before_mask).astype(bool)
+    after = np.asarray(after_mask).astype(bool)
+    free = np.asarray(free).astype(bool)
+    if before.shape != after.shape or after.shape != free.shape:
+        return 0.0
+    new_free = np.logical_and.reduce((after, np.logical_not(before), free))
+    voxel_size = float(getattr(tsdf_planner, "_voxel_size", 0.0) or 0.0)
+    return float(np.count_nonzero(new_free) * (voxel_size ** 2))
+
+
+def _branch_outcome_metrics(working_memory, navigation_intent):
+    if working_memory is None or not isinstance(navigation_intent, ExploreIntent):
+        return 0.0, 0.0, False
+    branch_id = navigation_intent.spatial_branch_id
+    if not branch_id:
+        return 0.0, 0.0, False
+    state = working_memory.branch_task_states.get(branch_id)
+    if state is None:
+        return 0.0, 0.0, False
+    return (
+        float(getattr(state, "recent_spatial_gain", 0.0) or 0.0),
+        float(getattr(state, "recent_region_overlap", 0.0) or 0.0),
+        bool(getattr(state, "reversal_count", 0) > 0),
+    )
+
+
 class Timer:
     def __init__(self):
         self.start_time = {}
@@ -613,7 +668,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         decision['max_point_choice'] = target_index
                         if navigation_intent is not None:
                             decision['navigation_intent'] = navigation_intent.to_dict()
-                        # Phase B: record stable frontier_id for frontier decisions
+                        # Record current frontier instance id for this decision.
                         if isinstance(navigation_intent, ExploreIntent) and navigation_intent.frontier_id is not None:
                             decision['frontier_id'] = int(navigation_intent.frontier_id)
                         # set the vlm choice as the navigation target
@@ -644,6 +699,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     elif target_type == "image" or target_type == "object":############# draw max_point_choice only when target is image or object
                         mpc_for_agent_step = max_point_choice
 
+                    pts_before_step = np.asarray(pts).copy()
+                    explored_before_step = _explored_mask_2d(tsdf_planner)
                     return_values = tsdf_planner.agent_step(
                         pts=pts,
                         angle=angle,
@@ -663,28 +720,34 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
                     # update agent's position and rotation
                     pts, angle, pts_voxel, fig, _, target_arrived = return_values
+                    explored_after_step = _explored_mask_2d(tsdf_planner)
+                    distance_moved = float(
+                        np.linalg.norm(np.asarray(pts) - pts_before_step)
+                    )
+                    explored_area_delta = _area_delta_m2(
+                        explored_before_step,
+                        explored_after_step,
+                        getattr(tsdf_planner, "_voxel_size", 0.0),
+                    )
+                    new_free_space_delta = _new_free_space_delta_m2(
+                        explored_before_step,
+                        explored_after_step,
+                        tsdf_planner,
+                    )
+                    (
+                        branch_progress_delta,
+                        recent_region_overlap,
+                        trajectory_reversal,
+                    ) = _branch_outcome_metrics(
+                        subtask_metadata.get("working_memory", None),
+                        navigation_intent,
+                    )
 
 
                     logger.log_step(pts_voxel=pts_voxel)
                     logging.info(
                         f"Current position: {pts}, {logger.subtask_explore_dist:.3f}"
                     )
-
-                    # Phase B/F: frontier reached -> mark + feedback
-                    if isinstance(navigation_intent, ExploreIntent) and target_arrived:
-                        fid = navigation_intent.frontier_id
-                        if fid is not None and fid >= 0:
-                            tsdf_planner.mark_frontier_result(fid, "NO_NEW_INFO")
-                            wm = subtask_metadata.get("working_memory", None)
-                            if wm is not None:
-                                wm.mark_frontier_reached(fid, "NO_NEW_INFO")
-                                wm.add_feedback(
-                                    step=cnt_step,
-                                    type_="FRONTIER_NO_INFO",
-                                    reason=f"Frontier F_{int(fid):03d} reached, no new target info",
-                                    frontier_id=int(fid),
-                                    suggested_fix="select a different frontier",
-                                )
 
                     # sanity check about objects, scene graph, ...
                     scene.sanity_check(cfg=cfg)
@@ -745,6 +808,15 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         step=global_step,
                         mode=navigation_mode,
                         intent=navigation_intent,
+                        distance_moved=distance_moved,
+                        explored_area_delta=explored_area_delta,
+                        new_free_space_delta=new_free_space_delta,
+                        branch_progress_delta=branch_progress_delta,
+                        recent_region_overlap=recent_region_overlap,
+                        trajectory_reversal=trajectory_reversal,
+                        semantic_updates=subtask_metadata.get(
+                            "last_evidence_updates", []
+                        ),
                         navigation_result=navigation_result,
                     )
                     nav_events_recorded = False

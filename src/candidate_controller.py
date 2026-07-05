@@ -162,7 +162,7 @@ class CandidateController:
         except Exception as exc:
             logging.info(f"[CandidateController] grounding failed: {exc}")
             candidate.record_attempt(4, False, f"exception: {exc}")
-            result = self._reject_grounding_result(
+            result = self._grounding_failed_result(
                 working_memory,
                 candidate,
                 img_path,
@@ -326,13 +326,61 @@ class CandidateController:
             except Exception as exc:
                 logging.info(f"[CandidateController] visual approach exception: {exc}")
         candidate.record_attempt(4, False, "visual approach unavailable")
-        return self._reject_grounding_result(
+        return self._grounding_failed_result(
             working_memory,
             candidate,
             img_path,
             step_index,
             f"VLM saw '{target_phrase}' but grounding failed",
             feedback_type=FB_AVU_VISUAL_ONLY,
+        )
+
+    def _grounding_failed_result(
+        self,
+        working_memory,
+        candidate: TargetCandidate,
+        img_path: str,
+        step_index: int,
+        reason: str,
+        feedback_type: str = FB_AVU_FAIL,
+    ) -> CandidateControllerResult:
+        """Record a technical grounding failure without rejecting the candidate."""
+        candidate.last_failure_reason = reason
+        candidate.nav_target_kind = None
+        candidate.nav_goal_xyz = None
+        candidate.nav_goal_yaw = None
+        candidate.nav_status = NavStatus.FAILED
+        if working_memory is not None:
+            stored = working_memory.target_candidates.get(candidate.candidate_id)
+            if stored is not None:
+                stored.status = candidate.status
+                stored.pinned = True
+                stored.last_failure_reason = reason
+                stored.nav_target_kind = None
+                stored.nav_goal_xyz = None
+                stored.nav_goal_yaw = None
+                stored.nav_status = NavStatus.FAILED
+                working_memory.pinned_ids.add(stored.image_path)
+            working_memory.add_feedback(
+                step=step_index,
+                type_=feedback_type,
+                reason=reason,
+                suggested_fix=working_memory.suggest_fix_for(
+                    feedback_type, reason
+                ),
+                target_candidate_id=candidate.candidate_id,
+            )
+        return CandidateControllerResult(
+            candidate=candidate,
+            events=[
+                self._event(
+                    EventType.GROUNDING_FAILED,
+                    step_index,
+                    candidate.candidate_id,
+                    {"image_path": img_path, "reason": reason},
+                )
+            ],
+            reason=reason,
         )
 
     def _reject_grounding_result(
@@ -436,8 +484,8 @@ class CandidateController:
             )
         valid_objs = [obj for obj in obj_pcds_and_bboxes if obj is not None]
         if not valid_objs:
-            candidate.record_attempt(3, False, "SAM/pcd invalid")
-            return self._reject_grounding_result(
+            candidate.record_attempt(4, False, "SAM/pcd invalid")
+            return self._grounding_failed_result(
                 working_memory,
                 candidate,
                 img_path,

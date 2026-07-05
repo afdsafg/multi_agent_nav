@@ -1,6 +1,7 @@
 """Typed event detection and trigger routing for the rebuild flow."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -59,7 +60,9 @@ class EventEngine:
 
     def __init__(self, config: Optional[EventEngineConfig] = None) -> None:
         self.config = config or EventEngineConfig()
-        self._last_emitted: Dict[Tuple[str, Optional[str], Optional[str]], int] = {}
+        self._last_emitted: Dict[
+            Tuple[str, Optional[str], Optional[str]], TypedEvent
+        ] = {}
 
     def reset_task_scope(self) -> None:
         self._last_emitted = {}
@@ -83,10 +86,10 @@ class EventEngine:
             severity=severity,
         )
         key = event.debounce_key()
-        last_step = self._last_emitted.get(key)
-        if last_step is not None and step - last_step < self.config.debounce_steps:
+        last_event = self._last_emitted.get(key)
+        if self._should_suppress(event, last_event):
             return None
-        self._last_emitted[key] = step
+        self._last_emitted[key] = event
         return event
 
     def debounce_events(self, events: Iterable[TypedEvent]) -> List[TypedEvent]:
@@ -94,12 +97,42 @@ class EventEngine:
         debounced = []
         for event in events:
             key = event.debounce_key()
-            last_step = self._last_emitted.get(key)
-            if last_step is not None and event.step - last_step < self.config.debounce_steps:
+            last_event = self._last_emitted.get(key)
+            if self._should_suppress(event, last_event):
                 continue
-            self._last_emitted[key] = event.step
+            self._last_emitted[key] = event
             debounced.append(event)
         return debounced
+
+    def _should_suppress(
+        self,
+        event: TypedEvent,
+        last_event: Optional[TypedEvent],
+    ) -> bool:
+        if last_event is None:
+            return False
+        if event.step - last_event.step >= self.config.debounce_steps:
+            return False
+        if self._severity_rank(event.severity) > self._severity_rank(last_event.severity):
+            return False
+        return self._material_signature(event) == self._material_signature(last_event)
+
+    @staticmethod
+    def _severity_rank(severity: str) -> int:
+        return {
+            "debug": 0,
+            "info": 1,
+            "warning": 2,
+            "error": 3,
+            "critical": 4,
+        }.get(str(severity or "info").lower(), 1)
+
+    @staticmethod
+    def _material_signature(event: TypedEvent) -> str:
+        try:
+            return json.dumps(event.payload or {}, sort_keys=True, default=str)
+        except TypeError:
+            return repr(event.payload)
 
     def detect_memory_events(
         self,

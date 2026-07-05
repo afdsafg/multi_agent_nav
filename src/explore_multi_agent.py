@@ -116,6 +116,27 @@ def add_egocentric_to_pool(
             "source": "egocentric",
             "step": step,
         })
+    deduplicate_image_pool(pool)
+
+
+def deduplicate_image_pool(pool: List[Dict[str, Any]]) -> None:
+    """Deterministically remove exact duplicate working-memory snapshots."""
+    seen_paths = set()
+    seen_images = set()
+    deduped = []
+    for snap in pool:
+        img_path = snap.get("img_path")
+        img_b64 = snap.get("img_b64")
+        if img_path and img_path in seen_paths:
+            continue
+        if img_b64 and img_b64 in seen_images:
+            continue
+        if img_path:
+            seen_paths.add(img_path)
+        if img_b64:
+            seen_images.add(img_b64)
+        deduped.append(snap)
+    pool[:] = deduped
 
 
 # ---------------------------------------------------------------------------
@@ -231,39 +252,34 @@ def format_frontier_manager_prompt(
 ) -> Tuple[str, list]:
     """Frontier Manager prompt.
 
-    Ported from Pred-EQA format_plan_manager_prompt. Outputs
-    'Retain Frontiers: {F_XXX, ...}' using stable frontier IDs.
+    Legacy prompt retained for compatibility tests. The rebuild path does not
+    call a VLM Frontier Manager.
     """
     sys_prompt = (
         "Task: You are an EXPLORATION DIRECTION MANAGEMENT AGENT responsible "
         "for STRATEGICALLY SELECTING and PRUNING potential frontiers based on "
-        "observed visual images. Your goal is to eliminate directions that "
-        "have BOTH OBVIOUSLY BEEN EXPLORED AND ARE IRRELEVANT to answering "
-        "the question.\n\n"
+        "observed visual images. This legacy prompt is not used by the rebuild "
+        "path, where frontier eligibility is deterministic and limited to "
+        "hard illegal choices.\n\n"
         "Instructions:\n"
-        "1. CAREFULLY analyze the provided visual images to identify areas "
-        "that have already been explored.\n"
-        "2. Determine which frontiers (exploration directions) can be safely "
-        "removed because they MEET BOTH CRITERIA:\n"
-        "- They lead to areas ALREADY CONFIRMED AS VISITED with high "
-        "certainty.\n"
-        "- The area or objects within them are CLEARLY UNRELATED TO THE "
-        "QUESTION or its context.\n"
-        "3. ONLY remove such frontiers if BOTH conditions above are MET. If "
-        "ANY DOUBT exists about either exploration status or relevance, KEEP "
-        "THE FRONTIER.\n"
+        "1. Treat each frontier ID as a current local instance, not a stable "
+        "long-term memory key.\n"
+        "2. Remove a frontier only when it is deterministically illegal, such "
+        "as unreachable, geometrically invalid, blocked, or tied to a closed "
+        "spatial branch.\n"
+        "3. Do not remove a frontier merely because it was recently selected "
+        "or because a previous visit did not reveal task information.\n"
         "4. Retain all other frontiers, including those where there is ANY "
-        "UNCERTAINTY regarding their exploration status or their relevance to "
-        "the question.\n"
+        "UNCERTAINTY regarding reachability, geometry, or relevance to the "
+        "question.\n"
         "5. Maintain spatial awareness: even partially visible rooms or "
         "ambiguous paths should be preserved unless you are ABSOLUTELY "
         "CERTAIN about their irrelevance.\n"
         "6. REMEMBER, the key is to avoid deleting potentially useful "
         "information. When in doubt, err on the side of caution and retain "
         "the frontier.\n"
-        "7. Each frontier has a STABLE ID like F_023. Use this ID (not the "
-        "display index) in your output. Frontiers marked DO NOT SELECT or "
-        "status=EXPLORED must be pruned.\n"
+        "7. Each frontier has a current ID like F_023. Use this ID (not the "
+        "display index) in your output.\n"
     )
     content = []
 
@@ -313,13 +329,8 @@ def format_frontier_manager_prompt(
 def _format_clr_block(history_decision: Optional[Dict[str, Any]]) -> str:
     """Build a 'History Decisions (avoid repeating)' text block from CLR data.
 
-    Mirrors the format of explore_utils.py Prompt_with_AVU_and_CLR L322-345.
-    F2: inject ALL decisions with object_judge=='no', including frontier
-    choices (previously only image/object were injected, leaving the Executor
-    without frontier anti-repeat protection).
-    F1: for image-type decisions, max_point_choice is an img_path (str), not
-    a numeric index — display the path short name so the VLM can associate it
-    with the pool entry rather than showing an opaque raw path.
+    Only carries explicit wrong answer feedback for old image/object answer
+    paths. Frontier history is represented by typed branch state/events.
     """
     if not history_decision:
         return ""
@@ -340,21 +351,7 @@ def _format_clr_block(history_decision: Optional[Dict[str, Any]]) -> str:
             continue
         target_type = decision["target_type"]
         choice = decision.get("max_point_choice", "?")
-        # F2: frontier decisions never get object_judge (no task_check for
-        # frontier), so inject them unconditionally as "already explored" to
-        # give the Executor anti-repeat context. image/object still require
-        # object_judge=='no' (confirmed wrong by task_check).
         if target_type == "frontier":
-            have_decision = True
-            fid = decision.get("frontier_id")
-            if fid is not None:
-                fid_str = f"F_{int(fid):03d}"
-            else:
-                fid_str = str(choice)
-            lines.append(
-                f"    step {s_key}: Choosing Frontier {fid_str} to explore, "
-                "already explored."
-            )
             continue
         if decision.get("object_judge") != "no":
             continue
@@ -1080,7 +1077,7 @@ def parse_executor_response(response: Optional[str]) -> int:
 
 
 def parse_executor_frontier_id(response: Optional[str]) -> int:
-    """Parse Executor response for a stable frontier ID.
+    """Parse Executor response for a current frontier instance ID.
 
     Returns:
         frontier_id (int) for 'Frontier F_XXX', or -1 for 'Stop Exploration'
@@ -1301,7 +1298,7 @@ def _frontier_heuristic_score(fs, frontier_img, pool, high_level_plan, question)
         novelty = 1.0 if fs.first_seen_step == fs.last_seen_step else 0.3
         info_gain = min(getattr(fs, "area", 0.0) / 100.0, 1.0)
         repeat_penalty = getattr(fs, "selected_count", 0)
-        failed_branch_penalty = 1 if getattr(fs, "last_result", None) in ("NO_NEW_INFO", "BLOCKED") else 0
+        failed_branch_penalty = 1 if getattr(fs, "last_result", None) == "BLOCKED" else 0
     # plan_alignment: simple room-word overlap between plan and question
     plan_alignment = 0.0
     if high_level_plan and question:
@@ -1629,6 +1626,7 @@ def explore_multi_agent(
         pool = build_image_pool_from_kss(
             step_index, scene, processed_images, image_map_reverse
         )
+        deduplicate_image_pool(pool)
         logging.info(
             f"[explore_multi_agent] built pool from KSS: {len(pool)} images"
         )
@@ -1801,6 +1799,7 @@ def explore_multi_agent(
         decision, idx, class_name, visibility
     )
     evidence_updates, evidence_conflict = parse_answerer_evidence(raw)
+    step["evidence_updates"] = evidence_updates
     answerer_decision = (
         AnswererDecision[decision]
         if decision in AnswererDecision.__members__

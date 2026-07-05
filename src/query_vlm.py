@@ -489,6 +489,7 @@ def query_vlm_multi_agent(
         # F3: explore_multi_agent updates step_dict['high_level_plan'] locally;
         # write it back to subtask_metadata so the main loop reads the latest plan.
         subtask_metadata['high_level_plan'] = step_dict.get('high_level_plan')
+        subtask_metadata['last_evidence_updates'] = step_dict.get('evidence_updates', [])
         # F5: write image_pool back to scene for next step
         scene.image_pool = step_dict.get('image_pool')
     except Exception as e:

@@ -23,8 +23,9 @@ from src.memory_structures import (
     ExploreIntent,
     FrontierState,
     F_ACTIVE,
-    F_EXPLORED,
+    F_BLOCKED,
     F_STALE,
+    FR_BLOCKED,
     FR_FOUND_CANDIDATE,
     FR_NO_NEW_INFO,
     NavigationMode,
@@ -115,7 +116,8 @@ class TSDFPlanner(TSDFPlannerBase):
         # about frontier allocation
         self.frontier_map = np.zeros(self._vol_dim[:2], dtype=int)
         self.frontier_counter = 1
-        # Phase B: stable frontier registry. Maps frontier_id -> FrontierState.
+        # Current-frontier registry. Frontier ids are prompt/context handles,
+        # not episode-long semantic identities.
         # Populated by update_frontier_map, read by agent_step + multi-agent.
         self.frontier_registry: Dict[int, "FrontierState"] = {}
 
@@ -808,16 +810,13 @@ class TSDFPlanner(TSDFPlannerBase):
         self._explore_vol_cpu[near_coords[:, 0], near_coords[:, 1], :] = 1
 
         if target_arrived:
-            # Phase B: mark the frontier as reached in the registry.
+            # FrontierInstance is transient; reaching one is navigation
+            # feedback, not proof that the spatial branch is irrelevant.
             if isinstance(self.max_point, Frontier):
                 fid = self.max_point.frontier_id
                 fs = self.frontier_registry.get(fid)
                 if fs is not None:
                     fs.reached_count += 1
-                    if fs.status != F_EXPLORED:
-                        fs.status = F_EXPLORED
-                    if fs.last_result is None:
-                        fs.last_result = FR_NO_NEW_INFO
             self.max_point = None
             self.target_point = None
             self.navigation_intent = None
@@ -1073,45 +1072,8 @@ class TSDFPlanner(TSDFPlannerBase):
     def free_frontier(self, frontier: Frontier):
         self.frontier_map[self.frontier_map == frontier.frontier_id] = 0
 
-    def _reassociate_stale_frontiers(self, new_frontiers: List[Frontier]) -> None:
-        """§4: match newly-created frontiers to STALE registry entries by
-        centroid distance (<1.0m) and yaw similarity (<30deg). First-match-
-        wins; reassign the stable old id so identity survives reappear."""
-        if not self.frontier_registry:
-            return
-        stale_items = [
-            (fid, fs) for fid, fs in self.frontier_registry.items()
-            if fs.status == F_STALE
-        ]
-        if not stale_items:
-            return
-        for nf in new_frontiers:
-            pos_world = self.voxel2habitat(nf.position)
-            n_centroid = np.array([pos_world[0], 0.0, pos_world[2]])
-            n_yaw = float(np.arctan2(nf.orientation[1], nf.orientation[0]))
-            for old_id, fs in stale_items:
-                if fs.status != F_STALE:
-                    continue  # claimed by an earlier new frontier
-                d = float(np.linalg.norm(n_centroid - fs.centroid))
-                if d >= 1.0:
-                    continue
-                dyaw = abs(n_yaw - fs.view_yaw)
-                dyaw = (dyaw + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi,pi]
-                if abs(dyaw) >= (30.0 * np.pi / 180.0):
-                    continue
-                # match: reclaim old id
-                logging.info(
-                    f"§4 reassociate: frontier {nf.frontier_id} -> {old_id} "
-                    f"(d={d:.3f}m, dyaw={np.degrees(abs(dyaw)):.1f}deg)"
-                )
-                self.frontier_map[nf.region] = old_id
-                nf.frontier_id = old_id
-                fs.status = F_ACTIVE  # so upsert below treats as existing-active
-                break
-
-    # Phase B: frontier selection bookkeeping (called by main loop after
-    # Executor picks a frontier). selected_count suppresses reselection;
-    # recent list enforces a window. Returns the FrontierState or None.
+    # Frontier selection bookkeeping is prompt context only. It must not turn a
+    # transient FrontierInstance into a hard eligibility decision.
     def mark_frontier_selected(self, frontier_id: int) -> Optional[FrontierState]:
         fs = self.frontier_registry.get(frontier_id)
         if fs is not None:
@@ -1126,8 +1088,8 @@ class TSDFPlanner(TSDFPlannerBase):
             return
         fs.reached_count += 1
         fs.last_result = result
-        if result == FR_NO_NEW_INFO:
-            fs.status = F_EXPLORED
+        if result == FR_BLOCKED:
+            fs.status = F_BLOCKED
         elif result == FR_FOUND_CANDIDATE:
             fs.status = F_ACTIVE
 
@@ -1137,20 +1099,14 @@ class TSDFPlanner(TSDFPlannerBase):
         recent_window: int = 3,
         recent_ids: Optional[List[int]] = None,
     ) -> List[int]:
-        """Return frontier_ids currently selectable (active, under reselect cap,
-        not in recent window)."""
-        recent = set(recent_ids[-recent_window:]) if recent_ids and recent_window > 0 else set()
+        """Return deterministically legal current frontier ids."""
         out = []
         for f in self.frontiers:
             fs = self.frontier_registry.get(f.frontier_id)
             if fs is None:
                 out.append(f.frontier_id)
                 continue
-            if fs.status in (F_EXPLORED,):
-                continue
-            if fs.selected_count >= max_reselect:
-                continue
-            if f.frontier_id in recent:
+            if fs.status == F_BLOCKED:
                 continue
             out.append(f.frontier_id)
         return out
