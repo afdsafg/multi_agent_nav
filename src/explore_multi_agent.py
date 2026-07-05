@@ -1284,61 +1284,11 @@ def explore_multi_agent(
             f"{len(nonpinned_idx)} <= 3, pinned={len(pinned_paths)})"
         )
 
-    # d. Frontier Manager (only when frontier count > 1)
-    if len(frontier_imgs) > 1:
-        sys_p, content = format_frontier_manager_prompt(
-            question, frontier_imgs, pool, high_level_plan, task_type,
-            frontier_states=frontier_states,
-        )
-        if verbose:
-            logging.info("[Frontier Manager] calling VLM")
-        raw = call_openai_api(sys_p, content)
-        valid_ids = [fs.frontier_id for fs in frontier_states if fs is not None]
-        retain_ids = parse_retain_frontier_ids(raw, valid_ids=valid_ids)
-        if retain_ids:
-            # map retained frontier_ids back to positional indices
-            id_to_pos = {
-                fs.frontier_id: i for i, fs in enumerate(frontier_states) if fs is not None
-            }
-            new_frontier_imgs = [
-                frontier_imgs[id_to_pos[fid]]
-                for fid in retain_ids
-                if fid in id_to_pos and 0 <= id_to_pos[fid] < len(frontier_imgs)
-            ]
-            if new_frontier_imgs:
-                logging.info(
-                    f"[Frontier Manager] filtered to "
-                    f"{len(new_frontier_imgs)} frontiers (ids={retain_ids})"
-                )
-                frontier_imgs = new_frontier_imgs
-                # keep frontier_states in sync (filter to retained ids)
-                retained_set = set(retain_ids)
-                frontier_states = [
-                    fs for fs in frontier_states
-                    if fs is not None and fs.frontier_id in retained_set
-                ]
-        else:
-            scored = sorted(
-                range(len(frontier_states)),
-                key=lambda i: _frontier_heuristic_score(
-                    frontier_states[i] if i < len(frontier_states) else None,
-                    frontier_imgs[i] if i < len(frontier_imgs) else None,
-                    pool, high_level_plan, question,
-                ),
-                reverse=True,
-            )
-            top_k = min(3, len(frontier_imgs))
-            keep_pos = scored[:top_k]
-            frontier_imgs = [frontier_imgs[p] for p in keep_pos]
-            frontier_states = [frontier_states[p] for p in keep_pos]
-            logging.info(
-                f"[Frontier Manager] parse fail, heuristic top_k={top_k} kept"
-            )
-    else:
-        logging.info(
-            f"[Frontier Manager] skipped (frontier count "
-            f"{len(frontier_imgs)} <= 1)"
-        )
+    # d. Frontier Manager temporarily disabled: pass all currently alive
+    # frontiers through to Planner and Executor without semantic pruning.
+    logging.info(
+        f"[Frontier Manager] disabled, passing through {len(frontier_imgs)} frontiers"
+    )
 
     # e. Answerer (Phase E: tri-state)
     candidates_block = ""
@@ -1441,34 +1391,12 @@ def explore_multi_agent(
         _executor_fb = working_memory.feedback_prompt_block(
             agent_name="Executor", current_step=step_index
         )
-    # §4: hard constraint — only offer valid frontiers (active, under reselect
-    # cap, not in recent window)
-    if tsdf_planner is not None and working_memory is not None:
-        valid_ids = set(tsdf_planner.get_valid_frontier_ids(
-            max_reselect=getattr(cfg, "max_frontier_reselect", 2),
-            recent_window=getattr(cfg, "frontier_recent_window", 3),
-            recent_ids=working_memory.recent_frontier_ids,
-        ))
-    elif tsdf_planner is not None:
-        valid_ids = set(tsdf_planner.get_valid_frontier_ids(
-            max_reselect=getattr(cfg, "max_frontier_reselect", 2),
-            recent_window=getattr(cfg, "frontier_recent_window", 3),
-        ))
-    else:
-        valid_ids = None
-    if valid_ids is not None:
-        keep_idx = [
-            i for i, fs in enumerate(frontier_states)
-            if fs is not None and fs.frontier_id in valid_ids
-        ]
-        if not keep_idx:
-            logging.info("[Executor] no valid frontiers, stop")
-            _record_step_summary(step, "Executor stop (no valid frontiers)")
-            return ("stop", None, "", n_filtered, None)
-        frontier_imgs = [frontier_imgs[i] for i in keep_idx]
-        frontier_states = [frontier_states[i] for i in keep_idx]
-    else:
-        valid_ids = None
+    # Executor frontier filtering is also temporarily disabled so the Executor
+    # sees the same currently alive frontier set as the Planner.
+    valid_ids = None
+    logging.info(
+        f"[Executor] frontier filter disabled, offering {len(frontier_imgs)} frontiers"
+    )
     sys_p, content = format_executor_prompt(
         question, frontier_imgs, pool, high_level_plan, task_type,
         history_decision=history_decision,

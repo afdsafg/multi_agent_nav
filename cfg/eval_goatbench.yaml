@@ -14,7 +14,7 @@ test_data_dir: "data/goat_bench/val_unseen/content/"
 concept_graph_config_path: "cfg/concept_graph_default.yaml"
 
 # major settings
-choose_every_step: true  # whether to query vlm at each step, or only after arriving at the navigation target
+choose_every_step: false  # whether to query vlm at each step, or only after arriving at the navigation target
 egocentric_views: true  # whether to add egocentric views when prompting vlm
 prefiltering: true  # whether to use prefiltering (you in fact cannot turn this off, since otherwise it will exceed the context length limit)
 use_ollama: false
