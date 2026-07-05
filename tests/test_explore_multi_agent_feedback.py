@@ -311,3 +311,43 @@ def test_executor_can_stop_when_no_current_frontier_options_exist():
             sys.modules.pop("src.explore_utils", None)
         else:
             sys.modules["src.explore_utils"] = old_explore_utils
+
+
+def test_description_prompts_use_candidate_when_context_is_uncertain():
+    old_explore_utils = _install_explore_utils_stub()
+    old_explore_multi_agent = sys.modules.get("src.explore_multi_agent")
+    sys.modules.pop("src.explore_multi_agent", None)
+    try:
+        explore_multi_agent = importlib.import_module("src.explore_multi_agent")
+
+        answerer_sys, _ = explore_multi_agent.format_answerer_prompt(
+            question="Could you find the object described as being beside a fixture?",
+            pool=[],
+            task_type="description",
+            image_goal=None,
+            high_level_plan=None,
+        )
+        planner_sys, _ = explore_multi_agent.format_high_level_planner_prompt(
+            question="Could you find the object described as being beside a fixture?",
+            task_type="description",
+            pool=[],
+            frontier_options=[],
+            high_level_plan_prev=None,
+            is_new_subtask=False,
+        )
+
+        assert "contextual constraints for disambiguation" in answerer_sys
+        assert "use CANDIDATE_VISIBLE instead of NOT_FOUND" in answerer_sys
+        assert "context/relationship is not fully verified" in answerer_sys
+        assert "agent can only navigate and observe" in planner_sys
+        assert "opening, moving, manipulating, or interacting" in planner_sys
+        assert "finding a better viewpoint" in planner_sys
+    finally:
+        if old_explore_multi_agent is None:
+            sys.modules.pop("src.explore_multi_agent", None)
+        else:
+            sys.modules["src.explore_multi_agent"] = old_explore_multi_agent
+        if old_explore_utils is None:
+            sys.modules.pop("src.explore_utils", None)
+        else:
+            sys.modules["src.explore_utils"] = old_explore_utils

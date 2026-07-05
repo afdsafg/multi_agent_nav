@@ -383,8 +383,11 @@ def format_answerer_prompt(
         )
     elif task_type == "description":
         sys_prompt += (
-            "   - This is a DESCRIPTION task: find the object exactly "
-            "matching the natural-language description.\n"
+            "   - This is a DESCRIPTION task: find the target object named in "
+            "the description. Treat location, containment, support, adjacency, "
+            "and attributes as contextual constraints for disambiguation. If "
+            "the object category is visible but the context is only partially "
+            "verified, use CANDIDATE_VISIBLE instead of NOT_FOUND.\n"
         )
     elif task_type == "image":
         sys_prompt += (
@@ -399,10 +402,12 @@ def format_answerer_prompt(
         )
     sys_prompt += (
         "4. Output ONE of three decisions:\n"
-        "   - NOT_FOUND: no image shows the target or any likely candidate.\n"
+        "   - NOT_FOUND: no image shows the target object category or any "
+        "likely candidate.\n"
         "   - CANDIDATE_VISIBLE: an image shows a LIKELY candidate but it is "
-        "small, partially occluded, at the edge of frame, or you are not "
-        "fully certain. This will trigger closer-view grounding.\n"
+        "small, partially occluded, at the edge of frame, or its described "
+        "context/relationship is not fully verified. This will trigger "
+        "closer-view grounding.\n"
         "   - TARGET_CONFIRMED: an image clearly and centrally shows the "
         "target object — directly visible, identifiable, not just inferred "
         "from common sense.\n"
@@ -544,6 +549,10 @@ def format_high_level_planner_prompt(
         "3. For each subgoal, create a clear task (e.g., \"Go to the "
         "kitchen\", \"Find the refrigerator\", \"Check the microwave's door "
         "status\").\n"
+        "The agent can only navigate and observe; do not create plans that "
+        "require opening, moving, manipulating, or interacting with objects. "
+        "Rewrite such goals as finding a better viewpoint or observing visible "
+        "evidence.\n"
         "4. Create Parallel Prediction-Based Branches for the immediate next "
         "step. For the most immediate unresolved navigation or search task, "
         "generate multiple parallel prediction-based exploration branches "
