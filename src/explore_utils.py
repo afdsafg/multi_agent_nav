@@ -579,7 +579,20 @@ def format_end_prompt(
     content = []
     text = "Definitions:\n"
     text += (
-    "Now that you have arrived near the previously selected answer, please observe your surroundings in the last five steps and confirm whether you have really reached the object required by the Question.\n"
+        "Now that you have arrived near the previously selected navigation "
+        "viewpoint, inspect the fresh surrounding observations collected at "
+        "the arrival pose and decide whether the agent has reached the target "
+        "object or the immediate area where the target object is visually "
+        "confirmed.\n"
+        "Answer Yes if any surrounding observation clearly shows the target "
+        "object required by the Question, or shows enough distinctive context "
+        "to confirm this is the same target instance/location even if the "
+        "target is not centered in the final-facing view.\n"
+        "Answer No only if the arrival observations do not show the target "
+        "object or its distinctive local context, or they clearly show a "
+        "different object/location. Do not reject solely because the last "
+        "single view faces the wrong direction; use all surrounding "
+        "observations.\n"
     )
     # text += (
     # "NOTE: Due to limited viewpoints, you must relax your standards for preliminary checking to avoid rejection of a successful reach.\n"
@@ -595,7 +608,7 @@ def format_end_prompt(
     steps.sort(reverse=True)
     for step in steps:
         text = (
-            f"The following are surrounding observations about the egocentric view of the agent at the final {step}-th step : \n"
+            f"The following are surrounding observations collected at arrival check {step}: \n"
         )
         content.append((text, ))
         for idx, img in enumerate(egocentric_imgs[step]):

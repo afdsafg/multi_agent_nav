@@ -41,6 +41,7 @@ from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end, qu
 from src.long_term_memory import TextLongTermMemory
 from src.logger_goatbench import Logger
 from src.memory_structures import SubtaskWorkingMemory, NavTargetKind, NavStatus
+from src.task_check_observation import collect_arrival_task_check_views
 import time
 
 
@@ -656,18 +657,18 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             or (_nav_candidate is None and target_type != "frontier")
                         )
                     ):
-                        back_frames = min(cnt_step + 1, cfg.frames_to_check)
-                        task_check_obs_frames = {}
-                        for back_step in range(global_step, global_step - back_frames, -1):
-                            task_check_obs = []
-                            for view_idx in range(7):
-                                obs_file_name = f"{back_step}-view_{view_idx}.png"
-                                if obs_file_name not in scene.all_observations.keys():
-                                    break
-                                task_check_obs.append(
-                                    resize_image(scene.all_observations[obs_file_name], cfg.prompt_h, cfg.prompt_w)
-                                )
-                            task_check_obs_frames[global_step - back_step + 1] = task_check_obs.copy()
+                        # The regular step observations were captured before
+                        # agent_step moved to the target. Verify using fresh
+                        # arrival-time views from the reached pose instead of
+                        # stale pre-navigation frames.
+                        task_check_obs_frames = {
+                            1: collect_arrival_task_check_views(
+                                scene=scene,
+                                pts=pts,
+                                angle=angle,
+                                cfg=cfg,
+                            )
+                        }
                         vlm_response, tc_reason = query_vlm_for_response_end(
                             subtask_metadata=subtask_metadata,
                             rgb_egocentric_views=task_check_obs_frames,
